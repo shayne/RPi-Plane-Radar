@@ -40,24 +40,38 @@ yet. The Pi already has working Wi-Fi, SSH, mDNS, and access to the adsb.fi API.
 
 ## Architecture
 
-The application will be a Python package using Pygame/SDL2 for direct KMS
-rendering. It will not start a graphical desktop. A small standard-library HTTP
-server will run in a background thread for configuration. Shared runtime state
-will pass through a narrow, thread-safe application model.
+The application will be a Rust 2024 workspace using SDL2 for direct KMS
+presentation and touch input. Application crates will declare
+`#![forbid(unsafe_code)]`; the audited SDL2 wrapper remains the native boundary.
+It will not start a graphical desktop.
+
+Rendering will be independent of SDL. `tiny-skia` will rasterize the radar into
+a deterministic 480×480 RGBA buffer, `fontdue` will rasterize the bundled font,
+and the `qrcode` crate will generate the setup code. SDL uploads the completed
+buffer to one streaming texture and presents it on the KMS display. This
+separation keeps golden-image tests deterministic and allows nearly all
+rendering work to run without display hardware.
+
+The application deliberately avoids an asynchronous runtime. The SDL event loop
+runs on the main thread, one worker polls ADS-B, and one worker serves the
+low-traffic settings site with `tiny_http`. HTTPS requests use `ureq` with
+rustls certificate verification. Shared runtime state consists of immutable
+snapshots exchanged through a narrow `Arc<RwLock<...>>` model; no lock is held
+during I/O, rendering, or sleeping.
 
 This will be an independent derivative project, not a GitHub fork. The
 repository keeps the upstream Git history, MIT license, and attribution so its
 provenance remains explicit. The ESP32-specific PlatformIO implementation will
-be replaced by the Raspberry Pi application, tests, installer, service unit,
-and documentation. The original repository will remain configured as the
-`upstream` remote even though ongoing merge compatibility is not a goal.
+be replaced by the Rust application, tests, cross-build environment, installer,
+service unit, and documentation. The original repository will remain configured
+as the `upstream` remote even though ongoing merge compatibility is not a goal.
 
 ### Components
 
 | Component | Responsibility |
 | --- | --- |
 | `app` | Startup, event loop, state transitions, scheduling, and shutdown |
-| `display` | Pygame/SDL initialization, KMS display selection, and frame presentation |
+| `display` | SDL initialization, KMS display selection, texture upload, touch events, and frame presentation |
 | `radar` | Pure radar geometry and 480×480 rendering |
 | `touch` | Tap and long-press recognition from SDL/Linux input events |
 | `adsb` | TLS-verified adsb.fi requests, response parsing, and immutable snapshots |
@@ -66,11 +80,13 @@ and documentation. The original repository will remain configured as the
 | `web` | Local responsive settings page and form endpoints |
 | `geocode` | Explicit address/place lookup with caching and rate limiting |
 | `setup_screen` | QR code, mDNS URL, IP URL, and network/status messages |
+| `install` | Idempotent target installation, boot overlay editing, and service setup |
 
 The production service will run as a dedicated `planeradar` system user. It will
 have only the groups needed for DRM and input devices plus
 `CAP_NET_BIND_SERVICE` for port 80. Persistent data will live in
-`/var/lib/planeradar`. Application files will live in `/opt/planeradar`.
+`/var/lib/planeradar`. The release binary, embedded-data manifest, and exact
+source revision will live in `/opt/planeradar`.
 
 ## Display and Interaction
 
@@ -98,9 +114,10 @@ The radar uses the upstream layout at exactly 2× its original pixel dimensions:
 - white, yellow, and blue aircraft tags; and
 - red rim dots for traffic beyond the outer ring.
 
-Pygame will maintain a cached static background containing the grid and runway
-overlay. Each ADS-B update copies that background and draws the current aircraft
-snapshot, avoiding partial frames and flicker.
+The renderer will maintain a cached static pixel buffer containing the grid and
+runway overlay. Each ADS-B update copies that background and draws the current
+aircraft snapshot, avoiding partial frames and flicker. SDL receives only
+complete frames.
 
 ### Gestures
 
@@ -204,22 +221,62 @@ configuration. Display initialization failure exits non-zero so systemd can
 restart the process. Logs go to the journal and must not contain address search
 text or other unnecessary location details.
 
+## Toolchain and Cross-build Environment
+
+`mise` is the only documented entry point for development and operational
+tasks. A repository `mise.toml` will pin Rust 1.97.1 and the small set of Cargo
+tools used by the project. Its named tasks will cover formatting, linting,
+tests, native development, ARM64 release builds, deployment, target smoke tests,
+and full verification. `mise.lock` and `Cargo.lock` will be committed.
+
+Host tests run natively on the Apple Silicon Mac. The macOS build uses bundled
+SDL only for development; production never uses that SDL build. The
+`mise run build-pi` task builds inside a pinned Debian 13 ARM64 container through
+the Mac's Docker-compatible OrbStack environment. The container installs the
+same SDL2 development headers supplied by Raspberry Pi OS and emits a release
+binary for `aarch64-unknown-linux-gnu`. The build records the clean source
+revision in the binary, verifies the output architecture with `file`, inspects
+dynamic dependencies with `readelf`, and writes the artifact and checksum under
+`dist/`.
+
+The cross-build task refuses to produce a deployable artifact from an
+uncommitted workspace. `mise run deploy-pi` transfers the checksummed artifact,
+installer payload, and recorded revision to `shayne@planeradar.local`. The Pi
+does not need `mise`, Cargo, Rust, Docker, or build headers in production.
+
+Real-target validation is incremental rather than deferred until the end. The
+implementation plan will include Pi build/deploy checkpoints after:
+
+1. SDL/KMS display and touch probing;
+2. radar and QR rendering;
+3. settings, geocoding, and ADS-B integration;
+4. gesture and runtime-state integration; and
+5. systemd installation and failure recovery.
+
+At every checkpoint, the artifact is built on this Mac, deployed to the
+configured Pi, and exercised end to end on the physical display. A failed
+checkpoint blocks later work until a regression test and verified fix are in
+place.
+
 ## Installation and Service Management
 
 The installer will:
 
 1. verify a supported Raspberry Pi OS environment;
-2. install Debian-packaged runtime dependencies;
-3. create the `planeradar` service account and persistent directory;
-4. install the current checkout into `/opt/planeradar`;
-5. configure the HyperPixel overlay idempotently, preserving a boot-config
+2. verify the artifact checksum and ARM64 architecture;
+3. install Debian-packaged runtime dependencies;
+4. create the `planeradar` service account and persistent directory;
+5. install the release binary and source revision into `/opt/planeradar`;
+6. configure the HyperPixel overlay idempotently, preserving a boot-config
    backup before the first change;
-6. install and enable the systemd unit; and
-7. reboot only when boot configuration changed.
+7. install and enable the systemd unit; and
+8. reboot only when boot configuration changed.
 
-Expected runtime packages include Python 3, Pygame/SDL2, Pillow, QR-code support,
-requests, and a packaged sans-serif font. No global `pip` installation is
-required on Debian 13.
+Expected runtime packages are SDL2 and CA certificates. The DejaVu Sans Bold
+font and its license ship as embedded application assets. Radar rendering, QR
+generation, HTTP, TLS, JSON, and runway data also ship in the Rust binary. No
+compiler, language package manager, or global language installation is required
+on Debian 13.
 
 The systemd unit starts after the network-online target, restarts on failure
 with bounded delay, runs without root, grants only low-port capability, and
@@ -238,10 +295,14 @@ applied only when they do not hide the required DRM or input devices.
 - Tap, movement tolerance, long press, and long-press release behavior.
 - Deterministic 480×480 renderer fixtures and approved golden PNGs.
 - Installer idempotence and boot-config editing against temporary fixtures.
-- Static checks and tests in GitHub Actions on pushes and pull requests.
+- Rustfmt, Clippy with warnings denied, tests, dependency-policy checks, and
+  ARM64 container builds in GitHub Actions on pushes and pull requests.
+- Host and ARM64 verification through the same named `mise` tasks used locally.
 
 ### Live Pi acceptance
 
+- Each vertical milestone is cross-built on the Mac, deployed to the Pi, and
+  smoke-tested before dependent work begins.
 - KMS reports a connected 480×480 HyperPixel display.
 - Linux/SDL reports touch input with the correct orientation.
 - The first-run QR and both HTTP URLs are legible on the physical screen.
@@ -253,6 +314,8 @@ applied only when they do not hide the required DRM or input devices.
 - A cold boot reaches the application without manual login.
 - A debug capture of the rendered surface matches the physical orientation and
   approved visual layout.
+- The installed binary reports the same source revision and SHA-256 checksum as
+  the final Mac-produced artifact.
 
 ## Publishing
 
@@ -266,7 +329,7 @@ The public repository will be `github.com/shayne/RPi-Plane-Radar`. It will:
 - document hardware, installation, configuration, gestures, architecture, and
   troubleshooting;
 - include representative screenshots and GitHub Actions status; and
-- publish the exact commit installed on the Pi.
+- publish the exact commit embedded in the binary installed on the Pi.
 
 The repository will be created and pushed only after the implementation and live
 acceptance checks pass.
@@ -277,9 +340,18 @@ acceptance checks pass.
   overlay.** The live kernel advertises touch parameters, but acceptance requires
   verifying the actual input device after enabling the overlay. Web settings
   remain usable if touch needs follow-up calibration.
-- **Direct KMS behavior can vary by SDL build.** Debian 13 supplies Pygame and
-  SDL2 packages. A minimal display probe will be the first implementation slice
-  before building the full renderer.
+- **Direct KMS behavior can vary by SDL build.** Debian 13 supplies SDL2 runtime
+  and development packages. Production links against Debian's SDL2 rather than
+  the bundled macOS development copy. A minimal ARM64 display probe will be the
+  first implementation slice before building the full renderer.
+- **Rust cross-builds can accidentally target the host or wrong libc.** The
+  release task runs in a pinned ARM64 Debian 13 container, checks the ELF
+  architecture and dynamic dependencies, records a checksum and source
+  revision, and must pass on the real Pi at each milestone.
+- **Container tooling can drift or be unavailable.** `mise`, Rust, container
+  base, Cargo dependencies, and Cargo tools are pinned. The build task performs
+  a preflight check and fails with a direct instruction if OrbStack/Docker is
+  not running.
 - **Physical rotation is unknown until the panel is active.** Rotation and
   touch-axis configuration will be calibrated together and captured
   declaratively.
@@ -293,6 +365,9 @@ acceptance checks pass.
 
 - Upstream project: <https://github.com/MatixYo/ESP32-Plane-Radar>
 - HyperPixel 2.1 Round: <https://shop.pimoroni.com/en-us/products/hyperpixel-round>
+- Rust: <https://www.rust-lang.org/>
+- mise: <https://mise.jdx.dev/>
+- SDL: <https://www.libsdl.org/>
 - Nominatim usage policy:
   <https://operations.osmfoundation.org/policies/nominatim/>
 - W3C Geolocation API: <https://www.w3.org/TR/geolocation/>
