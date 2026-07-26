@@ -90,6 +90,48 @@ fn east_west_offset_uses_cosine_of_mean_latitude() {
 }
 
 #[test]
+fn wraps_antimeridian_offsets_to_the_shortest_signed_direction() {
+    for (origin_longitude, target_longitude, expected_sign) in
+        [(179.9, -179.9, 1.0), (-179.9, 179.9, -1.0)]
+    {
+        let origin = location(70.0, origin_longitude);
+        let offset = offset_km(&origin, 70.0, target_longitude);
+        let projected = project_to_radar(
+            &origin,
+            70.0,
+            target_longitude,
+            OUTER_KM,
+            GRID_RADIUS_PX,
+            AIRCRAFT_SAFE_RADIUS_PX,
+        )
+        .expect("antimeridian projection");
+
+        assert_eq!(offset.north, 0.0);
+        assert!(
+            offset.east * expected_sign > 0.0,
+            "offset sign must be shortest-path {expected_sign}"
+        );
+        assert!(
+            (offset.east.abs() - 7.6).abs() < 0.1,
+            "offset must stay local"
+        );
+        assert!(projected.inside_ring);
+        assert!(
+            (projected.x - 240) as f64 * expected_sign > 0.0,
+            "projection must preserve the shortest-path direction"
+        );
+        assert_eq!(projected.y, 240);
+    }
+}
+
+#[test]
+fn treats_an_exact_one_hundred_eighty_degree_delta_as_west() {
+    let offset = offset_km(&location(0.0, 0.0), 0.0, 180.0);
+
+    assert!(offset.east < 0.0);
+}
+
+#[test]
 fn places_cardinal_bearings_on_the_requested_rim() {
     assert_eq!(rim_point(0.0, 1.0, 238.0), (240, 2));
     assert_eq!(rim_point(1.0, 0.0, 238.0), (478, 240));
@@ -101,6 +143,19 @@ fn places_cardinal_bearings_on_the_requested_rim() {
 fn rejects_nonpositive_or_nonfinite_rim_radius() {
     for radius_px in [0.0, -1.0, f64::NAN, f64::INFINITY] {
         assert_eq!(rim_point(1.0, 0.0, radius_px), (240, 240));
+    }
+}
+
+#[test]
+fn rejects_zero_or_nonfinite_rim_direction_components() {
+    for (east, north) in [
+        (0.0, 0.0),
+        (f64::NAN, 1.0),
+        (1.0, f64::NAN),
+        (f64::INFINITY, 1.0),
+        (1.0, f64::NEG_INFINITY),
+    ] {
+        assert_eq!(rim_point(east, north, 238.0), (240, 240));
     }
 }
 
@@ -160,6 +215,61 @@ fn rejects_nonpositive_or_nonfinite_projection_scale_inputs() {
             "invalid inputs ({outer_km}, {grid_radius_px}, {aircraft_safe_radius_px}) must fail"
         );
     }
+}
+
+#[test]
+fn rejects_every_nonfinite_origin_or_target_coordinate() {
+    let valid = location(40.7128, -74.0060);
+    let cases = [
+        (
+            location(f64::NAN, valid.longitude),
+            valid.latitude,
+            valid.longitude,
+        ),
+        (
+            location(valid.latitude, f64::INFINITY),
+            valid.latitude,
+            valid.longitude,
+        ),
+        (valid.clone(), f64::NEG_INFINITY, valid.longitude),
+        (valid.clone(), valid.latitude, f64::NAN),
+    ];
+
+    for (origin, latitude, longitude) in cases {
+        assert!(
+            project_to_radar(
+                &origin,
+                latitude,
+                longitude,
+                OUTER_KM,
+                GRID_RADIUS_PX,
+                AIRCRAFT_SAFE_RADIUS_PX,
+            )
+            .is_err()
+        );
+    }
+}
+
+#[test]
+fn inside_ring_uses_unrounded_distance_at_the_pixel_boundary() {
+    let origin = location(0.0, 0.0);
+    let target_km = OUTER_KM * 190.4 / GRID_RADIUS_PX;
+    let target_longitude = target_km / 6_371.008_8 * 180.0 / std::f64::consts::PI;
+    let projected = project_to_radar(
+        &origin,
+        0.0,
+        target_longitude,
+        OUTER_KM,
+        GRID_RADIUS_PX,
+        190.0,
+    )
+    .expect("boundary projection");
+
+    assert_eq!((projected.x, projected.y), (430, 240));
+    assert!(
+        !projected.inside_ring,
+        "the unrounded 190.4-pixel distance is beyond the 190-pixel safe radius"
+    );
 }
 
 fn pixel_radius(x: i32, y: i32) -> f64 {

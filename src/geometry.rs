@@ -34,11 +34,16 @@ pub enum GeometryError {
 pub fn offset_km(origin: &Location, latitude: f64, longitude: f64) -> OffsetKm {
     let lat0 = origin.latitude.to_radians();
     let lat1 = latitude.to_radians();
-    let dlon = (longitude - origin.longitude).to_radians();
+    let dlon = normalize_longitude_delta_degrees(longitude - origin.longitude).to_radians();
     OffsetKm {
         east: EARTH_RADIUS_KM * dlon * ((lat0 + lat1) / 2.0).cos(),
         north: EARTH_RADIUS_KM * (lat1 - lat0),
     }
+}
+
+/// Normalizes to [-180, 180); an exact 180-degree separation is westbound.
+fn normalize_longitude_delta_degrees(delta: f64) -> f64 {
+    (delta + 180.0).rem_euclid(360.0) - 180.0
 }
 
 pub fn project_to_radar(
