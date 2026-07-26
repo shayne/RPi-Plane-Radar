@@ -1,6 +1,8 @@
+use std::time::{Duration, Instant};
+
 use planeradar::display::{
-    DisplayConfig, InputEvent, normalize_finger, normalize_sdl_event, render_driver_matches,
-    video_driver_matches,
+    DisplayConfig, DisplayHandler, DisplayUpdate, InputEvent, normalize_finger,
+    normalize_sdl_event, render_driver_matches, run_display, video_driver_matches,
 };
 use sdl2::event::Event;
 use sdl2::mouse::{MouseButton, MouseState};
@@ -172,4 +174,38 @@ fn default_display_requires_the_verified_accelerated_renderer() {
 fn render_driver_name_is_matched_case_insensitively() {
     assert!(render_driver_matches("OpenGLES2", "opengles2"));
     assert!(!render_driver_matches("opengl", "opengles2"));
+}
+
+struct ExitImmediately {
+    shutdown_calls: usize,
+}
+
+impl DisplayHandler for ExitImmediately {
+    fn step(&mut self, _events: &[InputEvent], _now: Instant) -> DisplayUpdate {
+        DisplayUpdate {
+            frame: None,
+            exit: true,
+        }
+    }
+
+    fn shutdown(&mut self) {
+        self.shutdown_calls += 1;
+    }
+}
+
+#[test]
+fn display_exit_is_bounded_without_a_touch_read() {
+    let started = Instant::now();
+    let mut handler = ExitImmediately { shutdown_calls: 0 };
+    let config = DisplayConfig {
+        width: 16,
+        height: 16,
+        video_driver: "dummy".to_owned(),
+        render_driver: "software".to_owned(),
+        fullscreen: false,
+    };
+
+    run_display(config, &mut handler).expect("dummy display");
+    assert_eq!(handler.shutdown_calls, 1);
+    assert!(started.elapsed() < Duration::from_secs(5));
 }
