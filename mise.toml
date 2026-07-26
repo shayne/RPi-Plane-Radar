@@ -27,6 +27,26 @@ run = "cargo deny check"
 [tasks.verify]
 depends = ["fmt", "lint", "test", "deny"]
 
+[tasks.refresh-airports]
+run = '''
+set -euo pipefail
+refresh_dir="$(mktemp -d src/assets/.refresh-airports.XXXXXX)"
+trap 'rm -rf "$refresh_dir"' EXIT
+curl --fail --location --proto '=https' --tlsv1.2 \
+  https://ourairports.com/data/airports.csv \
+  --output "$refresh_dir/airports.csv"
+curl --fail --location --proto '=https' --tlsv1.2 \
+  https://ourairports.com/data/runways.csv \
+  --output "$refresh_dir/runways.csv"
+printf 'OurAirports retrieval date: %s\n' "$(date -u +%Y-%m-%d)"
+shasum -a 256 "$refresh_dir/airports.csv" "$refresh_dir/runways.csv"
+cargo run --locked --bin build-airports -- \
+  "$refresh_dir/airports.csv" \
+  "$refresh_dir/runways.csv" \
+  "$refresh_dir/large_airports.json.gz"
+mv "$refresh_dir/large_airports.json.gz" src/assets/large_airports.json.gz
+'''
+
 [tasks.build-pi]
 run = "./scripts/build-pi.sh"
 

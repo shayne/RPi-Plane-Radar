@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 pub mod adsb;
+pub mod airports;
 pub mod cli;
 pub mod display;
 pub mod geometry;

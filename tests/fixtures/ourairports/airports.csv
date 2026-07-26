@@ -1,0 +1,4 @@
+id,ident,type,name,latitude_deg,longitude_deg
+1,KJFK,large_airport,"John F. Kennedy – Aéroport",40.63944744,-73.77931744
+2,KSMALL,small_airport,"Petit aérodrome",40.1,-73.1
+3,KBAD,large_airport,"Malformed coordinate",not-a-number,-74.0
