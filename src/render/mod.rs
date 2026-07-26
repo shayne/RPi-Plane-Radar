@@ -5,6 +5,7 @@ use fontdue::{Font, FontSettings};
 use thiserror::Error;
 
 pub mod radar;
+pub mod setup;
 pub mod text;
 pub mod theme;
 
@@ -107,6 +108,8 @@ pub enum RenderError {
     InvalidFrameLength { expected: usize, actual: usize },
     #[error("PNG encoding failed: {0}")]
     Png(#[from] png::EncodingError),
+    #[error("QR encoding failed: {0}")]
+    Qr(#[from] qrcode::types::QrError),
     #[error("render I/O failed: {0}")]
     Io(#[from] std::io::Error),
     #[error("radar location is not configured")]

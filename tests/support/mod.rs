@@ -49,9 +49,12 @@ impl FrameAssertions for Frame {
             .join("tests")
             .join("goldens")
             .join(format!("{name}.png"));
-        let expected = decode_png(&expected_path);
         let (width, height) = self.dimensions();
-        if expected.0 == width && expected.1 == height && expected.2 == self.pixels() {
+        if let Some(expected) = decode_png(&expected_path)
+            && expected.0 == width
+            && expected.1 == height
+            && expected.2 == self.pixels()
+        {
             return;
         }
 
@@ -75,9 +78,12 @@ impl FrameAssertions for Frame {
     }
 }
 
-fn decode_png(path: &Path) -> (u32, u32, Vec<u8>) {
-    let file = fs::File::open(path)
-        .unwrap_or_else(|error| panic!("open golden {}: {error}", path.display()));
+fn decode_png(path: &Path) -> Option<(u32, u32, Vec<u8>)> {
+    let file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(error) => panic!("open golden {}: {error}", path.display()),
+    };
     let decoder = png::Decoder::new(std::io::BufReader::new(file));
     let mut reader = decoder
         .read_info()
@@ -91,9 +97,9 @@ fn decode_png(path: &Path) -> (u32, u32, Vec<u8>) {
         .unwrap_or_else(|error| panic!("decode golden {}: {error}", path.display()));
     assert_eq!(info.color_type, png::ColorType::Rgba);
     assert_eq!(info.bit_depth, png::BitDepth::Eight);
-    (
+    Some((
         info.width,
         info.height,
         buffer[..info.buffer_size()].to_vec(),
-    )
+    ))
 }
