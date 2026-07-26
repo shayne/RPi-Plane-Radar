@@ -1,11 +1,14 @@
 mod support;
 
+use fontdue::{Font, FontSettings};
 use qrcode::QrCode;
 use qrcode::types::{Color, EcLevel};
+use tiny_skia::Pixmap;
 
 use planeradar::render::setup::{
     CANONICAL_LOCAL_URL, SetupRenderer, fixture_required, fixture_settings,
 };
+use planeradar::render::text::{HorizontalAnchor, TextRasterizer, TextStyle, VerticalAnchor};
 use planeradar::render::{FontAsset, Frame};
 use support::FrameAssertions;
 
@@ -56,6 +59,69 @@ fn assert_canonical_qr(frame: &Frame) {
                     );
                 }
             }
+        }
+    }
+}
+
+fn assert_opaque_and_circular_safe(frame: &Frame) {
+    for y in 0..SIZE {
+        for x in 0..SIZE {
+            let pixel = frame.pixel(x, y);
+            assert_eq!(pixel[3], 255, "pixel ({x}, {y}) must be opaque");
+            if pixel != WHITE {
+                assert!(
+                    inside_safe_circle(x as i32, y as i32),
+                    "visible pixel ({x}, {y}) falls outside the circular safe region"
+                );
+            }
+        }
+    }
+}
+
+fn reference_text_frame(lines: &[(&str, f32, f32)]) -> Frame {
+    let font = Font::from_bytes(
+        include_bytes!("../src/assets/DejaVuSans-Bold.ttf").as_slice(),
+        FontSettings {
+            collection_index: 0,
+            scale: 40.0,
+            load_substitutions: true,
+        },
+    )
+    .expect("reference font");
+    let text = TextRasterizer::new(&font);
+    let mut pixmap = Pixmap::new(SIZE, SIZE).expect("reference pixmap");
+    pixmap.fill(tiny_skia::Color::from_rgba8(255, 255, 255, 255));
+    for &(line, top, cap_height) in lines {
+        text.draw(
+            &mut pixmap,
+            line,
+            SIZE as f32 / 2.0,
+            top,
+            TextStyle {
+                cap_height,
+                color: INK,
+                horizontal: HorizontalAnchor::Center,
+                vertical: VerticalAnchor::Top,
+            },
+        );
+    }
+    Frame::new(SIZE, SIZE, pixmap.take()).expect("reference frame")
+}
+
+fn assert_region_matches_reference(
+    frame: &Frame,
+    reference: &Frame,
+    top: u32,
+    height: u32,
+    label: &str,
+) {
+    for y in top..top + height {
+        for x in 0..SIZE {
+            assert_eq!(
+                frame.pixel(x, y),
+                reference.pixel(x, y),
+                "{label} mismatch at ({x}, {y})"
+            );
         }
     }
 }
@@ -148,17 +214,23 @@ fn all_ink_and_alpha_stay_inside_the_circular_safe_region_for_hostile_text() {
         &message,
     );
 
-    for y in 0..SIZE {
-        for x in 0..SIZE {
-            let pixel = frame.pixel(x, y);
-            assert_eq!(pixel[3], 255, "pixel ({x}, {y}) must be opaque");
-            if pixel != WHITE {
-                assert!(
-                    inside_safe_circle(x as i32, y as i32),
-                    "visible pixel ({x}, {y}) falls outside the circular safe region"
-                );
-            }
-        }
+    assert_opaque_and_circular_safe(&frame);
+}
+
+#[test]
+fn longest_valid_ipv6_urls_are_measured_to_fit_the_round_safe_region() {
+    for ip_url in [
+        "http://[ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff]",
+        "http://[ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff]:65535",
+    ] {
+        let frame = render(
+            CANONICAL_LOCAL_URL,
+            Some(ip_url),
+            true,
+            "Settings are available on this page",
+        );
+        assert_canonical_qr(&frame);
+        assert_opaque_and_circular_safe(&frame);
     }
 }
 
@@ -176,12 +248,6 @@ fn network_and_dismissal_control_text_cannot_be_overridden_by_messages_or_urls()
         false,
         "Open this page to set the radar location",
     );
-    let required_with_dismissal = render(
-        CANONICAL_LOCAL_URL,
-        None,
-        false,
-        "Tap to dismiss and return",
-    );
     let required_safe_fallback = render(
         CANONICAL_LOCAL_URL,
         None,
@@ -195,18 +261,84 @@ fn network_and_dismissal_control_text_cannot_be_overridden_by_messages_or_urls()
         "Settings are available on this page",
     );
 
-    assert_eq!(
-        missing_ip, invalid_ip,
-        "missing and invalid numeric URLs must show WAITING FOR NETWORK"
+    let waiting_reference = reference_text_frame(&[
+        ("http://planeradar.local", 322.0, 20.0),
+        ("WAITING FOR NETWORK", 351.0, 17.0),
+    ]);
+    assert_region_matches_reference(
+        &missing_ip,
+        &waiting_reference,
+        346,
+        34,
+        "WAITING FOR NETWORK",
     );
-    assert_eq!(
-        required_with_dismissal, required_safe_fallback,
-        "required setup must never render caller-provided dismissal language"
+    assert_region_matches_reference(
+        &invalid_ip,
+        &waiting_reference,
+        346,
+        34,
+        "invalid URL network status",
     );
-    assert_ne!(
-        configured, required_safe_fallback,
-        "configured settings must have distinct TAP TO RETURN control text"
+    let required_reference = reference_text_frame(&[
+        ("Open this page to set the", 381.0, 14.0),
+        ("radar location", 401.0, 14.0),
+    ]);
+    assert_region_matches_reference(
+        &required_safe_fallback,
+        &required_reference,
+        378,
+        46,
+        "fixed required instruction",
     );
+    let configured_control_reference = reference_text_frame(&[("TAP TO RETURN", 428.0, 12.0)]);
+    assert_region_matches_reference(
+        &configured,
+        &configured_control_reference,
+        424,
+        32,
+        "TAP TO RETURN",
+    );
+}
+
+#[test]
+fn required_instruction_ignores_disguised_dismissal_messages() {
+    let expected = render(
+        CANONICAL_LOCAL_URL,
+        None,
+        false,
+        "Open this page to set the radar location",
+    );
+    for disguised in [
+        "T\u{200b}AP TO DIS\u{200b}MISS AND RE\u{200b}TURN",
+        "T\u{2060}AP TO DIS\u{2060}MISS AND RE\u{2060}TURN",
+        "T\u{200c}AP TO DIS\u{200d}MISS AND RE\u{feff}TURN",
+        "T\0AP TO DIS\u{1f}MISS AND RE\tTURN",
+    ] {
+        assert!(
+            render(CANONICAL_LOCAL_URL, None, false, disguised) == expected,
+            "required setup must ignore caller message {disguised:?}"
+        );
+    }
+}
+
+#[test]
+fn oversized_raw_whitespace_url_is_rejected_before_trim_can_reveal_a_valid_url() {
+    let huge_candidate = format!(
+        "{}http://10.0.4.74{}",
+        " ".repeat(1_000_000),
+        " ".repeat(1_000_000)
+    );
+    let frame = render(
+        CANONICAL_LOCAL_URL,
+        Some(&huge_candidate),
+        true,
+        "Settings are available on this page",
+    );
+    let waiting_reference = reference_text_frame(&[
+        ("http://planeradar.local", 322.0, 20.0),
+        ("WAITING FOR NETWORK", 351.0, 17.0),
+    ]);
+    assert_region_matches_reference(&frame, &waiting_reference, 346, 34, "oversized raw URL");
 }
 
 #[test]
