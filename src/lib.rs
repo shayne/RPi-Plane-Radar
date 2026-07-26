@@ -8,7 +8,6 @@ pub mod display;
 pub mod geocode;
 pub mod geometry;
 pub mod http;
-pub mod hyperpixel;
 pub mod install;
 pub mod logging;
 pub mod model;
