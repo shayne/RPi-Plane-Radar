@@ -46,15 +46,64 @@ hp2r_release_path() {
 hp2r_verify_sha256() {
   local file="$1"
   local expected="$2"
+  local label="${3:-base DTB}"
   local actual
 
-  if command -v sha256sum >/dev/null 2>&1; then
-    actual="$(sha256sum "$file" | awk '{ print $1 }')"
-  else
-    actual="$(shasum -a 256 "$file" | awk '{ print $1 }')"
-  fi
+  actual="$(hp2r_sha256 "$file")" || return
   test "$actual" = "$expected" || {
-    echo "base DTB checksum mismatch for $file" >&2
+    echo "$label checksum mismatch for $file" >&2
+    return 1
+  }
+}
+
+hp2r_sha256() {
+  local file="$1"
+
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$file" | awk '{ print $1 }'
+  else
+    shasum -a 256 "$file" | awk '{ print $1 }'
+  fi
+}
+
+hp2r_require_clean_source() {
+  git diff-index --quiet HEAD -- || {
+    echo "tracked source is dirty; commit the exact source before building artifacts" >&2
+    return 1
+  }
+}
+
+hp2r_validate_source_identity() {
+  local source_dirty="$1"
+  local source_revision="$2"
+  local source_tree="$3"
+  local overlay_file="$4"
+  local expected_revision="$5"
+  local expected_tree="$6"
+
+  test "$source_dirty" = false || {
+    echo "driver artifacts require clean tracked source" >&2
+    return 1
+  }
+  [[ "$source_revision" =~ ^[0-9a-f]{40}$ ]] || {
+    echo "source revision is not a 40-character hexadecimal Git object ID" >&2
+    return 1
+  }
+  test "$source_revision" = "$expected_revision" || {
+    echo "source revision does not match checked source" >&2
+    return 1
+  }
+  [[ "$source_tree" =~ ^[0-9a-f]{40}$ ]] || {
+    echo "source tree is not a 40-character hexadecimal Git object ID" >&2
+    return 1
+  }
+  test "$source_tree" = "$expected_tree" || {
+    echo "source tree does not match checked source" >&2
+    return 1
+  }
+  test "$overlay_file" = \
+    "planeradar-hyperpixel2r-${source_revision:0:12}.dtbo" || {
+    echo "overlay filename does not match source revision" >&2
     return 1
   }
 }
