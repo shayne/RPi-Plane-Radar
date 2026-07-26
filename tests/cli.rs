@@ -1,5 +1,8 @@
 use std::process::Command;
 
+use clap::Parser;
+use planeradar::cli::{Cli, Command as CliCommand};
+
 #[test]
 fn version_reports_name_and_revision() {
     let output = Command::new(env!("CARGO_BIN_EXE_planeradar"))
@@ -87,4 +90,28 @@ fn setup_demo_rejects_an_unbounded_seconds_argument_before_opening_sdl() {
 
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("invalid value"));
+}
+
+#[test]
+fn run_headless_accepts_the_runtime_paths_and_addresses() {
+    let cli = Cli::try_parse_from([
+        "planeradar",
+        "run",
+        "--headless",
+        "--settings",
+        "/tmp/settings.json",
+        "--geocode-cache",
+        "/tmp/cache.json",
+        "--http",
+        "127.0.0.1:8080",
+        "--local-url",
+        "http://radar.test",
+        "--nominatim-url",
+        "https://example.test/search",
+    ])
+    .expect("parse runtime command");
+    assert!(matches!(
+        cli.command,
+        CliCommand::Run { headless: true, .. }
+    ));
 }

@@ -50,6 +50,8 @@ pub enum WebError {
     Json(#[from] serde_json::Error),
     #[error("LAN settings service failed")]
     Settings,
+    #[error("runtime settings update notification is unavailable")]
+    WorkerUnavailable,
     #[error("LAN settings server state is unavailable")]
     State,
 }

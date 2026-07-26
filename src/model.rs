@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -79,6 +79,113 @@ pub struct RadarSnapshot {
     pub aircraft: Arc<[Aircraft]>,
     pub fetched_at: Option<Duration>,
     pub last_error_at: Option<Duration>,
+}
+
+#[derive(Clone, Debug)]
+pub struct RuntimeSnapshot {
+    pub settings: RadarSettings,
+    pub aircraft: Arc<[Aircraft]>,
+    pub fetched_at: Option<Duration>,
+    pub last_error_at: Option<Duration>,
+    pub local_url: String,
+    pub ip_url: Option<String>,
+    pub generation: u64,
+}
+
+#[derive(Clone)]
+pub struct RuntimeModel {
+    snapshot: Arc<RwLock<RuntimeSnapshot>>,
+}
+
+impl RuntimeModel {
+    pub fn new(settings: RadarSettings, local_url: String) -> Self {
+        Self {
+            snapshot: Arc::new(RwLock::new(RuntimeSnapshot {
+                settings,
+                aircraft: Arc::from([]),
+                fetched_at: None,
+                last_error_at: None,
+                local_url,
+                ip_url: None,
+                generation: 0,
+            })),
+        }
+    }
+
+    pub fn snapshot(&self) -> RuntimeSnapshot {
+        self.snapshot.read().expect("runtime model lock").clone()
+    }
+
+    pub fn replace_settings(&self, settings: RadarSettings) -> u64 {
+        let mut snapshot = self.snapshot.write().expect("runtime model lock");
+        let query_changed = snapshot.settings.location != settings.location
+            || snapshot.settings.range_index != settings.range_index;
+        snapshot.settings = settings;
+        if query_changed {
+            snapshot.aircraft = Arc::from([]);
+            snapshot.fetched_at = None;
+        }
+        bump(&mut snapshot)
+    }
+
+    pub fn record_aircraft(&self, aircraft: Vec<Aircraft>, fetched_at: Duration) -> u64 {
+        let mut snapshot = self.snapshot.write().expect("runtime model lock");
+        snapshot.aircraft = Arc::from(aircraft);
+        snapshot.fetched_at = Some(fetched_at);
+        bump(&mut snapshot)
+    }
+
+    pub fn record_aircraft_if_query(
+        &self,
+        expected_location: &Location,
+        expected_range_index: u8,
+        aircraft: Vec<Aircraft>,
+        fetched_at: Duration,
+    ) -> Option<u64> {
+        let mut snapshot = self.snapshot.write().expect("runtime model lock");
+        if snapshot.settings.location.as_ref() != Some(expected_location)
+            || snapshot.settings.range_index != expected_range_index
+        {
+            return None;
+        }
+        snapshot.aircraft = Arc::from(aircraft);
+        snapshot.fetched_at = Some(fetched_at);
+        Some(bump(&mut snapshot))
+    }
+
+    pub fn record_adsb_error(&self, at: Duration) -> u64 {
+        let mut snapshot = self.snapshot.write().expect("runtime model lock");
+        snapshot.last_error_at = Some(at);
+        bump(&mut snapshot)
+    }
+
+    pub fn record_adsb_error_if_query(
+        &self,
+        expected_location: &Location,
+        expected_range_index: u8,
+        at: Duration,
+    ) -> Option<u64> {
+        let mut snapshot = self.snapshot.write().expect("runtime model lock");
+        if snapshot.settings.location.as_ref() != Some(expected_location)
+            || snapshot.settings.range_index != expected_range_index
+        {
+            return None;
+        }
+        snapshot.last_error_at = Some(at);
+        Some(bump(&mut snapshot))
+    }
+
+    pub fn set_urls(&self, local_url: String, ip_url: Option<String>) -> u64 {
+        let mut snapshot = self.snapshot.write().expect("runtime model lock");
+        snapshot.local_url = local_url;
+        snapshot.ip_url = ip_url;
+        bump(&mut snapshot)
+    }
+}
+
+fn bump(snapshot: &mut RuntimeSnapshot) -> u64 {
+    snapshot.generation = snapshot.generation.saturating_add(1);
+    snapshot.generation
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
