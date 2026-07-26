@@ -14,11 +14,27 @@ pub struct Cli {
 pub enum Command {
     Version,
     Probe,
+    Demo {
+        #[command(subcommand)]
+        command: DemoCommand,
+    },
+    RenderFixtures {
+        #[arg(long)]
+        output: PathBuf,
+    },
     ConfigureDisplay {
         #[arg(long, default_value = "/boot/firmware/config.txt")]
         boot_config: PathBuf,
         #[arg(long, default_value = DEFAULT_HYPERPIXEL_DECLARATION)]
         declaration: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum DemoCommand {
+    Radar {
+        #[arg(long)]
+        seconds: u64,
     },
 }
 

@@ -10,4 +10,5 @@ pub mod install;
 pub mod logging;
 pub mod model;
 pub mod range;
+pub mod render;
 pub mod settings;
