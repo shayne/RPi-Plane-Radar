@@ -12,3 +12,4 @@ pub mod model;
 pub mod range;
 pub mod render;
 pub mod settings;
+pub mod touch;
