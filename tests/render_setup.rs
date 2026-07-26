@@ -19,8 +19,10 @@ const QR_LEFT: u32 = 108;
 const QR_TOP: u32 = 50;
 const QR_MODULE_PIXELS: u32 = 8;
 const QR_QUIET_MODULES: u32 = 4;
+const BACKGROUND: [u8; 4] = [0, 0, 0, 255];
 const WHITE: [u8; 4] = [255, 255, 255, 255];
 const INK: [u8; 4] = [0, 0, 0, 255];
+const LIGHT_TEXT: [u8; 4] = [255, 255, 255, 255];
 
 fn test_setup_renderer() -> SetupRenderer {
     SetupRenderer::new(FontAsset::embedded().expect("embedded DejaVu font"))
@@ -41,21 +43,34 @@ fn assert_canonical_qr(frame: &Frame) {
     let code = expected_code();
     let code_width = u32::try_from(code.width()).expect("QR width");
     let colors = code.into_colors();
+    let total_modules = code_width + QR_QUIET_MODULES * 2;
 
-    for row in 0..code_width {
-        for column in 0..code_width {
-            let expected = match colors[usize::try_from(row * code_width + column).unwrap()] {
-                Color::Dark => INK,
-                Color::Light => WHITE,
+    for row in 0..total_modules {
+        for column in 0..total_modules {
+            let expected = if row < QR_QUIET_MODULES
+                || column < QR_QUIET_MODULES
+                || row >= QR_QUIET_MODULES + code_width
+                || column >= QR_QUIET_MODULES + code_width
+            {
+                WHITE
+            } else {
+                match colors[usize::try_from(
+                    (row - QR_QUIET_MODULES) * code_width + (column - QR_QUIET_MODULES),
+                )
+                .unwrap()]
+                {
+                    Color::Dark => INK,
+                    Color::Light => WHITE,
+                }
             };
-            let module_left = QR_LEFT + (QR_QUIET_MODULES + column) * QR_MODULE_PIXELS;
-            let module_top = QR_TOP + (QR_QUIET_MODULES + row) * QR_MODULE_PIXELS;
+            let module_left = QR_LEFT + column * QR_MODULE_PIXELS;
+            let module_top = QR_TOP + row * QR_MODULE_PIXELS;
             for y in module_top..module_top + QR_MODULE_PIXELS {
                 for x in module_left..module_left + QR_MODULE_PIXELS {
                     assert_eq!(
                         frame.pixel(x, y),
                         expected,
-                        "QR module ({column}, {row}) must be an opaque integer-aligned square"
+                        "QR tile module ({column}, {row}) must be an opaque integer-aligned square"
                     );
                 }
             }
@@ -63,12 +78,12 @@ fn assert_canonical_qr(frame: &Frame) {
     }
 }
 
-fn assert_opaque_and_circular_safe(frame: &Frame) {
+fn assert_opaque_and_content_stays_inside_the_circular_safe_region(frame: &Frame) {
     for y in 0..SIZE {
         for x in 0..SIZE {
             let pixel = frame.pixel(x, y);
             assert_eq!(pixel[3], 255, "pixel ({x}, {y}) must be opaque");
-            if pixel != WHITE {
+            if pixel != BACKGROUND {
                 assert!(
                     inside_safe_circle(x as i32, y as i32),
                     "visible pixel ({x}, {y}) falls outside the circular safe region"
@@ -90,7 +105,12 @@ fn reference_text_frame(lines: &[(&str, f32, f32)]) -> Frame {
     .expect("reference font");
     let text = TextRasterizer::new(&font);
     let mut pixmap = Pixmap::new(SIZE, SIZE).expect("reference pixmap");
-    pixmap.fill(tiny_skia::Color::from_rgba8(255, 255, 255, 255));
+    pixmap.fill(tiny_skia::Color::from_rgba8(
+        BACKGROUND[0],
+        BACKGROUND[1],
+        BACKGROUND[2],
+        BACKGROUND[3],
+    ));
     for &(line, top, cap_height) in lines {
         text.draw(
             &mut pixmap,
@@ -99,7 +119,7 @@ fn reference_text_frame(lines: &[(&str, f32, f32)]) -> Frame {
             top,
             TextStyle {
                 cap_height,
-                color: INK,
+                color: LIGHT_TEXT,
                 horizontal: HorizontalAnchor::Center,
                 vertical: VerticalAnchor::Top,
             },
@@ -154,6 +174,26 @@ fn setup_frame_encodes_only_the_stable_medium_ec_local_url() {
         assert_eq!(frame.dimensions(), (SIZE, SIZE));
         assert_canonical_qr(&frame);
     }
+}
+
+#[test]
+fn setup_frame_uses_a_black_canvas_white_qr_tile_and_light_text() {
+    let frame = render(
+        CANONICAL_LOCAL_URL,
+        Some("http://10.0.4.74"),
+        false,
+        "Open this page to set the radar location",
+    );
+
+    for (x, y) in [(0, 0), (479, 0), (0, 479), (479, 479), (240, 470)] {
+        assert_eq!(frame.pixel(x, y), BACKGROUND, "canvas pixel ({x}, {y})");
+    }
+    assert_canonical_qr(&frame);
+    assert!(
+        frame.color_count(LIGHT_TEXT, 0, 318, SIZE, 145) > 0,
+        "surrounding setup text must remain light and readable"
+    );
+    assert_opaque_and_content_stays_inside_the_circular_safe_region(&frame);
 }
 
 #[test]
@@ -214,7 +254,7 @@ fn all_ink_and_alpha_stay_inside_the_circular_safe_region_for_hostile_text() {
         &message,
     );
 
-    assert_opaque_and_circular_safe(&frame);
+    assert_opaque_and_content_stays_inside_the_circular_safe_region(&frame);
 }
 
 #[test]
@@ -230,7 +270,7 @@ fn longest_valid_ipv6_urls_are_measured_to_fit_the_round_safe_region() {
             "Settings are available on this page",
         );
         assert_canonical_qr(&frame);
-        assert_opaque_and_circular_safe(&frame);
+        assert_opaque_and_content_stays_inside_the_circular_safe_region(&frame);
     }
 }
 

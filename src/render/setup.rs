@@ -16,7 +16,8 @@ pub const CANONICAL_LOCAL_URL: &str = "http://planeradar.local";
 
 const SIZE: u32 = 480;
 const WHITE: [u8; 4] = [255, 255, 255, 255];
-const INK: [u8; 4] = theme::BACKGROUND;
+const QR_INK: [u8; 4] = theme::BACKGROUND;
+const LIGHT_TEXT: [u8; 4] = theme::LABEL;
 const QR_TOP: u32 = 50;
 const QR_MAX_PIXELS: u32 = 264;
 const QR_QUIET_MODULES: u32 = 4;
@@ -69,8 +70,20 @@ impl SetupRenderer {
 
         let mut pixmap = Pixmap::new(SIZE, SIZE).ok_or(RenderError::DimensionsOverflow)?;
         pixmap.fill(tiny_skia::Color::from_rgba8(
-            WHITE[0], WHITE[1], WHITE[2], WHITE[3],
+            theme::BACKGROUND[0],
+            theme::BACKGROUND[1],
+            theme::BACKGROUND[2],
+            theme::BACKGROUND[3],
         ));
+        let pixmap_width = pixmap.width();
+        fill_opaque_square(
+            pixmap.data_mut(),
+            pixmap_width,
+            qr_left,
+            QR_TOP,
+            qr_pixels,
+            WHITE,
+        )?;
         draw_qr(
             &mut pixmap,
             &code,
@@ -221,7 +234,7 @@ fn draw_qr(
                 module_left,
                 module_top,
                 module_pixels,
-                INK,
+                QR_INK,
             )?;
         }
     }
@@ -264,7 +277,7 @@ fn draw_centered_line(
         top,
         TextStyle {
             cap_height,
-            color: INK,
+            color: LIGHT_TEXT,
             horizontal: HorizontalAnchor::Center,
             vertical: VerticalAnchor::Top,
         },
