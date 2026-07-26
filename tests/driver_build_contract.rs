@@ -242,6 +242,241 @@ fn source_identity_rejects_dirty_stale_and_mismatched_overlay_provenance() {
 }
 
 #[test]
+fn app_build_uses_the_clean_workspace_head_identity_that_the_driver_manifest_records() {
+    let temporary = TempDir::new().expect("temporary directory must be created");
+    let fake_bin = temporary.path().join("bin");
+    fs::create_dir(&fake_bin).expect("fake bin directory must be created");
+    let real_git = String::from_utf8(
+        Command::new("which")
+            .arg("git")
+            .output()
+            .expect("find git")
+            .stdout,
+    )
+    .expect("git path")
+    .trim()
+    .to_owned();
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let synthesized_revision = "1".repeat(40);
+    let stack_revision = "2".repeat(40);
+    let source_tree = "3".repeat(40);
+    fs::create_dir_all(temporary.path().join("dist/hyperpixel/test"))
+        .expect("driver artifact directory must be created");
+    fs::write(
+        temporary.path().join("dist/hyperpixel/test/manifest.txt"),
+        format!("source_revision\t{synthesized_revision}\nsource_tree\t{source_tree}\n"),
+    )
+    .expect("driver manifest must be written");
+
+    fs::write(
+        fake_bin.join("git"),
+        format!(
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+case "$*" in
+  "status --porcelain") exit 0 ;;
+  "diff-index --quiet HEAD --") exit 0 ;;
+  "rev-parse HEAD") printf '%s\n' '{synthesized_revision}' ;;
+  "rev-parse HEAD^{{tree}}") printf '%s\n' '{source_tree}' ;;
+  "rev-parse --verify rpi-port^{{commit}}") printf '%s\n' '{stack_revision}' ;;
+  "archive --format=tar HEAD") exec '{real_git}' -C '{repository}' archive --format=tar HEAD ;;
+  *) printf 'unexpected git command: %s\n' "$*" >&2; exit 64 ;;
+esac
+"#,
+            real_git = real_git,
+            repository = repository.display(),
+        ),
+    )
+    .expect("fake git must be written");
+    fs::write(
+        fake_bin.join("docker"),
+        r#"#!/usr/bin/env bash
+set -euo pipefail
+case "${1-}" in
+  info) exit 0 ;;
+  buildx)
+    printf '%s\n' "$*" > docker-arguments.txt
+    mkdir -p dist
+    printf app > dist/planeradar
+    printf 'Machine: AArch64\n' > dist/planeradar.readelf.txt
+    ;;
+  *) exit 64 ;;
+esac
+"#,
+    )
+    .expect("fake docker must be written");
+    fs::write(
+        fake_bin.join("file"),
+        "#!/usr/bin/env bash\nprintf 'dist/planeradar: ELF 64-bit ARM aarch64\\n'\n",
+    )
+    .expect("fake file must be written");
+    for executable in ["git", "docker", "file"] {
+        let path = fake_bin.join(executable);
+        let mut permissions = fs::metadata(&path)
+            .expect("fake executable metadata must exist")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions).expect("fake executable must be executable");
+    }
+
+    let output = Command::new("bash")
+        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/build-pi.sh"))
+        .current_dir(temporary.path())
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                fake_bin.display(),
+                std::env::var("PATH").expect("PATH must be set")
+            ),
+        )
+        .output()
+        .expect("app build script must run");
+    assert!(
+        output.status.success(),
+        "app build failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let manifest = fs::read_to_string(temporary.path().join("dist/hyperpixel/test/manifest.txt"))
+        .expect("driver manifest must remain readable");
+    let driver_revision = manifest
+        .lines()
+        .find_map(|line| line.strip_prefix("source_revision\t"))
+        .expect("driver revision");
+    let driver_tree = manifest
+        .lines()
+        .find_map(|line| line.strip_prefix("source_tree\t"))
+        .expect("driver tree");
+    assert_eq!(
+        fs::read_to_string(temporary.path().join("dist/planeradar.revision"))
+            .expect("app revision")
+            .trim(),
+        driver_revision
+    );
+    assert_eq!(
+        fs::read_to_string(temporary.path().join("dist/planeradar.tree"))
+            .expect("app source tree")
+            .trim(),
+        driver_tree
+    );
+    let docker_arguments =
+        fs::read_to_string(temporary.path().join("docker-arguments.txt")).expect("docker args");
+    assert!(docker_arguments.contains(&format!(
+        "--build-arg PLANERADAR_REVISION={synthesized_revision}"
+    )));
+    assert!(!docker_arguments.contains(&stack_revision));
+}
+
+#[test]
+fn app_build_context_excludes_untracked_build_affecting_inputs() {
+    let temporary = TempDir::new().expect("temporary directory must be created");
+    let fake_bin = temporary.path().join("bin");
+    fs::create_dir(&fake_bin).expect("fake bin directory must be created");
+    fs::create_dir_all(temporary.path().join("packaging"))
+        .expect("packaging directory must be created");
+    fs::write(
+        temporary.path().join("packaging/Dockerfile.build"),
+        "FROM scratch\n",
+    )
+    .expect("tracked Dockerfile must be written");
+    fs::write(temporary.path().join("tracked.txt"), "tracked\n")
+        .expect("tracked sentinel must be written");
+
+    let run_git = |arguments: &[&str]| {
+        let output = Command::new("git")
+            .args(arguments)
+            .current_dir(temporary.path())
+            .output()
+            .expect("git command must run");
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            arguments,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    run_git(&["init", "-q"]);
+    run_git(&["config", "user.email", "fixture@example.invalid"]);
+    run_git(&["config", "user.name", "Fixture"]);
+    run_git(&["add", "packaging/Dockerfile.build", "tracked.txt"]);
+    run_git(&["commit", "-qm", "fixture"]);
+
+    fs::create_dir(temporary.path().join(".cargo"))
+        .expect("untracked cargo directory must be created");
+    fs::write(
+        temporary.path().join(".cargo/config.toml"),
+        "[build]\nrustflags = [\"--cfg\", \"untracked_input\"]\n",
+    )
+    .expect("untracked cargo config must be written");
+    fs::write(
+        temporary.path().join("build.rs"),
+        "fn main() { println!(\"cargo:rustc-cfg=untracked_input\"); }\n",
+    )
+    .expect("untracked build script must be written");
+
+    fs::write(
+        fake_bin.join("docker"),
+        r#"#!/usr/bin/env bash
+set -euo pipefail
+case "${1-}" in
+  info) exit 0 ;;
+  buildx)
+    context="${@: -1}"
+    test "$context" != "."
+    test -f "$context/tracked.txt"
+    test ! -e "$context/.cargo/config.toml"
+    test ! -e "$context/build.rs"
+    printf '%s\n' "$context" > docker-context.txt
+    mkdir -p dist
+    printf app > dist/planeradar
+    printf 'Machine: AArch64\n' > dist/planeradar.readelf.txt
+    ;;
+  *) exit 64 ;;
+esac
+"#,
+    )
+    .expect("fake docker must be written");
+    fs::write(
+        fake_bin.join("file"),
+        "#!/usr/bin/env bash\nprintf 'dist/planeradar: ELF 64-bit ARM aarch64\\n'\n",
+    )
+    .expect("fake file must be written");
+    for executable in ["docker", "file"] {
+        let path = fake_bin.join(executable);
+        let mut permissions = fs::metadata(&path)
+            .expect("fake executable metadata must exist")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions).expect("fake executable must be executable");
+    }
+
+    let output = Command::new("bash")
+        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/build-pi.sh"))
+        .current_dir(temporary.path())
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                fake_bin.display(),
+                std::env::var("PATH").expect("PATH must be set")
+            ),
+        )
+        .output()
+        .expect("app build script must run");
+    assert!(
+        output.status.success(),
+        "untracked inputs reached the app build context:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        temporary.path().join("docker-context.txt").is_file(),
+        "Docker never received an isolated build context"
+    );
+}
+
+#[test]
 fn build_rejects_dirty_tracked_source_before_compilation() {
     let temporary = TempDir::new().expect("temporary directory must be created");
     let release = "6.18.34+rpt-rpi-v8";

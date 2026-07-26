@@ -8,7 +8,10 @@ use clap::Parser;
 use planeradar::app::PlaneRadarApp;
 use planeradar::cli::{Cli, Command, DemoCommand, version_line};
 use planeradar::display::{DisplayConfig, run_display, run_probe};
-use planeradar::install::{BootConfigEditor, ensure_overlay};
+use planeradar::install::{
+    BootConfigEditor, DisplaySelection, commit_display_config, ensure_overlay,
+    rollback_display_config, stage_tryboot_config, stage_tryboot_config_if_source_matches,
+};
 use planeradar::logging;
 use planeradar::render::FontAsset;
 use planeradar::render::radar::RadarRenderer;
@@ -107,6 +110,49 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 println!("unchanged");
             }
+        }
+        Command::StageDisplay {
+            boot_config,
+            tryboot_config,
+            expected_boot_config_sha256,
+            overlay,
+            parameters,
+        } => {
+            let parameters: Vec<_> = parameters.iter().map(String::as_str).collect();
+            let selection = DisplaySelection::Candidate {
+                overlay: &overlay,
+                parameters: &parameters,
+            };
+            if let Some(expected) = expected_boot_config_sha256 {
+                stage_tryboot_config_if_source_matches(
+                    &boot_config,
+                    &tryboot_config,
+                    &expected,
+                    selection,
+                )?;
+            } else {
+                stage_tryboot_config(&boot_config, &tryboot_config, selection)?;
+            }
+            println!("staged {}", tryboot_config.display());
+        }
+        Command::CommitDisplay {
+            boot_config,
+            overlay,
+            parameters,
+        } => {
+            let parameters: Vec<_> = parameters.iter().map(String::as_str).collect();
+            let changed = commit_display_config(
+                &boot_config,
+                DisplaySelection::Candidate {
+                    overlay: &overlay,
+                    parameters: &parameters,
+                },
+            )?;
+            println!("{}", if changed { "changed" } else { "unchanged" });
+        }
+        Command::RollbackDisplay { boot_config } => {
+            let changed = rollback_display_config(&boot_config)?;
+            println!("{}", if changed { "changed" } else { "unchanged" });
         }
     }
     Ok(())

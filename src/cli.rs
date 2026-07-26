@@ -65,6 +65,30 @@ pub enum Command {
         #[arg(long, default_value = DEFAULT_HYPERPIXEL_DECLARATION)]
         declaration: String,
     },
+    StageDisplay {
+        #[arg(long, default_value = "/boot/firmware/config.txt")]
+        boot_config: PathBuf,
+        #[arg(long, default_value = "/boot/firmware/tryboot.txt")]
+        tryboot_config: PathBuf,
+        #[arg(long)]
+        expected_boot_config_sha256: Option<String>,
+        #[arg(long)]
+        overlay: String,
+        #[arg(long = "parameter")]
+        parameters: Vec<String>,
+    },
+    CommitDisplay {
+        #[arg(long, default_value = "/boot/firmware/config.txt")]
+        boot_config: PathBuf,
+        #[arg(long)]
+        overlay: String,
+        #[arg(long = "parameter")]
+        parameters: Vec<String>,
+    },
+    RollbackDisplay {
+        #[arg(long, default_value = "/boot/firmware/config.txt")]
+        boot_config: PathBuf,
+    },
 }
 
 #[derive(Debug, Subcommand)]

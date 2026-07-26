@@ -39,6 +39,18 @@ run = "./scripts/build-hyperpixel-driver.sh"
 [tasks.check-hyperpixel-artifacts]
 run = "./scripts/check-hyperpixel-artifacts.sh"
 
+[tasks.stage-hyperpixel-tryboot]
+run = "./scripts/stage-hyperpixel-tryboot.sh"
+
+[tasks.verify-hyperpixel-boot]
+run = "./scripts/verify-hyperpixel-boot.sh"
+
+[tasks.commit-hyperpixel-boot]
+run = "./scripts/commit-hyperpixel-boot.sh"
+
+[tasks.rollback-hyperpixel-boot]
+run = "./scripts/rollback-hyperpixel-boot.sh"
+
 [tasks.verify]
 depends = ["fmt", "lint", "test", "deny"]
 
