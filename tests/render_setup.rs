@@ -20,7 +20,7 @@ const QR_TOP: u32 = 50;
 const QR_MODULE_PIXELS: u32 = 8;
 const QR_QUIET_MODULES: u32 = 4;
 const WHITE: [u8; 4] = [255, 255, 255, 255];
-const INK: [u8; 4] = [4, 10, 28, 255];
+const INK: [u8; 4] = [0, 0, 0, 255];
 
 fn test_setup_renderer() -> SetupRenderer {
     SetupRenderer::new(FontAsset::embedded().expect("embedded DejaVu font"))
