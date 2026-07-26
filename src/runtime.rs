@@ -17,7 +17,7 @@ use crate::geocode::{GeocodeService, Geocoder};
 use crate::http::{HttpClient, UreqHttpClient};
 use crate::model::{AppState, RadarSettings};
 use crate::network::{current_interfaces, discover_ip_url};
-use crate::range::range_preset;
+use crate::range::{next_range_index, range_preset};
 use crate::settings::SettingsStore;
 use crate::time::{Clock, SystemClock, ThreadSleeper};
 use crate::web::{HealthSnapshot, HealthSource, SettingsServer, SettingsService, WebError};
@@ -292,6 +292,34 @@ impl RuntimeSettingsService {
             update: Mutex::new(()),
         }
     }
+
+    fn cycle_range(&self) -> Result<RadarSettings, WebError> {
+        self.update_settings(|model| {
+            let mut candidate = model.snapshot().settings;
+            candidate.range_index = next_range_index(candidate.range_index);
+            candidate
+        })
+    }
+
+    fn update_settings<F>(&self, transform: F) -> Result<RadarSettings, WebError>
+    where
+        F: FnOnce(&RuntimeModel) -> RadarSettings,
+    {
+        let _update = self.update.lock().map_err(|_| WebError::State)?;
+        let candidate = transform(&self.model);
+        self.commit(candidate.clone())?;
+        Ok(candidate)
+    }
+
+    fn commit(&self, candidate: RadarSettings) -> Result<(), WebError> {
+        self.store
+            .save(&candidate)
+            .map_err(|_| WebError::Settings)?;
+        self.model.replace_settings(candidate.clone());
+        self.notifier
+            .settings_changed(candidate)
+            .map_err(|_| WebError::WorkerUnavailable)
+    }
 }
 
 impl SettingsService for RuntimeSettingsService {
@@ -301,13 +329,7 @@ impl SettingsService for RuntimeSettingsService {
 
     fn replace(&self, candidate: RadarSettings) -> Result<(), WebError> {
         let _update = self.update.lock().map_err(|_| WebError::State)?;
-        self.store
-            .save(&candidate)
-            .map_err(|_| WebError::Settings)?;
-        self.model.replace_settings(candidate.clone());
-        self.notifier
-            .settings_changed(candidate)
-            .map_err(|_| WebError::WorkerUnavailable)
+        self.commit(candidate)
     }
 }
 
@@ -362,11 +384,25 @@ pub struct RuntimeHandle {
     pub model: RuntimeModel,
     pub commands: Sender<WorkerCommand>,
     pub stop: Arc<AtomicBool>,
+    settings: Arc<RuntimeSettingsService>,
+    clock: SharedClock,
     web_worker: Option<JoinHandle<Result<(), WebError>>>,
     adsb_worker: Option<JoinHandle<()>>,
 }
 
 impl RuntimeHandle {
+    pub fn cycle_range(&self) -> Result<RadarSettings, RuntimeError> {
+        Ok(self.settings.cycle_range()?)
+    }
+
+    pub fn monotonic(&self) -> Duration {
+        self.clock.monotonic()
+    }
+
+    pub fn stop_requested(&self) -> bool {
+        self.stop.load(Ordering::Acquire)
+    }
+
     pub fn shutdown(mut self) -> Result<(), RuntimeError> {
         self.stop.store(true, Ordering::Release);
         let _ = self.commands.send(WorkerCommand::Stop);
@@ -414,7 +450,7 @@ impl RuntimeCoordinator {
         signal_hook::flag::register(SIGTERM, stop.clone())
             .map_err(|_| RuntimeError::WorkerPanic)?;
 
-        let settings: Arc<dyn SettingsService> = Arc::new(RuntimeSettingsService::new(
+        let settings = Arc::new(RuntimeSettingsService::new(
             model.clone(),
             store,
             commands.clone(),
@@ -437,7 +473,7 @@ impl RuntimeCoordinator {
         };
         let server = Arc::new(SettingsServer::bind(
             config.http_address,
-            settings,
+            settings.clone(),
             Arc::new(Mutex::new(geocoder)),
             health,
             allowed_hosts,
@@ -446,11 +482,12 @@ impl RuntimeCoordinator {
         let web_worker = thread::spawn(move || server.run(&web_stop));
         let adsb_model = model.clone();
         let adsb_stop = stop.clone();
+        let adsb_clock = clock.clone();
         let adsb_worker = thread::spawn(move || {
             AdsbWorker::new(
                 AdsbClient::new(UreqHttpClient),
                 adsb_model,
-                clock,
+                adsb_clock,
                 ChannelWaiter,
             )
             .run(receiver, adsb_stop);
@@ -459,6 +496,8 @@ impl RuntimeCoordinator {
             model,
             commands,
             stop,
+            settings,
+            clock,
             web_worker: Some(web_worker),
             adsb_worker: Some(adsb_worker),
         })
@@ -516,6 +555,18 @@ mod tests {
                 .expect("notify release")
                 .recv()
                 .expect("release notification");
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingNotifier {
+        notified: Mutex<Option<RadarSettings>>,
+    }
+
+    impl SettingsNotifier for RecordingNotifier {
+        fn settings_changed(&self, settings: RadarSettings) -> Result<(), ()> {
+            *self.notified.lock().expect("notified settings") = Some(settings);
             Ok(())
         }
     }
@@ -579,5 +630,90 @@ mod tests {
 
         release_sender.send(()).expect("release notification");
         worker.join().expect("settings worker").expect("replace");
+    }
+
+    #[test]
+    fn range_cycle_reads_the_latest_settings_inside_the_transaction_guard() {
+        let model = RuntimeModel::new(
+            RadarSettings::default(),
+            "http://planeradar.local".to_owned(),
+        );
+        let writer = Arc::new(RecordingWriter::default());
+        let notifier = Arc::new(RecordingNotifier {
+            notified: Mutex::new(None),
+        });
+        let service = RuntimeSettingsService::with_components(
+            model.clone(),
+            writer.clone(),
+            notifier.clone(),
+        );
+        let web_candidate = RadarSettings {
+            location: Some(crate::model::Location {
+                latitude: 51.5,
+                longitude: -0.1,
+                label: "web".to_owned(),
+            }),
+            units: crate::model::Units::Miles,
+            show_runways: false,
+            range_index: 2,
+            ..RadarSettings::default()
+        };
+
+        service.replace(web_candidate.clone()).expect("web replace");
+        let cycled = service.cycle_range().expect("cycle range");
+        let expected = RadarSettings {
+            range_index: 3,
+            ..web_candidate
+        };
+        assert_eq!(cycled, expected);
+        assert_eq!(model.snapshot().settings, expected);
+        assert_eq!(
+            writer
+                .persisted
+                .lock()
+                .expect("persisted settings")
+                .as_ref(),
+            Some(&expected)
+        );
+        assert_eq!(
+            notifier
+                .notified
+                .lock()
+                .expect("notified settings")
+                .as_ref(),
+            Some(&expected)
+        );
+    }
+
+    #[test]
+    fn settings_transform_runs_while_the_transaction_guard_is_held() {
+        let model = RuntimeModel::new(
+            RadarSettings::default(),
+            "http://planeradar.local".to_owned(),
+        );
+        let writer = Arc::new(RecordingWriter::default());
+        let notifier = Arc::new(RecordingNotifier::default());
+        let service = Arc::new(RuntimeSettingsService::with_components(
+            model.clone(),
+            writer,
+            notifier,
+        ));
+
+        let transformed = service
+            .update_settings({
+                let service = service.clone();
+                move |model| {
+                    assert!(matches!(
+                        service.update.try_lock(),
+                        Err(TryLockError::WouldBlock)
+                    ));
+                    let mut candidate = model.snapshot().settings;
+                    candidate.range_index = next_range_index(candidate.range_index);
+                    candidate
+                }
+            })
+            .expect("transform");
+        assert_eq!(transformed.range_index, 2);
+        assert_eq!(model.snapshot().settings, transformed);
     }
 }

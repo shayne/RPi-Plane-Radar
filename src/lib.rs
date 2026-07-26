@@ -2,6 +2,7 @@
 
 pub mod adsb;
 pub mod airports;
+pub mod app;
 pub mod cli;
 pub mod display;
 pub mod geocode;

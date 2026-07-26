@@ -42,6 +42,12 @@ pub enum Command {
             default_value = "https://nominatim.openstreetmap.org/search"
         )]
         nominatim_url: String,
+        #[arg(
+            long,
+            env = "PLANERADAR_DEBUG_FRAME",
+            default_value = "/var/lib/planeradar/debug.png"
+        )]
+        debug_frame: PathBuf,
     },
     Version,
     Probe,
