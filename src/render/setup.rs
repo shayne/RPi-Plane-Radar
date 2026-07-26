@@ -9,13 +9,14 @@ use url::Host;
 
 use crate::display::{DisplayConfig, DisplayHandler, DisplayUpdate, InputEvent, run_display};
 use crate::render::text::{HorizontalAnchor, TextRasterizer, TextStyle, VerticalAnchor};
+use crate::render::theme;
 use crate::render::{FontAsset, Frame, RenderError};
 
 pub const CANONICAL_LOCAL_URL: &str = "http://planeradar.local";
 
 const SIZE: u32 = 480;
 const WHITE: [u8; 4] = [255, 255, 255, 255];
-const INK: [u8; 4] = [4, 10, 28, 255];
+const INK: [u8; 4] = theme::BACKGROUND;
 const QR_TOP: u32 = 50;
 const QR_MAX_PIXELS: u32 = 264;
 const QR_QUIET_MODULES: u32 = 4;

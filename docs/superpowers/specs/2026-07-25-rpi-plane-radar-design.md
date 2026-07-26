@@ -102,9 +102,12 @@ remain disabled as required by the display overlay. Rotation and touch-axis
 parameters will be selected during live hardware verification and recorded by
 the installer.
 
-The radar uses the upstream layout at exactly 2× its original pixel dimensions:
+The radar keeps the upstream spatial layout at exactly 2× its original pixel
+dimensions. Typography, symbols, dots, strokes, and their local spacing use 80%
+of the first Pi prototype's visual weight, rounded to native whole-pixel sizes,
+without shrinking the radar diameter:
 
-- dark blue circular field;
+- true black circular field;
 - four subdued green rings and crosshairs;
 - white N/S/E/W labels and center dot;
 - range label on the east spoke;

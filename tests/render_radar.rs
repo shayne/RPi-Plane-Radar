@@ -9,7 +9,12 @@ use planeradar::model::{
 };
 use planeradar::render::radar::{BackgroundKey, RadarRenderer};
 use planeradar::render::theme::{
-    AIRCRAFT, BACKGROUND, CENTER, GRID, GRID_OUTER_RADIUS, RUNWAY, SIZE, STALE, TRACK,
+    AIRCRAFT, AIRCRAFT_LABEL_GAP, AIRCRAFT_NOSE_LENGTH, AIRCRAFT_SAFE_RADIUS,
+    AIRCRAFT_TAG_CAP_HEIGHT, AIRCRAFT_TAIL_HALF_WIDTH, AIRCRAFT_TAIL_LENGTH, BACKGROUND,
+    CARDINAL_CAP_HEIGHT, CENTER, CENTER_DOT_RADIUS, GRID, GRID_OUTER_RADIUS, GRID_STROKE_WIDTH,
+    RIM_DOT_RADIUS, RIM_RADIUS, RUNWAY, RUNWAY_LABEL_CAP_HEIGHT, RUNWAY_LABEL_GAP,
+    RUNWAY_STROKE_WIDTH, SCALE_CAP_HEIGHT, SIZE, STALE, STALE_CAP_HEIGHT, TRACK, TRACK_MIN_LENGTH,
+    TRACK_STROKE_WIDTH,
 };
 use planeradar::render::{FontAsset, Frame, RenderError};
 use support::FrameAssertions;
@@ -26,6 +31,39 @@ const EMBEDDED_FONT_LICENSE_PATH: &str = concat!(
     "/src/assets/DejaVu-FONT-LICENSE.txt"
 );
 const EMBEDDED_FONT_LICENSE: &str = include_str!("../src/assets/DejaVu-FONT-LICENSE.txt");
+
+#[test]
+fn visual_metrics_use_whole_pixels_without_moving_the_radar() {
+    assert_eq!(BACKGROUND, [0, 0, 0, 255]);
+    assert_eq!(SIZE, 480);
+    assert_eq!(CENTER, (240.0, 240.0));
+    assert_eq!(GRID_OUTER_RADIUS, 214.0);
+    assert_eq!(AIRCRAFT_SAFE_RADIUS, 188.0);
+    assert_eq!(RIM_RADIUS, 238.0);
+
+    let refined = [
+        (GRID_STROKE_WIDTH, 3.0),
+        (CENTER_DOT_RADIUS, 3.0),
+        (AIRCRAFT_NOSE_LENGTH, 13.0),
+        (AIRCRAFT_TAIL_LENGTH, 5.0),
+        (AIRCRAFT_TAIL_HALF_WIDTH, 6.0),
+        (AIRCRAFT_LABEL_GAP, 2.0),
+        (TRACK_MIN_LENGTH, 3.0),
+        (TRACK_STROKE_WIDTH, 3.0),
+        (RIM_DOT_RADIUS, 6.0),
+        (RUNWAY_STROKE_WIDTH, 3.0),
+        (RUNWAY_LABEL_GAP, 5.0),
+        (CARDINAL_CAP_HEIGHT, 22.0),
+        (SCALE_CAP_HEIGHT, 18.0),
+        (AIRCRAFT_TAG_CAP_HEIGHT, 21.0),
+        (RUNWAY_LABEL_CAP_HEIGHT, 22.0),
+        (STALE_CAP_HEIGHT, 18.0),
+    ];
+    for (actual, expected) in refined {
+        assert_eq!(actual, expected);
+        assert_eq!(actual.fract(), 0.0);
+    }
+}
 
 fn test_renderer() -> RadarRenderer {
     RadarRenderer::new(FontAsset::embedded().expect("embedded DejaVu font"))
