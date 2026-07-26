@@ -17,6 +17,15 @@ use support::FrameAssertions;
 const ORIGIN_LATITUDE: f64 = 40.0;
 const ORIGIN_LONGITUDE: f64 = -75.0;
 const EARTH_RADIUS_KM: f64 = 6_371.008_8;
+const EMBEDDED_FONT_PATH: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/src/assets/DejaVuSans-Bold.ttf"
+);
+const EMBEDDED_FONT_LICENSE_PATH: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/src/assets/DejaVu-FONT-LICENSE.txt"
+);
+const EMBEDDED_FONT_LICENSE: &str = include_str!("../src/assets/DejaVu-FONT-LICENSE.txt");
 
 fn test_renderer() -> RadarRenderer {
     RadarRenderer::new(FontAsset::embedded().expect("embedded DejaVu font"))
@@ -294,37 +303,61 @@ fn empty_and_unrenderable_tag_strings_do_not_panic() {
 
 #[test]
 fn background_key_uses_exact_float_bits_and_every_static_setting() {
-    let mut settings = configured_settings();
-    settings.location.as_mut().expect("location").latitude = 0.0;
-    let base = BackgroundKey::from_settings(&settings).expect("background key");
-    settings.location.as_mut().expect("location").latitude = -0.0;
-    let negative_zero = BackgroundKey::from_settings(&settings).expect("negative-zero key");
+    let mut base_settings = configured_settings();
+    base_settings.location.as_mut().expect("location").latitude = 0.0;
+    let base = BackgroundKey::from_settings(&base_settings).expect("background key");
+
+    let mut changed = base_settings.clone();
+    changed.location.as_mut().expect("location").latitude = -0.0;
+    let negative_zero = BackgroundKey::from_settings(&changed).expect("negative-zero key");
     assert_ne!(base, negative_zero);
 
-    let mut changed = configured_settings();
+    changed = base_settings.clone();
     changed.location.as_mut().expect("location").longitude = -74.0;
     assert_ne!(
         base,
         BackgroundKey::from_settings(&changed).expect("longitude key")
     );
-    changed = configured_settings();
+    changed = base_settings.clone();
     changed.range_index = 2;
     assert_ne!(
         base,
         BackgroundKey::from_settings(&changed).expect("range key")
     );
-    changed = configured_settings();
+    changed = base_settings.clone();
     changed.units = Units::Miles;
     assert_ne!(
         base,
         BackgroundKey::from_settings(&changed).expect("units key")
     );
-    changed = configured_settings();
+    changed = base_settings.clone();
     changed.show_runways = false;
     assert_ne!(
         base,
         BackgroundKey::from_settings(&changed).expect("runway key")
     );
+}
+
+#[test]
+fn embedded_font_sidecar_contains_the_complete_upstream_notices() {
+    for distinctive_notice in [
+        "Bitstream Vera Fonts Copyright",
+        "DejaVu changes are in public domain.",
+        "Arev Fonts Copyright",
+        "Copyright (c) 2006 by Tavmjong Bah. All Rights Reserved.",
+        "the words \"Tavmjong Bah\" or the word \"Arev\"",
+    ] {
+        assert!(
+            EMBEDDED_FONT_LICENSE.contains(distinctive_notice),
+            "font sidecar must contain {distinctive_notice:?}"
+        );
+    }
+
+    let font = std::path::Path::new(EMBEDDED_FONT_PATH);
+    let license = std::path::Path::new(EMBEDDED_FONT_LICENSE_PATH);
+    assert_eq!(font.parent(), license.parent());
+    assert!(font.is_file());
+    assert!(license.is_file());
 }
 
 #[test]
