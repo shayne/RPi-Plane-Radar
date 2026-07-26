@@ -44,6 +44,8 @@ pub enum InputEvent {
 
 pub trait DisplayHandler {
     fn step(&mut self, events: &[InputEvent], now: Instant) -> DisplayUpdate;
+
+    fn shutdown(&mut self) {}
 }
 
 pub struct DisplayUpdate {
@@ -158,6 +160,9 @@ pub fn run_display<H: DisplayHandler>(
         });
     }
     let sdl = sdl2::init().map_err(DisplayError::Sdl)?;
+    if sdl2::touch::num_touch_devices() <= 0 {
+        log::warn!("touch input is unavailable; display and web setup remain active");
+    }
     let video = sdl.video().map_err(DisplayError::Sdl)?;
     let actual_driver = video.current_video_driver().to_owned();
     if !video_driver_matches(&actual_driver, &config.video_driver) {
@@ -234,6 +239,7 @@ pub fn run_display<H: DisplayHandler>(
             canvas.present();
         }
         if update.exit {
+            handler.shutdown();
             return Ok(());
         }
 
