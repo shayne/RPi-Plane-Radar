@@ -27,6 +27,18 @@ run = "cargo deny check"
 [tasks.test-driver-protocol]
 run = "./scripts/test-hyperpixel-protocol.sh"
 
+[tasks.test-driver-gpio]
+run = "./scripts/test-hyperpixel-gpio.sh"
+
+[tasks.export-pi-kernel-build]
+run = "./scripts/export-pi-kernel-build.sh"
+
+[tasks.build-hyperpixel-driver]
+run = "./scripts/build-hyperpixel-driver.sh"
+
+[tasks.check-hyperpixel-artifacts]
+run = "./scripts/check-hyperpixel-artifacts.sh"
+
 [tasks.verify]
 depends = ["fmt", "lint", "test", "deny"]
 
