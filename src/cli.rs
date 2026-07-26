@@ -36,6 +36,12 @@ pub enum DemoCommand {
         #[arg(long)]
         seconds: u64,
     },
+    Setup {
+        #[arg(long)]
+        ip_url: Option<String>,
+        #[arg(long)]
+        seconds: u64,
+    },
 }
 
 pub fn version_line() -> String {

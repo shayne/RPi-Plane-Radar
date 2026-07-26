@@ -8,6 +8,7 @@ use planeradar::display::run_probe;
 use planeradar::install::{BootConfigEditor, ensure_overlay};
 use planeradar::logging;
 use planeradar::render::radar::{run_radar_demo, write_fixtures};
+use planeradar::render::setup::{run_setup_demo, write_fixtures as write_setup_fixtures};
 
 fn main() {
     if let Err(error) = logging::init() {
@@ -27,7 +28,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         Command::Demo {
             command: DemoCommand::Radar { seconds },
         } => run_radar_demo(seconds)?,
-        Command::RenderFixtures { output } => write_fixtures(&output)?,
+        Command::Demo {
+            command: DemoCommand::Setup { ip_url, seconds },
+        } => run_setup_demo(ip_url.as_deref(), seconds)?,
+        Command::RenderFixtures { output } => {
+            write_fixtures(&output)?;
+            write_setup_fixtures(&output)?;
+        }
         Command::ConfigureDisplay {
             boot_config,
             declaration,
