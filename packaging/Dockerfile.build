@@ -1,0 +1,28 @@
+FROM rust:1.97.1-trixie AS build
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        binutils \
+        ca-certificates \
+        file \
+        libsdl2-dev \
+        pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace
+
+COPY . .
+
+ARG PLANERADAR_REVISION
+ENV PLANERADAR_REVISION=${PLANERADAR_REVISION}
+
+RUN cargo build --release --locked --bin planeradar \
+    && mkdir -p /out \
+    && file target/release/planeradar \
+    && readelf -d target/release/planeradar > /out/planeradar.readelf.txt \
+    && cp target/release/planeradar /out/planeradar
+
+FROM scratch AS artifact
+
+COPY --from=build /out/planeradar /planeradar
+COPY --from=build /out/planeradar.readelf.txt /planeradar.readelf.txt

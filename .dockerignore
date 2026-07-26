@@ -1,0 +1,7 @@
+.git
+.gitbutler
+target
+dist
+.vscode
+.DS_Store
+**/.DS_Store
