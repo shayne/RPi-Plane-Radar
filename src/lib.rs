@@ -15,3 +15,4 @@ pub mod render;
 pub mod settings;
 pub mod time;
 pub mod touch;
+pub mod web;
