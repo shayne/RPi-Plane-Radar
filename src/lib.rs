@@ -6,6 +6,7 @@ pub mod display;
 pub mod geometry;
 pub mod http;
 pub mod install;
+pub mod logging;
 pub mod model;
 pub mod range;
 pub mod settings;
