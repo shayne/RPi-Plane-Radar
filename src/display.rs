@@ -51,6 +51,21 @@ pub struct DisplayUpdate {
     pub exit: bool,
 }
 
+#[derive(Default)]
+struct PresentationState {
+    has_uploaded_frame: bool,
+}
+
+impl PresentationState {
+    fn record_upload(&mut self) {
+        self.has_uploaded_frame = true;
+    }
+
+    fn should_present(&self) -> bool {
+        self.has_uploaded_frame
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum DisplayError {
     #[error("SDL failure: {0}")]
@@ -188,6 +203,7 @@ pub fn run_display<H: DisplayHandler>(
         .and_then(|width| width.checked_mul(4))
         .ok_or(DisplayError::DimensionsOverflow)?;
     let frame_period = Duration::from_secs_f64(1.0 / f64::from(FRAME_RATE));
+    let mut presentation = PresentationState::default();
 
     loop {
         let frame_start = Instant::now();
@@ -206,6 +222,12 @@ pub fn run_display<H: DisplayHandler>(
             texture
                 .update(None, &frame, pitch)
                 .map_err(|error| DisplayError::Sdl(error.to_string()))?;
+            presentation.record_upload();
+        }
+        if presentation.should_present() {
+            // SDL invalidates the renderer backbuffer after every present. Keep
+            // the GPU texture, but redraw it so KMS always gets a complete frame.
+            canvas.clear();
             canvas
                 .copy(&texture, None, None)
                 .map_err(DisplayError::Sdl)?;
@@ -497,5 +519,20 @@ fn draw_top(frame: &mut [u8], width: u32, x: i32, y: i32) {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PresentationState;
+
+    #[test]
+    fn uploaded_frame_remains_presentable_on_unchanged_ticks() {
+        let mut state = PresentationState::default();
+        assert!(!state.should_present());
+
+        state.record_upload();
+        assert!(state.should_present());
+        assert!(state.should_present());
     }
 }
