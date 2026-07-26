@@ -1,7 +1,10 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::thread;
 use std::time::{Duration, Instant};
 
+#[cfg(target_os = "linux")]
+use crate::hyperpixel::{HyperpixelTouch, TOUCH_DEVICE};
 use sdl2::event::Event;
 use sdl2::mouse::MouseButton;
 use sdl2::pixels::PixelFormatEnum;
@@ -20,6 +23,7 @@ pub struct DisplayConfig {
     pub video_driver: String,
     pub render_driver: String,
     pub fullscreen: bool,
+    pub touch_device: Option<PathBuf>,
 }
 
 impl Default for DisplayConfig {
@@ -30,6 +34,7 @@ impl Default for DisplayConfig {
             video_driver: "kmsdrm".to_owned(),
             render_driver: "opengles2".to_owned(),
             fullscreen: true,
+            touch_device: default_touch_device(),
         }
     }
 }
@@ -160,7 +165,30 @@ pub fn run_display<H: DisplayHandler>(
         });
     }
     let sdl = sdl2::init().map_err(DisplayError::Sdl)?;
-    if sdl2::touch::num_touch_devices() <= 0 {
+    let sdl_touch_available = sdl2::touch::num_touch_devices() > 0;
+    #[cfg(target_os = "linux")]
+    let mut hyperpixel_touch =
+        config
+            .touch_device
+            .as_deref()
+            .and_then(|path| match HyperpixelTouch::open(path) {
+                Ok(touch) => {
+                    log::info!("HyperPixel touch input is available at {}", path.display());
+                    Some(touch)
+                }
+                Err(error) => {
+                    log::debug!(
+                        "HyperPixel touch input is unavailable at {}: {error}",
+                        path.display()
+                    );
+                    None
+                }
+            });
+    #[cfg(not(target_os = "linux"))]
+    let hyperpixel_touch_available = false;
+    #[cfg(target_os = "linux")]
+    let hyperpixel_touch_available = hyperpixel_touch.is_some();
+    if !sdl_touch_available && !hyperpixel_touch_available {
         log::warn!("touch input is unavailable; display and web setup remain active");
     }
     let video = sdl.video().map_err(DisplayError::Sdl)?;
@@ -209,13 +237,30 @@ pub fn run_display<H: DisplayHandler>(
         .ok_or(DisplayError::DimensionsOverflow)?;
     let frame_period = Duration::from_secs_f64(1.0 / f64::from(FRAME_RATE));
     let mut presentation = PresentationState::default();
+    #[cfg(target_os = "linux")]
+    let mut touch_error_reported = false;
 
     loop {
         let frame_start = Instant::now();
-        let events: Vec<_> = event_pump
+        let sdl_events: Vec<_> = event_pump
             .poll_iter()
             .filter_map(|event| normalize_sdl_event(&event))
             .collect();
+        #[cfg(target_os = "linux")]
+        let mut events = sdl_events;
+        #[cfg(not(target_os = "linux"))]
+        let events = sdl_events;
+        #[cfg(target_os = "linux")]
+        if let Some(touch) = hyperpixel_touch.as_mut() {
+            match touch.poll() {
+                Ok(touch_events) => events.extend(touch_events),
+                Err(error) if !touch_error_reported => {
+                    log::warn!("HyperPixel touch read failed; retrying: {error}");
+                    touch_error_reported = true;
+                }
+                Err(_) => {}
+            }
+        }
         let update = handler.step(&events, frame_start);
         if let Some(frame) = update.frame {
             if frame.len() != expected_len {
@@ -246,6 +291,17 @@ pub fn run_display<H: DisplayHandler>(
         if let Some(remaining) = frame_period.checked_sub(frame_start.elapsed()) {
             thread::sleep(remaining);
         }
+    }
+}
+
+fn default_touch_device() -> Option<PathBuf> {
+    #[cfg(target_os = "linux")]
+    {
+        Some(PathBuf::from(TOUCH_DEVICE))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
     }
 }
 
