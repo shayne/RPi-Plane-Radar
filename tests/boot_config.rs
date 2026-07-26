@@ -1,7 +1,9 @@
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 
-use planeradar::install::{edit_boot_config, ensure_overlay};
+use planeradar::install::{
+    InstallError, edit_boot_config, edit_boot_config_from_source, ensure_overlay,
+};
 
 const DECLARATION: &str = "dtoverlay=vc4-kms-dpi-hyperpixel2r";
 
@@ -85,6 +87,24 @@ fn preserves_crlf_newlines() {
 }
 
 #[test]
+fn preserves_unrelated_mixed_newline_bytes() {
+    let source = "[all]\r\ndtparam=audio=on\ndtoverlay=vc4-kms-v3d\r\n";
+    assert_eq!(
+        ensure_overlay(source, DECLARATION),
+        (
+            concat!(
+                "[all]\r\n",
+                "dtoverlay=vc4-kms-dpi-hyperpixel2r\r\n",
+                "dtparam=audio=on\n",
+                "dtoverlay=vc4-kms-v3d\r\n",
+            )
+            .to_owned(),
+            true,
+        )
+    );
+}
+
+#[test]
 fn preserves_missing_final_newline() {
     let source = "[all]\ndtoverlay=vc4-kms-v3d";
     assert_eq!(
@@ -142,4 +162,28 @@ fn edit_creates_one_backup_and_preserves_file_mode() {
         0o640
     );
     assert!(!edit_boot_config(&path, DECLARATION).expect("idempotent edit"));
+}
+
+#[test]
+fn approved_preview_rejects_a_concurrent_boot_config_change() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let path = directory.path().join("config.txt");
+    let approved = "[all]\ndtoverlay=vc4-kms-v3d\n";
+    let concurrent = "[all]\ndtoverlay=vc4-kms-v3d\n# concurrent edit\n";
+    fs::write(&path, approved).expect("write approved fixture");
+    fs::write(&path, concurrent).expect("write concurrent fixture");
+
+    let error = edit_boot_config_from_source(&path, approved, DECLARATION)
+        .expect_err("concurrent edit must be rejected");
+    assert!(matches!(error, InstallError::SourceChanged(changed) if changed == path));
+    assert_eq!(
+        fs::read_to_string(&path).expect("read rejected fixture"),
+        concurrent
+    );
+    assert!(
+        !directory
+            .path()
+            .join("config.txt.planeradar-backup")
+            .exists()
+    );
 }

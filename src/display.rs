@@ -11,6 +11,7 @@ pub const LOGICAL_WIDTH: u32 = 480;
 pub const LOGICAL_HEIGHT: u32 = 480;
 const FRAME_RATE: u32 = 30;
 const PROBE_DURATION: Duration = Duration::from_secs(30);
+const SDL_TOUCH_MOUSE_ID: u32 = u32::MAX;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DisplayConfig {
@@ -88,20 +89,26 @@ pub fn normalize_sdl_event(event: &Event) -> Option<InputEvent> {
             })
         }
         Event::MouseButtonDown {
+            which,
             mouse_btn: MouseButton::Left,
             x,
             y,
             ..
-        } => Some(mouse_event(x, y, true)),
+        } if which != SDL_TOUCH_MOUSE_ID => Some(mouse_event(x, y, true)),
         Event::MouseButtonUp {
+            which,
             mouse_btn: MouseButton::Left,
             x,
             y,
             ..
-        } => Some(mouse_event(x, y, false)),
+        } if which != SDL_TOUCH_MOUSE_ID => Some(mouse_event(x, y, false)),
         Event::MouseMotion {
-            mousestate, x, y, ..
-        } if mousestate.left() => {
+            which,
+            mousestate,
+            x,
+            y,
+            ..
+        } if which != SDL_TOUCH_MOUSE_ID && mousestate.left() => {
             let (x, y) = mouse_coordinates(x, y);
             Some(InputEvent::Moved {
                 pointer_id: 0,
@@ -119,6 +126,7 @@ pub fn run_display<H: DisplayHandler>(
     handler: &mut H,
 ) -> Result<(), DisplayError> {
     sdl2::hint::set("SDL_VIDEODRIVER", &config.video_driver);
+    sdl2::hint::set("SDL_TOUCH_MOUSE_EVENTS", "0");
     let sdl = sdl2::init().map_err(DisplayError::Sdl)?;
     let video = sdl.video().map_err(DisplayError::Sdl)?;
     let actual_driver = video.current_video_driver().to_owned();
