@@ -24,6 +24,9 @@ run = "cargo nextest run --all-features"
 [tasks.deny]
 run = "cargo deny check"
 
+[tasks.test-driver-protocol]
+run = "./scripts/test-hyperpixel-protocol.sh"
+
 [tasks.verify]
 depends = ["fmt", "lint", "test", "deny"]
 
