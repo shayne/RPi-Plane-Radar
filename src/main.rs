@@ -6,7 +6,7 @@ use std::io::{self, Write};
 use clap::Parser;
 use planeradar::cli::{Cli, Command, version_line};
 use planeradar::display::run_probe;
-use planeradar::install::{edit_boot_config, ensure_overlay};
+use planeradar::install::{edit_boot_config_from_source, ensure_overlay};
 
 fn main() {
     if let Err(error) = run() {
@@ -43,7 +43,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 return Ok(());
             }
 
-            if edit_boot_config(&boot_config, &declaration)? {
+            if edit_boot_config_from_source(&boot_config, &source, &declaration)? {
                 println!("changed");
             } else {
                 println!("unchanged");

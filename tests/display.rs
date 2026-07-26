@@ -120,6 +120,35 @@ fn non_left_mouse_buttons_are_ignored() {
 }
 
 #[test]
+fn synthetic_mouse_events_from_touch_are_ignored() {
+    assert_eq!(
+        normalize_sdl_event(&Event::MouseButtonDown {
+            timestamp: 0,
+            window_id: 1,
+            which: u32::MAX,
+            mouse_btn: MouseButton::Left,
+            clicks: 1,
+            x: 120,
+            y: 240,
+        }),
+        None
+    );
+    assert_eq!(
+        normalize_sdl_event(&Event::MouseMotion {
+            timestamp: 0,
+            window_id: 1,
+            which: u32::MAX,
+            mousestate: MouseState::from_sdl_state(1),
+            x: 121,
+            y: 241,
+            xrel: 1,
+            yrel: 1,
+        }),
+        None
+    );
+}
+
+#[test]
 fn quit_is_normalized() {
     assert_eq!(
         normalize_sdl_event(&Event::Quit { timestamp: 0 }),
