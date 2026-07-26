@@ -122,7 +122,7 @@ pub fn run_display<H: DisplayHandler>(
     let sdl = sdl2::init().map_err(DisplayError::Sdl)?;
     let video = sdl.video().map_err(DisplayError::Sdl)?;
     let actual_driver = video.current_video_driver().to_owned();
-    if actual_driver != config.video_driver {
+    if !video_driver_matches(&actual_driver, &config.video_driver) {
         return Err(DisplayError::WrongVideoDriver {
             expected: config.video_driver,
             actual: actual_driver,
@@ -189,6 +189,10 @@ pub fn run_display<H: DisplayHandler>(
             thread::sleep(remaining);
         }
     }
+}
+
+pub fn video_driver_matches(actual: &str, expected: &str) -> bool {
+    actual.eq_ignore_ascii_case(expected)
 }
 
 pub fn run_probe() -> Result<(), DisplayError> {
