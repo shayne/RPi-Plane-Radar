@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Read};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -21,6 +21,7 @@ const MAX_SESSIONS: usize = 128;
 const SESSION_LIFETIME: Duration = Duration::from_secs(60 * 60);
 const RECEIVE_TIMEOUT: Duration = Duration::from_millis(50);
 const SESSION_COOKIE: &str = "planeradar_session";
+const MAX_IN_FLIGHT_REQUESTS: usize = 16;
 
 pub trait SettingsService: Send + Sync {
     fn current(&self) -> RadarSettings;
@@ -55,11 +56,16 @@ pub enum WebError {
 
 pub struct SettingsServer {
     server: Server,
+    state: Arc<ServerState>,
+}
+
+struct ServerState {
     settings: Arc<dyn SettingsService>,
     geocoder: Arc<Mutex<Box<dyn GeocodeService>>>,
     health: Arc<dyn HealthSource>,
     allowed_hosts: Arc<dyn Fn() -> HashSet<String> + Send + Sync>,
     sessions: Mutex<SessionStore>,
+    in_flight_requests: AtomicUsize,
 }
 
 impl SettingsServer {
@@ -73,23 +79,39 @@ impl SettingsServer {
         let server = Server::http(address).map_err(|error| WebError::Bind(error.to_string()))?;
         Ok(Self {
             server,
-            settings,
-            geocoder,
-            health,
-            allowed_hosts,
-            sessions: Mutex::new(SessionStore::default()),
+            state: Arc::new(ServerState {
+                settings,
+                geocoder,
+                health,
+                allowed_hosts,
+                sessions: Mutex::new(SessionStore::default()),
+                in_flight_requests: AtomicUsize::new(0),
+            }),
         })
     }
 
     pub fn run(&self, stop: &AtomicBool) -> Result<(), WebError> {
         while !stop.load(Ordering::Acquire) {
             if let Some(request) = self.server.recv_timeout(RECEIVE_TIMEOUT)? {
-                self.handle(request)?;
+                if !self.state.try_acquire_request_slot() {
+                    let _ =
+                        request.respond(Outgoing::text(503, "Service unavailable").into_response());
+                    continue;
+                }
+                let state = self.state.clone();
+                std::thread::spawn(move || {
+                    let _request_slot = RequestSlot {
+                        state: state.clone(),
+                    };
+                    let _ = state.handle(request);
+                });
             }
         }
         Ok(())
     }
+}
 
+impl ServerState {
     fn handle(&self, mut request: Request) -> Result<(), WebError> {
         let outgoing = match self.route(&mut request) {
             Ok(response) => response,
@@ -121,7 +143,7 @@ impl SettingsServer {
 
     fn page(&self) -> Result<Outgoing, WebError> {
         let (session_id, csrf_token) = self.sessions.lock().map_err(|_| WebError::State)?.create();
-        let body = render_page(&self.settings.current(), &csrf_token, &[]);
+        let body = render_page(&self.settings.current(), &csrf_token, &[], None);
         Ok(Outgoing::html(200, body)
             .with_header(
                 "Set-Cookie",
@@ -195,9 +217,17 @@ impl SettingsServer {
             .search(query)
         {
             Ok(results) => results,
-            Err(_) => return Ok(Outgoing::text(502, "Search unavailable")),
+            Err(_) => {
+                let body = render_page(
+                    &self.settings.current(),
+                    csrf_token,
+                    &[],
+                    Some("Search unavailable; enter coordinates manually"),
+                );
+                return Ok(Outgoing::html(200, body).with_header("Cache-Control", "no-store"));
+            }
         };
-        let body = render_page(&self.settings.current(), csrf_token, &results);
+        let body = render_page(&self.settings.current(), csrf_token, &results, None);
         Ok(Outgoing::html(200, body).with_header("Cache-Control", "no-store"))
     }
 
@@ -248,6 +278,34 @@ impl SettingsServer {
             .iter()
             .filter_map(|allowed| Authority::parse_host_header(allowed))
             .any(|allowed| allowed == *authority)
+    }
+
+    fn try_acquire_request_slot(&self) -> bool {
+        let mut active = self.in_flight_requests.load(Ordering::Acquire);
+        loop {
+            if active >= MAX_IN_FLIGHT_REQUESTS {
+                return false;
+            }
+            match self.in_flight_requests.compare_exchange_weak(
+                active,
+                active + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(current) => active = current,
+            }
+        }
+    }
+}
+
+struct RequestSlot {
+    state: Arc<ServerState>,
+}
+
+impl Drop for RequestSlot {
+    fn drop(&mut self) {
+        self.state.in_flight_requests.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -531,7 +589,12 @@ fn header_values<'a>(request: &'a Request, name: &'static str) -> Vec<&'a str> {
         .collect()
 }
 
-fn render_page(settings: &RadarSettings, csrf_token: &str, results: &[GeocodeResult]) -> String {
+fn render_page(
+    settings: &RadarSettings,
+    csrf_token: &str,
+    results: &[GeocodeResult],
+    message: Option<&str>,
+) -> String {
     let (latitude, longitude, label) = settings
         .location
         .as_ref()
@@ -560,6 +623,9 @@ fn render_page(settings: &RadarSettings, csrf_token: &str, results: &[GeocodeRes
     } else {
         ""
     };
+    let message = message
+        .map(|message| format!("<p role=\"alert\">{}</p>", escape_html(message)))
+        .unwrap_or_default();
 
     let mut result_forms = String::new();
     for result in results {
@@ -601,11 +667,27 @@ fn render_page(settings: &RadarSettings, csrf_token: &str, results: &[GeocodeRes
     format!(
         r#"<!doctype html>
 <html lang="en">
-<head><meta charset="utf-8"><title>Plane Radar settings</title></head>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Plane Radar settings</title>
+<style>
+* {{ box-sizing: border-box; }}
+body {{ margin: 0; font-size: 16px; line-height: 1.5; }}
+main {{ width: min(100%, 42rem); margin: 0 auto; padding: 1rem; }}
+section {{ margin-block: 1.5rem; }}
+form {{ display: grid; gap: 0.75rem; }}
+label {{ display: grid; gap: 0.25rem; min-width: 0; }}
+input, select, button {{ width: 100%; min-height: 2.75rem; font: inherit; }}
+p, button {{ overflow-wrap: anywhere; }}
+@media (min-width: 40rem) {{ main {{ padding: 2rem; }} }}
+</style>
+</head>
 <body>
 <main>
 <h1>Plane Radar settings</h1>
 <p>Open this page at <a href="http://planeradar.local">http://planeradar.local</a>.</p>
+{message}
 <section>
 <h2>Search for a place</h2>
 <form action="/search" method="post">

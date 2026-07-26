@@ -1,10 +1,10 @@
 use std::collections::HashSet;
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use planeradar::geocode::{GeocodeError, GeocodeResult, GeocodeService};
 use planeradar::model::{AppState, Location, RadarSettings, Units};
@@ -48,6 +48,14 @@ struct TestGeocoder {
     queries: Arc<Mutex<Vec<String>>>,
 }
 
+struct FailingGeocoder;
+
+impl GeocodeService for FailingGeocoder {
+    fn search(&mut self, _query: &str) -> Result<Vec<GeocodeResult>, GeocodeError> {
+        Err(GeocodeError::InvalidQuery)
+    }
+}
+
 impl GeocodeService for TestGeocoder {
     fn search(&mut self, query: &str) -> Result<Vec<GeocodeResult>, GeocodeError> {
         self.queries.lock().unwrap().push(query.to_owned());
@@ -75,6 +83,11 @@ struct HttpResponse {
     body: String,
 }
 
+struct WireBody<'a> {
+    bytes: &'a [u8],
+    has_content_length: bool,
+}
+
 impl HttpResponse {
     fn header(&self, name: &str) -> Option<&str> {
         self.headers
@@ -100,13 +113,29 @@ struct TestServer {
 
 impl TestServer {
     fn new(initial: RadarSettings, results: Vec<GeocodeResult>) -> Self {
-        let address = reserve_address();
-        let settings = TestSettings::new(initial);
         let queries = Arc::new(Mutex::new(Vec::new()));
         let geocoder: Box<dyn GeocodeService> = Box::new(TestGeocoder {
             results,
             queries: queries.clone(),
         });
+        Self::start(initial, geocoder, queries)
+    }
+
+    fn with_failing_geocoder(initial: RadarSettings) -> Self {
+        Self::start(
+            initial,
+            Box::new(FailingGeocoder),
+            Arc::new(Mutex::new(Vec::new())),
+        )
+    }
+
+    fn start(
+        initial: RadarSettings,
+        geocoder: Box<dyn GeocodeService>,
+        queries: Arc<Mutex<Vec<String>>>,
+    ) -> Self {
+        let address = reserve_address();
+        let settings = TestSettings::new(initial);
         let allowed_address = address;
         let allowed_hosts = Arc::new(move || {
             HashSet::from([
@@ -207,28 +236,108 @@ impl TestServer {
         wire_body: &[u8],
         add_content_length: bool,
     ) -> HttpResponse {
+        self.request_with_timeout(
+            method,
+            path,
+            host,
+            headers,
+            WireBody {
+                bytes: wire_body,
+                has_content_length: add_content_length,
+            },
+            Duration::from_secs(3),
+        )
+        .unwrap()
+    }
+
+    fn get_with_timeout(&self, path: &str, timeout: Duration) -> io::Result<HttpResponse> {
+        self.request_with_timeout(
+            "GET",
+            path,
+            &self.allowed_host(),
+            Vec::new(),
+            WireBody {
+                bytes: &[],
+                has_content_length: true,
+            },
+            timeout,
+        )
+    }
+
+    fn request_with_timeout(
+        &self,
+        method: &str,
+        path: &str,
+        host: &str,
+        headers: Vec<(String, String)>,
+        wire_body: WireBody<'_>,
+        timeout: Duration,
+    ) -> io::Result<HttpResponse> {
         let mut request =
             format!("{method} {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n")
                 .into_bytes();
         for (name, value) in headers {
             request.extend_from_slice(format!("{name}: {value}\r\n").as_bytes());
         }
-        if add_content_length {
-            request
-                .extend_from_slice(format!("Content-Length: {}\r\n", wire_body.len()).as_bytes());
+        if wire_body.has_content_length {
+            request.extend_from_slice(
+                format!("Content-Length: {}\r\n", wire_body.bytes.len()).as_bytes(),
+            );
         }
         request.extend_from_slice(b"\r\n");
-        request.extend_from_slice(wire_body);
+        request.extend_from_slice(wire_body.bytes);
 
-        let mut stream = TcpStream::connect(self.address).unwrap();
-        stream
-            .set_read_timeout(Some(Duration::from_secs(3)))
-            .unwrap();
-        stream.write_all(&request).unwrap();
-        stream.shutdown(Shutdown::Write).unwrap();
+        let mut stream = TcpStream::connect(self.address)?;
+        stream.set_read_timeout(Some(timeout))?;
+        stream.write_all(&request)?;
+        stream.shutdown(Shutdown::Write)?;
         let mut response = Vec::new();
-        stream.read_to_end(&mut response).unwrap();
-        parse_response(&response)
+        stream.read_to_end(&mut response)?;
+        Ok(parse_response(&response))
+    }
+
+    fn begin_incomplete_settings_post(&self, session: &Session) -> TcpStream {
+        let full_body = format!(
+            "csrf_token={}&latitude=40.7&longitude=-74.0&padding={}",
+            session.csrf,
+            "x".repeat(2_048)
+        );
+        let partial_body = &full_body.as_bytes()[..32];
+        let request = format!(
+            "POST /settings HTTP/1.1\r\nHost: {}\r\nContent-Type: application/x-www-form-urlencoded\r\nCookie: {}\r\nOrigin: {}\r\nContent-Length: {}\r\n\r\n",
+            self.allowed_host(),
+            session.cookie,
+            self.current_ip_origin(),
+            full_body.len(),
+        );
+        let mut stream = TcpStream::connect(self.address).unwrap();
+        stream.write_all(request.as_bytes()).unwrap();
+        stream.write_all(partial_body).unwrap();
+        stream.flush().unwrap();
+        stream
+    }
+
+    fn stop_is_observed_within(&mut self, timeout: Duration) -> bool {
+        self.stop.store(true, Ordering::Release);
+        let deadline = Instant::now() + timeout;
+        while self
+            .thread
+            .as_ref()
+            .is_some_and(|thread| !thread.is_finished())
+            && Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(5));
+        }
+        if self
+            .thread
+            .as_ref()
+            .is_some_and(|thread| thread.is_finished())
+        {
+            self.thread.take().unwrap().join().unwrap();
+            true
+        } else {
+            false
+        }
     }
 }
 
@@ -317,6 +426,21 @@ fn page_exposes_local_settings_without_wifi_or_browser_geolocation() {
         response.header("content-type"),
         Some("text/html; charset=utf-8")
     );
+    assert!(
+        response
+            .body
+            .contains("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">")
+    );
+    for expected in [
+        "box-sizing: border-box",
+        "min-height: 2.75rem",
+        "overflow-wrap: anywhere",
+    ] {
+        assert!(
+            response.body.contains(expected),
+            "page omitted mobile CSS {expected:?}"
+        );
+    }
     let page = response.body.to_lowercase();
     for expected in [
         "http://planeradar.local",
@@ -747,6 +871,59 @@ fn search_results_are_selectable_escaped_and_never_persist() {
         server.queries.lock().unwrap().as_slice(),
         ["New York".to_owned()]
     );
+}
+
+#[test]
+fn failed_search_keeps_the_manual_settings_page_without_sensitive_error_text() {
+    let server = TestServer::with_failing_geocoder(configured_settings());
+    let session = server.session();
+    let query = "private place search";
+
+    let response = server.post_form(
+        "/search",
+        &[("query", query)],
+        &session,
+        Some(&server.current_ip_origin()),
+        None,
+    );
+
+    assert_eq!(response.status, 200);
+    assert_eq!(
+        response.header("content-type"),
+        Some("text/html; charset=utf-8")
+    );
+    assert_eq!(response.header("cache-control"), Some("no-store"));
+    assert!(
+        response
+            .body
+            .contains("Search unavailable; enter coordinates manually")
+    );
+    assert!(response.body.contains("action=\"/settings\""));
+    assert!(
+        response
+            .body
+            .contains(&format!("name=\"csrf_token\" value=\"{}\"", session.csrf))
+    );
+    assert!(!response.body.contains(query));
+    assert!(!response.body.contains("geocode query"));
+}
+
+#[test]
+fn incomplete_post_body_does_not_block_another_request_or_stop() {
+    let mut server = TestServer::new(configured_settings(), Vec::new());
+    let session = server.session();
+    let partial_connection = server.begin_incomplete_settings_post(&session);
+    thread::sleep(Duration::from_millis(75));
+
+    let started = Instant::now();
+    let health = server
+        .get_with_timeout("/healthz", Duration::from_millis(300))
+        .expect("an incomplete POST must not wedge the handler");
+    assert_eq!(health.status, 200);
+    assert!(started.elapsed() < Duration::from_millis(300));
+    assert!(server.stop_is_observed_within(Duration::from_millis(300)));
+
+    drop(partial_connection);
 }
 
 #[test]
