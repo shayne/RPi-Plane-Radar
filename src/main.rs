@@ -1,12 +1,11 @@
 #![forbid(unsafe_code)]
 
-use std::fs;
 use std::io::{self, Write};
 
 use clap::Parser;
 use planeradar::cli::{Cli, Command, version_line};
 use planeradar::display::run_probe;
-use planeradar::install::{edit_boot_config_from_source, ensure_overlay};
+use planeradar::install::{BootConfigEditor, ensure_overlay};
 
 fn main() {
     if let Err(error) = run() {
@@ -23,7 +22,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             boot_config,
             declaration,
         } => {
-            let source = fs::read_to_string(&boot_config)?;
+            let editor = BootConfigEditor::acquire(&boot_config)?;
+            let source = editor.read_source()?;
             let (updated, changed) = ensure_overlay(&source, &declaration);
             if !changed {
                 println!("unchanged");
@@ -43,7 +43,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 return Ok(());
             }
 
-            if edit_boot_config_from_source(&boot_config, &source, &declaration)? {
+            if editor.edit_from_source(&source, &declaration)? {
                 println!("changed");
             } else {
                 println!("unchanged");
