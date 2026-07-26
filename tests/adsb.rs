@@ -277,12 +277,10 @@ fn fetch_maps_status_body_and_json_errors() {
         Err(AdsbError::Status(503))
     ));
 
-    let body = AdsbClient::new(FakeHttpClient::responding(Err(HttpError::Body(
-        "read failed".to_owned(),
-    ))));
+    let body = AdsbClient::new(FakeHttpClient::responding(Err(HttpError::Body)));
     assert!(matches!(
         body.fetch(&location(), 13.3333),
-        Err(AdsbError::Http(HttpError::Body(_)))
+        Err(AdsbError::Http(HttpError::Body))
     ));
 
     let json = AdsbClient::new(FakeHttpClient::responding(ok_response(b"{")));

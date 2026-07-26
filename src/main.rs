@@ -6,8 +6,13 @@ use clap::Parser;
 use planeradar::cli::{Cli, Command, version_line};
 use planeradar::display::run_probe;
 use planeradar::install::{BootConfigEditor, ensure_overlay};
+use planeradar::logging;
 
 fn main() {
+    if let Err(error) = logging::init() {
+        eprintln!("planeradar: logger initialization failed: {error}");
+        std::process::exit(1);
+    }
     if let Err(error) = run() {
         eprintln!("planeradar: {error}");
         std::process::exit(1);
