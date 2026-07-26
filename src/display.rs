@@ -18,6 +18,7 @@ pub struct DisplayConfig {
     pub width: u32,
     pub height: u32,
     pub video_driver: String,
+    pub render_driver: String,
     pub fullscreen: bool,
 }
 
@@ -27,6 +28,7 @@ impl Default for DisplayConfig {
             width: LOGICAL_WIDTH,
             height: LOGICAL_HEIGHT,
             video_driver: "kmsdrm".to_owned(),
+            render_driver: "opengles2".to_owned(),
             fullscreen: true,
         }
     }
@@ -55,6 +57,10 @@ pub enum DisplayError {
     Sdl(String),
     #[error("SDL selected video driver {actual:?}, expected {expected:?}")]
     WrongVideoDriver { expected: String, actual: String },
+    #[error("SDL selected render driver {actual:?}, expected {expected:?}")]
+    WrongRenderDriver { expected: String, actual: String },
+    #[error("SDL rejected required hint {name:?}")]
+    Hint { name: &'static str },
     #[error("frame has {actual} bytes, expected {expected}")]
     InvalidFrameSize { expected: usize, actual: usize },
     #[error("display dimensions overflow the address space")]
@@ -127,6 +133,15 @@ pub fn run_display<H: DisplayHandler>(
 ) -> Result<(), DisplayError> {
     sdl2::hint::set("SDL_VIDEODRIVER", &config.video_driver);
     sdl2::hint::set("SDL_TOUCH_MOUSE_EVENTS", "0");
+    if !sdl2::hint::set_with_priority(
+        "SDL_RENDER_DRIVER",
+        &config.render_driver,
+        &sdl2::hint::Hint::Override,
+    ) {
+        return Err(DisplayError::Hint {
+            name: "SDL_RENDER_DRIVER",
+        });
+    }
     let sdl = sdl2::init().map_err(DisplayError::Sdl)?;
     let video = sdl.video().map_err(DisplayError::Sdl)?;
     let actual_driver = video.current_video_driver().to_owned();
@@ -151,6 +166,13 @@ pub fn run_display<H: DisplayHandler>(
         .into_canvas()
         .build()
         .map_err(|error| DisplayError::Sdl(error.to_string()))?;
+    let actual_renderer = canvas.info().name.to_owned();
+    if !render_driver_matches(&actual_renderer, &config.render_driver) {
+        return Err(DisplayError::WrongRenderDriver {
+            expected: config.render_driver,
+            actual: actual_renderer,
+        });
+    }
     canvas
         .set_logical_size(config.width, config.height)
         .map_err(|error| DisplayError::Sdl(error.to_string()))?;
@@ -200,6 +222,10 @@ pub fn run_display<H: DisplayHandler>(
 }
 
 pub fn video_driver_matches(actual: &str, expected: &str) -> bool {
+    actual.eq_ignore_ascii_case(expected)
+}
+
+pub fn render_driver_matches(actual: &str, expected: &str) -> bool {
     actual.eq_ignore_ascii_case(expected)
 }
 
