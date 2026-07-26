@@ -1,8 +1,10 @@
 use std::fs;
+use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
+use std::process::{Command, Stdio};
 
 use planeradar::install::{
-    InstallError, edit_boot_config, edit_boot_config_from_source, ensure_overlay,
+    BootConfigEditor, InstallError, edit_boot_config, edit_boot_config_from_source, ensure_overlay,
 };
 
 const DECLARATION: &str = "dtoverlay=vc4-kms-dpi-hyperpixel2r";
@@ -105,6 +107,18 @@ fn preserves_unrelated_mixed_newline_bytes() {
 }
 
 #[test]
+fn removed_declaration_remains_the_newline_style_source() {
+    let source = "dtoverlay=vc4-kms-dpi-hyperpixel2r\r\n[all]";
+    assert_eq!(
+        ensure_overlay(source, DECLARATION),
+        (
+            "[all]\r\ndtoverlay=vc4-kms-dpi-hyperpixel2r".to_owned(),
+            true,
+        )
+    );
+}
+
+#[test]
 fn preserves_missing_final_newline() {
     let source = "[all]\ndtoverlay=vc4-kms-v3d";
     assert_eq!(
@@ -185,5 +199,97 @@ fn approved_preview_rejects_a_concurrent_boot_config_change() {
             .path()
             .join("config.txt.planeradar-backup")
             .exists()
+    );
+}
+
+#[test]
+fn cooperating_editors_serialize_preview_and_stale_source_check() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let path = directory.path().join("config.txt");
+    let approved = "[all]\ndtoverlay=vc4-kms-v3d\n";
+    fs::write(&path, approved).expect("write fixture");
+
+    let first = BootConfigEditor::acquire(&path).expect("acquire first editor");
+    let preview = first.read_source().expect("read locked preview");
+
+    assert!(
+        BootConfigEditor::try_acquire(&path)
+            .expect("try second editor")
+            .is_none(),
+        "second cooperating editor must not acquire the preview lock"
+    );
+    assert_eq!(
+        fs::read_to_string(&path).expect("read locked fixture"),
+        approved,
+        "second editor must not modify while lock acquisition is denied"
+    );
+
+    assert!(
+        first
+            .edit_from_source(&preview, DECLARATION)
+            .expect("first locked edit")
+    );
+    drop(first);
+
+    let second = BootConfigEditor::try_acquire(&path)
+        .expect("try released editor")
+        .expect("second editor acquires after release");
+    let error = second
+        .edit_from_source(&preview, "dtoverlay=planeradar-second-editor")
+        .expect_err("second editor must observe its stale source");
+    assert!(matches!(error, InstallError::SourceChanged(changed) if changed == path));
+    drop(second);
+
+    assert!(
+        directory.path().join("config.txt.planeradar-lock").exists(),
+        "the sibling lock file remains persistent"
+    );
+}
+
+#[test]
+fn configure_display_holds_preview_lock_until_confirmation() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let path = directory.path().join("config.txt");
+    let source = "[all]\ndtoverlay=vc4-kms-v3d\n";
+    fs::write(&path, source).expect("write fixture");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_planeradar"))
+        .args(["configure-display", "--boot-config"])
+        .arg(&path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn configure-display");
+    let mut stdout = child.stdout.take().expect("capture stdout");
+    let mut output = Vec::new();
+    let prompt = b"Apply these changes? [y/N] ";
+    while !output.ends_with(prompt) {
+        let mut byte = [0_u8; 1];
+        stdout.read_exact(&mut byte).expect("read preview output");
+        output.push(byte[0]);
+    }
+
+    let second_acquired = BootConfigEditor::try_acquire(&path)
+        .expect("try second editor")
+        .is_some();
+
+    child
+        .stdin
+        .take()
+        .expect("open child stdin")
+        .write_all(b"n\n")
+        .expect("cancel configure-display");
+    stdout
+        .read_to_end(&mut output)
+        .expect("read command output");
+    assert!(child.wait().expect("wait for configure-display").success());
+
+    assert!(
+        !second_acquired,
+        "configure-display must hold the preview lock while awaiting confirmation"
+    );
+    assert_eq!(
+        fs::read_to_string(&path).expect("read cancelled fixture"),
+        source
     );
 }

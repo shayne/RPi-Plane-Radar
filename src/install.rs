@@ -1,4 +1,4 @@
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -24,16 +24,96 @@ pub enum InstallError {
     Persist(#[from] tempfile::PersistError),
 }
 
+pub struct BootConfigEditor {
+    path: PathBuf,
+    _lock: File,
+}
+
+impl BootConfigEditor {
+    pub fn acquire(path: &Path) -> Result<Self, InstallError> {
+        let lock = open_lock_file(path)?;
+        lock.lock()?;
+        Ok(Self {
+            path: path.to_owned(),
+            _lock: lock,
+        })
+    }
+
+    pub fn try_acquire(path: &Path) -> Result<Option<Self>, InstallError> {
+        let lock = open_lock_file(path)?;
+        match lock.try_lock() {
+            Ok(()) => Ok(Some(Self {
+                path: path.to_owned(),
+                _lock: lock,
+            })),
+            Err(TryLockError::WouldBlock) => Ok(None),
+            Err(TryLockError::Error(error)) => Err(error.into()),
+        }
+    }
+
+    pub fn read_source(&self) -> Result<String, InstallError> {
+        Ok(fs::read_to_string(&self.path)?)
+    }
+
+    pub fn edit_from_source(
+        &self,
+        approved_source: &str,
+        declaration: &str,
+    ) -> Result<bool, InstallError> {
+        let (updated, changed) = ensure_overlay(approved_source, declaration);
+        ensure_source_unchanged(&self.path, approved_source)?;
+        if !changed {
+            return Ok(false);
+        }
+
+        let metadata = fs::metadata(&self.path)?;
+        let parent = self
+            .path
+            .parent()
+            .ok_or_else(|| InstallError::MissingParent(self.path.clone()))?;
+        let backup = backup_path(&self.path);
+
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&backup)
+        {
+            Ok(mut file) => {
+                file.write_all(approved_source.as_bytes())?;
+                file.set_permissions(fs::Permissions::from_mode(metadata.permissions().mode()))?;
+                file.sync_all()?;
+                File::open(parent)?.sync_all()?;
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error.into()),
+        }
+
+        let mut temporary = tempfile::Builder::new()
+            .prefix(".planeradar-config-")
+            .tempfile_in(parent)?;
+        temporary.write_all(updated.as_bytes())?;
+        temporary
+            .as_file()
+            .set_permissions(fs::Permissions::from_mode(metadata.permissions().mode()))?;
+        temporary.as_file().sync_all()?;
+        temporary.persist(&self.path)?;
+        File::open(parent)?.sync_all()?;
+
+        Ok(true)
+    }
+}
+
 pub fn ensure_overlay(input: &str, declaration: &str) -> (String, bool) {
     let had_final_newline = input.ends_with('\n');
-    let mut lines: Vec<ConfigLine> = split_lines_preserving_endings(input)
-        .into_iter()
-        .filter(|line| line.body.trim() != declaration)
-        .collect();
-    let fallback_ending = lines
+    let original_lines = split_lines_preserving_endings(input);
+    let fallback_ending = original_lines
         .iter()
         .find_map(|line| (!line.ending.is_empty()).then(|| line.ending.clone()))
         .unwrap_or_else(|| "\n".to_owned());
+    let mut lines: Vec<ConfigLine> = original_lines
+        .into_iter()
+        .filter(|line| line.body.trim() != declaration)
+        .collect();
 
     if let Some(last_all) = lines.iter().rposition(|line| line.body.trim() == "[all]") {
         let insertion = last_all + 1;
@@ -112,8 +192,9 @@ fn split_lines_preserving_endings(input: &str) -> Vec<ConfigLine> {
 }
 
 pub fn edit_boot_config(path: &Path, declaration: &str) -> Result<bool, InstallError> {
-    let source = fs::read_to_string(path)?;
-    edit_boot_config_from_source(path, &source, declaration)
+    let editor = BootConfigEditor::acquire(path)?;
+    let source = editor.read_source()?;
+    editor.edit_from_source(&source, declaration)
 }
 
 pub fn edit_boot_config_from_source(
@@ -121,46 +202,8 @@ pub fn edit_boot_config_from_source(
     approved_source: &str,
     declaration: &str,
 ) -> Result<bool, InstallError> {
-    let (updated, changed) = ensure_overlay(approved_source, declaration);
-    if !changed {
-        return Ok(false);
-    }
-
-    ensure_source_unchanged(path, approved_source)?;
-    let metadata = fs::metadata(path)?;
-    let parent = path
-        .parent()
-        .ok_or_else(|| InstallError::MissingParent(path.to_owned()))?;
-    let backup = backup_path(path);
-
-    match OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&backup)
-    {
-        Ok(mut file) => {
-            file.write_all(approved_source.as_bytes())?;
-            file.set_permissions(fs::Permissions::from_mode(metadata.permissions().mode()))?;
-            file.sync_all()?;
-            File::open(parent)?.sync_all()?;
-        }
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-        Err(error) => return Err(error.into()),
-    }
-
-    let mut temporary = tempfile::Builder::new()
-        .prefix(".planeradar-config-")
-        .tempfile_in(parent)?;
-    temporary.write_all(updated.as_bytes())?;
-    temporary
-        .as_file()
-        .set_permissions(fs::Permissions::from_mode(metadata.permissions().mode()))?;
-    temporary.as_file().sync_all()?;
-    ensure_source_unchanged(path, approved_source)?;
-    temporary.persist(path)?;
-    File::open(parent)?.sync_all()?;
-
-    Ok(true)
+    let editor = BootConfigEditor::acquire(path)?;
+    editor.edit_from_source(approved_source, declaration)
 }
 
 fn ensure_source_unchanged(path: &Path, approved_source: &str) -> Result<(), InstallError> {
@@ -177,5 +220,23 @@ fn backup_path(path: &Path) -> PathBuf {
         .expect("boot configuration path has a file name")
         .to_os_string();
     name.push(".planeradar-backup");
+    path.with_file_name(name)
+}
+
+fn open_lock_file(path: &Path) -> Result<File, InstallError> {
+    Ok(OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(lock_path(path))?)
+}
+
+fn lock_path(path: &Path) -> PathBuf {
+    let mut name = path
+        .file_name()
+        .expect("boot configuration path has a file name")
+        .to_os_string();
+    name.push(".planeradar-lock");
     path.with_file_name(name)
 }
