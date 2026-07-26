@@ -1,5 +1,7 @@
 use std::io::{Read, Write};
 use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use flate2::Compression;
 use flate2::read::GzDecoder;
@@ -31,6 +33,23 @@ fn gzip_json(json: &[u8]) -> Vec<u8> {
     let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
     encoder.write_all(json).expect("gzip json");
     encoder.finish().expect("finish gzip")
+}
+
+struct FlushFailWriter {
+    bytes: Arc<Mutex<Vec<u8>>>,
+    flushes: Arc<AtomicUsize>,
+}
+
+impl Write for FlushFailWriter {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        self.bytes.lock().expect("buffer").extend_from_slice(buffer);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.flushes.fetch_add(1, Ordering::SeqCst);
+        Err(std::io::Error::other("simulated final flush failure"))
+    }
 }
 
 #[test]
@@ -87,6 +106,32 @@ fn writer_is_byte_deterministic_and_sets_gzip_mtime_to_zero() {
             r#"{"schema_version":1,"source":"OurAirports","airports":[{"ident":"KJFK""#
         )
     );
+}
+
+#[test]
+fn writer_reports_a_failure_flushing_the_finished_gzip() {
+    let dataset = build_fixture();
+    let bytes = Arc::new(Mutex::new(Vec::new()));
+    let flushes = Arc::new(AtomicUsize::new(0));
+    let result = write_dataset(
+        &dataset,
+        FlushFailWriter {
+            bytes: Arc::clone(&bytes),
+            flushes: Arc::clone(&flushes),
+        },
+    );
+
+    let encoded = bytes.lock().expect("buffer").clone();
+    let decoded = read_dataset(encoded.as_slice()).expect("gzip was finished before final flush");
+    assert_eq!(decoded.len(), 1);
+    assert!(
+        result.is_err(),
+        "write_dataset returned Ok after finishing {} gzip bytes without the final flush",
+        encoded.len()
+    );
+    assert_eq!(flushes.load(Ordering::SeqCst), 1);
+    let error = result.expect_err("final flush failure must be returned");
+    assert!(matches!(error, AirportError::Io(_)));
 }
 
 #[test]

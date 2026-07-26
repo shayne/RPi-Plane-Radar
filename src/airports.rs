@@ -180,7 +180,8 @@ pub fn write_dataset(dataset: &AirportDataset, writer: impl Write) -> Result<(),
         .mtime(0)
         .write(writer, Compression::default());
     serde_json::to_writer(&mut encoder, &normalized)?;
-    encoder.finish()?;
+    let mut writer = encoder.finish()?;
+    writer.flush()?;
     Ok(())
 }
 
