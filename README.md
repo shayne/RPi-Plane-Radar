@@ -207,3 +207,13 @@ The release workflow builds firmware in CI and attaches the merged image to the 
 - [LovyanGFX](https://github.com/lovyan03/LovyanGFX)
 - [WiFiManager](https://github.com/tzapu/WiFiManager)
 - [ArduinoJson](https://github.com/bblanchon/ArduinoJson)
+- The Rust renderer embeds DejaVu Sans Bold 2.37 from Debian's
+  `fonts-dejavu-core` 2.37-8 package. DejaVu incorporates Bitstream Vera and
+  Arev-derived glyphs by Tavmjong Bah; the complete upstream notices and terms
+  are preserved in
+  [`src/assets/DejaVu-FONT-LICENSE.txt`](src/assets/DejaVu-FONT-LICENSE.txt).
+  The sidecar is the canonical
+  [`version_2_37` LICENSE](https://github.com/dejavu-fonts/dejavu-fonts/blob/version_2_37/LICENSE)
+  at tag commit `0eda8a319c08835009849583cd090bb5b141ce25`
+  (SHA-256
+  `7a083b136e64d064794c3419751e5c7dd10d2f64c108fe5ba161eae5e5958a93`).
