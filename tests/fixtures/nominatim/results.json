@@ -1,0 +1,73 @@
+[
+  {
+    "place_id": 1,
+    "lat": "40.7128",
+    "lon": "-74.0060",
+    "display_name": "New York, New York, United States"
+  },
+  {
+    "place_id": 2,
+    "lat": "91.0",
+    "lon": "10.0",
+    "display_name": "Outside latitude range"
+  },
+  {
+    "place_id": 3,
+    "lat": "not-a-coordinate",
+    "lon": "10.0",
+    "display_name": "Malformed latitude"
+  },
+  {
+    "place_id": 10,
+    "lat": "10.0",
+    "lon": "181.0",
+    "display_name": "Outside longitude range"
+  },
+  {
+    "place_id": 11,
+    "lat": "10.0",
+    "lon": "not-a-coordinate",
+    "display_name": "Malformed longitude"
+  },
+  {
+    "place_id": 12,
+    "lat": "10.0",
+    "lon": "NaN",
+    "display_name": "Non-finite longitude"
+  },
+  {
+    "place_id": 4,
+    "lat": "34.0522",
+    "lon": "-118.2437",
+    "display_name": "<b>Los Angeles</b>"
+  },
+  {
+    "place_id": 5,
+    "lat": "41.8781",
+    "lon": "-87.6298",
+    "display_name": "Chicago, Illinois, United States"
+  },
+  {
+    "place_id": 6,
+    "lat": "29.7604",
+    "lon": "-95.3698",
+    "display_name": "Houston, Texas, United States"
+  },
+  {
+    "place_id": 7,
+    "lat": "33.4484",
+    "lon": "-112.0740",
+    "display_name": "Phoenix, Arizona, United States"
+  },
+  {
+    "place_id": 8,
+    "lat": "39.7392",
+    "lon": "-104.9903",
+    "display_name": "Denver, Colorado, United States"
+  },
+  {
+    "place_id": 9,
+    "lat": "47.6062",
+    "lon": "-122.3321"
+  }
+]
