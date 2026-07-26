@@ -24,6 +24,9 @@ const IP_URL_TOP: f32 = 351.0;
 const MESSAGE_TOP: f32 = 381.0;
 const MESSAGE_LINE_STEP: f32 = 20.0;
 const CONTROL_TOP: f32 = 428.0;
+const IP_URL_MAX_WIDTH: f32 = 350.0;
+const IP_URL_MAX_CAP_HEIGHT: u32 = 17;
+const IP_URL_MIN_CAP_HEIGHT: u32 = 12;
 const MESSAGE_MAX_WIDTH: f32 = 270.0;
 const MAX_URL_BYTES: usize = 128;
 const MAX_MESSAGE_CHARACTERS: usize = 512;
@@ -78,14 +81,16 @@ impl SetupRenderer {
 
         let text = TextRasterizer::new(self.font.font());
         draw_centered_line(&text, &mut pixmap, CANONICAL_LOCAL_URL, LOCAL_URL_TOP, 20.0);
-        draw_centered_line(
+        draw_fitted_centered_line(
             &text,
             &mut pixmap,
             validated_ip_url(ip_url)
                 .as_deref()
                 .unwrap_or(WAITING_FOR_NETWORK),
             IP_URL_TOP,
-            17.0,
+            IP_URL_MAX_WIDTH,
+            IP_URL_MAX_CAP_HEIGHT,
+            IP_URL_MIN_CAP_HEIGHT,
         );
 
         let message = safe_message(message, configured);
@@ -265,12 +270,49 @@ fn draw_centered_line(
     );
 }
 
+fn draw_fitted_centered_line(
+    text: &TextRasterizer<'_>,
+    pixmap: &mut Pixmap,
+    value: &str,
+    top: f32,
+    max_width: f32,
+    max_cap_height: u32,
+    min_cap_height: u32,
+) {
+    for cap_height in (min_cap_height..=max_cap_height).rev() {
+        if text.measure(value, cap_height as f32).0 <= max_width {
+            draw_centered_line(text, pixmap, value, top, cap_height as f32);
+            return;
+        }
+    }
+    let cap_height = min_cap_height as f32;
+    let fitted = middle_ellipsis(text, value, max_width, cap_height);
+    draw_centered_line(text, pixmap, &fitted, top, cap_height);
+}
+
+fn middle_ellipsis(
+    text: &TextRasterizer<'_>,
+    value: &str,
+    max_width: f32,
+    cap_height: f32,
+) -> String {
+    let characters: Vec<_> = value.chars().collect();
+    for keep in (0..characters.len()).rev() {
+        let left = keep.div_ceil(2);
+        let right = keep / 2;
+        let mut candidate: String = characters[..left].iter().collect();
+        candidate.push('…');
+        candidate.extend(characters[characters.len() - right..].iter());
+        if text.measure(&candidate, cap_height).0 <= max_width {
+            return candidate;
+        }
+    }
+    "…".to_owned()
+}
+
 fn validated_ip_url(candidate: Option<&str>) -> Option<String> {
-    let candidate = candidate?.trim();
-    if candidate.is_empty()
-        || candidate.len() > MAX_URL_BYTES
-        || candidate.chars().any(char::is_control)
-    {
+    let candidate = bounded_url_candidate_with(candidate?, str::trim)?;
+    if candidate.is_empty() || candidate.chars().any(char::is_control) {
         return None;
     }
     let parsed = url::Url::parse(candidate).ok()?;
@@ -287,24 +329,23 @@ fn validated_ip_url(candidate: Option<&str>) -> Option<String> {
     Some(parsed.as_str().trim_end_matches('/').to_owned())
 }
 
-fn safe_message(message: &str, configured: bool) -> String {
-    let normalized = normalize_message(message);
-    if !configured {
-        let lowercase = normalized.to_lowercase();
-        if normalized.is_empty()
-            || ["tap", "dismiss", "return", "back"]
-                .iter()
-                .any(|word| lowercase.contains(word))
-        {
-            return REQUIRED_MESSAGE.to_owned();
-        }
+fn bounded_url_candidate_with<'a>(
+    candidate: &'a str,
+    trim: impl FnOnce(&'a str) -> &'a str,
+) -> Option<&'a str> {
+    if candidate.len() > MAX_URL_BYTES {
+        return None;
     }
+    Some(trim(candidate))
+}
+
+fn safe_message(message: &str, configured: bool) -> String {
+    if !configured {
+        return REQUIRED_MESSAGE.to_owned();
+    }
+    let normalized = normalize_message(message);
     if normalized.is_empty() {
-        if configured {
-            "Settings are available on this page".to_owned()
-        } else {
-            REQUIRED_MESSAGE.to_owned()
-        }
+        "Settings are available on this page".to_owned()
     } else {
         normalized
     }
@@ -451,5 +492,37 @@ mod tests {
             ),
             ["Settings are available on", "this page"]
         );
+    }
+
+    #[test]
+    fn oversized_url_is_rejected_without_invoking_the_trim_seam() {
+        let oversized = " ".repeat(MAX_URL_BYTES + 1);
+        let trim_called = std::cell::Cell::new(false);
+
+        assert_eq!(
+            bounded_url_candidate_with(&oversized, |candidate| {
+                trim_called.set(true);
+                candidate.trim()
+            }),
+            None
+        );
+        assert!(!trim_called.get());
+    }
+
+    #[test]
+    fn overflow_message_ends_with_a_measured_ellipsis() {
+        let font = FontAsset::embedded().expect("embedded font");
+        let text = TextRasterizer::new(font.font());
+        let lines = wrap_message(
+            &text,
+            &format!("VISIBLE {}", "X".repeat(10_000)),
+            MESSAGE_MAX_WIDTH,
+            14.0,
+            2,
+        );
+
+        assert_eq!(lines.len(), 2);
+        assert!(lines[1].ends_with('…'));
+        assert!(text.measure(&lines[1], 14.0).0 <= MESSAGE_MAX_WIDTH);
     }
 }
