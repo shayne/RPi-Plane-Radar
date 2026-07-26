@@ -1,5 +1,6 @@
 use planeradar::display::{
-    InputEvent, normalize_finger, normalize_sdl_event, video_driver_matches,
+    DisplayConfig, InputEvent, normalize_finger, normalize_sdl_event, render_driver_matches,
+    video_driver_matches,
 };
 use sdl2::event::Event;
 use sdl2::mouse::{MouseButton, MouseState};
@@ -160,4 +161,15 @@ fn quit_is_normalized() {
 fn sdl_video_driver_name_is_matched_case_insensitively() {
     assert!(video_driver_matches("KMSDRM", "kmsdrm"));
     assert!(!video_driver_matches("dummy", "kmsdrm"));
+}
+
+#[test]
+fn default_display_requires_the_verified_accelerated_renderer() {
+    assert_eq!(DisplayConfig::default().render_driver, "opengles2");
+}
+
+#[test]
+fn render_driver_name_is_matched_case_insensitively() {
+    assert!(render_driver_matches("OpenGLES2", "opengles2"));
+    assert!(!render_driver_matches("opengl", "opengles2"));
 }
