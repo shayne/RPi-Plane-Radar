@@ -1,0 +1,26 @@
+name: Rust CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up mise
+        uses: jdx/mise-action@v4
+
+      - name: Install native dependencies
+        run: sudo apt-get update && sudo apt-get install -y libsdl2-dev pkg-config
+
+      - name: Verify
+        run: mise run verify
+
+      - name: Build Raspberry Pi binary
+        run: |
+          PLANERADAR_SOURCE_REF=HEAD mise run build-pi
+          file dist/planeradar

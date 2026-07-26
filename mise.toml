@@ -1,0 +1,38 @@
+min_version = "2026.7.7"
+
+[env]
+CMAKE_POLICY_VERSION_MINIMUM = "3.5"
+CC = "/usr/bin/clang"
+CXX = "/usr/bin/clang++"
+CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER = "/usr/bin/clang"
+
+[tools]
+rust = "1.97.1"
+cmake = "4.3.3"
+"cargo:cargo-deny" = "0.20.2"
+"cargo:cargo-nextest" = "0.9.140"
+
+[tasks.fmt]
+run = "cargo fmt --all --check"
+
+[tasks.lint]
+run = "cargo clippy --all-targets --all-features -- -D warnings"
+
+[tasks.test]
+run = "cargo nextest run --all-features"
+
+[tasks.deny]
+run = "cargo deny check"
+
+[tasks.verify]
+depends = ["fmt", "lint", "test", "deny"]
+
+[tasks.build-pi]
+run = "./scripts/build-pi.sh"
+
+[tasks.deploy-pi]
+depends = ["build-pi"]
+run = "./scripts/deploy-pi.sh"
+
+[tasks.smoke-pi]
+run = "./scripts/smoke-pi.sh"
