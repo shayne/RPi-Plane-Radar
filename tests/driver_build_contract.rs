@@ -188,6 +188,196 @@ fn checksum_helper_accepts_only_the_fresh_file_digest() {
 }
 
 #[test]
+fn source_identity_rejects_dirty_stale_and_mismatched_overlay_provenance() {
+    let revision = "1".repeat(40);
+    let tree = "2".repeat(40);
+    let valid_overlay = format!("planeradar-hyperpixel2r-{}.dtbo", &revision[..12]);
+    let cases = [
+        (
+            "true",
+            revision.as_str(),
+            tree.as_str(),
+            valid_overlay.as_str(),
+            "driver artifacts require clean tracked source",
+        ),
+        (
+            "false",
+            "0000000000000000000000000000000000000000",
+            tree.as_str(),
+            "planeradar-hyperpixel2r-000000000000.dtbo",
+            "source revision does not match checked source",
+        ),
+        (
+            "false",
+            revision.as_str(),
+            "0000000000000000000000000000000000000000",
+            valid_overlay.as_str(),
+            "source tree does not match checked source",
+        ),
+        (
+            "false",
+            revision.as_str(),
+            tree.as_str(),
+            "planeradar-hyperpixel2r-000000000000.dtbo",
+            "overlay filename does not match source revision",
+        ),
+    ];
+    for (dirty, source_revision, source_tree, overlay_file, expected_error) in cases {
+        let output = run_common_script(&[
+            "hp2r_validate_source_identity",
+            dirty,
+            source_revision,
+            source_tree,
+            overlay_file,
+            &revision,
+            &tree,
+        ]);
+        assert!(!output.status.success(), "invalid provenance was accepted");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(expected_error),
+            "provenance failed for the wrong reason: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[test]
+fn build_rejects_dirty_tracked_source_before_compilation() {
+    let temporary = TempDir::new().expect("temporary directory must be created");
+    let release = "6.18.34+rpt-rpi-v8";
+    let target_dir = temporary.path().join("dist/kernel-target").join(release);
+    let target_root = target_dir.join("root");
+    for directory in [
+        target_root.join("headers"),
+        target_root.join("common/include"),
+        target_root.join("usr/src"),
+        target_root.join("kbuild"),
+        target_root.join("boot"),
+    ] {
+        fs::create_dir_all(directory).expect("target directory must be created");
+    }
+    fs::write(
+        target_root.join("headers/.config"),
+        concat!(
+            "CONFIG_DRM_PANEL=y\n",
+            "CONFIG_I2C_ALGOBIT=m\n",
+            "CONFIG_TOUCHSCREEN_EDT_FT5X06=m\n",
+            "CONFIG_OF_OVERLAY=y\n",
+            "CONFIG_DRM_VC4=m\n",
+            "CONFIG_DRM_V3D=m\n",
+        ),
+    )
+    .expect("target config must be written");
+    fs::write(target_root.join("headers/Module.symvers"), "")
+        .expect("Module.symvers must be written");
+    fs::write(target_root.join("boot/base.dtb"), "base").expect("base DTB must be written");
+    fs::write(
+        target_dir.join("target.txt"),
+        format!(
+            "kernel_release\t{release}\n\
+             kernel_arch\taarch64\n\
+             header_path\t/headers\n\
+             common_header_path\t/common\n\
+             kbuild_path\t/kbuild\n\
+             base_dtb_path\t/boot/base.dtb\n\
+             base_dtb_sha256\t{}\n",
+            "0".repeat(64)
+        ),
+    )
+    .expect("target manifest must be written");
+    fs::create_dir(temporary.path().join("kernel")).expect("kernel source must be created");
+    fs::write(temporary.path().join("kernel/source.c"), "dirty source")
+        .expect("kernel source must be written");
+
+    let fake_bin = temporary.path().join("bin");
+    fs::create_dir(&fake_bin).expect("fake bin directory must be created");
+    fs::write(
+        fake_bin.join("ssh"),
+        format!("#!/usr/bin/env bash\nprintf '{release}\\n'\n"),
+    )
+    .expect("fake ssh must be written");
+    fs::write(
+        fake_bin.join("git"),
+        r#"#!/usr/bin/env bash
+set -eu
+case "${1-} ${2-}" in
+  "rev-parse HEAD") printf '%040d\n' 1 ;;
+  "rev-parse HEAD^{tree}") printf '%040d\n' 2 ;;
+  "diff-index --quiet") exit 1 ;;
+  "cat-file -e") exit 0 ;;
+  "status --porcelain") printf ' M kernel/source.c\n' ;;
+  *) exit 2 ;;
+esac
+"#,
+    )
+    .expect("fake git must be written");
+    fs::write(
+        fake_bin.join("docker"),
+        r#"#!/usr/bin/env bash
+set -eu
+case "${1-}" in
+  info|buildx) exit 0 ;;
+  run)
+    shift
+    build=
+    while test "$#" -gt 0; do
+      if test "$1" = --volume; then
+        case "$2" in
+          *:/build) build="${2%:/build}" ;;
+        esac
+        shift 2
+      else
+        shift
+      fi
+    done
+    test -n "$build"
+    printf module > "$build/kernel/planeradar_hyperpixel2r.ko"
+    printf file > "$build/kernel/module.file.txt"
+    printf readelf > "$build/kernel/module.readelf.txt"
+    printf 'vermagic: fake\nlicense: GPL\n' > "$build/kernel/module.modinfo.txt"
+    printf 'hash  planeradar_hyperpixel2r.ko\n' > "$build/kernel/module.sha256"
+    printf overlay > "$build/out/planeradar-hyperpixel2r-000000000000.dtbo"
+    printf applied > "$build/out/planeradar-hyperpixel2r-applied.dtb"
+    ;;
+  *) exit 2 ;;
+esac
+"#,
+    )
+    .expect("fake docker must be written");
+    for executable in ["ssh", "git", "docker"] {
+        let path = fake_bin.join(executable);
+        let mut permissions = fs::metadata(&path)
+            .expect("fake executable metadata must exist")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions).expect("fake executable must be executable");
+    }
+
+    let output = Command::new("bash")
+        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/build-hyperpixel-driver.sh"))
+        .current_dir(temporary.path())
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                fake_bin.display(),
+                std::env::var("PATH").expect("PATH must be set")
+            ),
+        )
+        .output()
+        .expect("build script must run");
+    assert!(
+        !output.status.success(),
+        "dirty tracked source was compiled"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("tracked source is dirty"),
+        "dirty build failed for the wrong reason: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn checker_rejects_dot_release_before_constructing_an_artifact_path() {
     let temporary = TempDir::new().expect("temporary directory must be created");
     let fake_bin = temporary.path().join("bin");
@@ -325,7 +515,21 @@ fn build_rejects_an_artifact_release_symlink_before_removing_through_it() {
     .expect("fake ssh must be written");
     let fake_docker = fake_bin.join("docker");
     fs::write(&fake_docker, "#!/usr/bin/env bash\nexit 0\n").expect("fake docker must be written");
-    for executable in [&fake_ssh, &fake_docker] {
+    let fake_git = fake_bin.join("git");
+    fs::write(
+        &fake_git,
+        r#"#!/usr/bin/env bash
+set -eu
+case "${1-} ${2-}" in
+  "diff-index --quiet"|"cat-file -e") exit 0 ;;
+  "rev-parse HEAD") printf '%040d\n' 1 ;;
+  "rev-parse HEAD^{tree}") printf '%040d\n' 2 ;;
+  *) exit 2 ;;
+esac
+"#,
+    )
+    .expect("fake git must be written");
+    for executable in [&fake_ssh, &fake_docker, &fake_git] {
         let mut permissions = fs::metadata(executable)
             .expect("fake executable metadata must exist")
             .permissions();
