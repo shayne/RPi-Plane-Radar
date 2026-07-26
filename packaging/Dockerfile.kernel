@@ -1,0 +1,23 @@
+FROM debian:trixie-slim
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        bc \
+        binutils-aarch64-linux-gnu \
+        bison \
+        ca-certificates \
+        device-tree-compiler \
+        file \
+        flex \
+        gcc \
+        gcc-14-aarch64-linux-gnu \
+        kmod \
+        libelf-dev \
+        libssl-dev \
+        make \
+        openssl \
+        python3 \
+        xz-utils \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build

@@ -15,7 +15,11 @@ done
 docker info >/dev/null
 source_ref="${PLANERADAR_SOURCE_REF:-rpi-port}"
 revision="$(git rev-parse --verify "${source_ref}^{commit}")"
-rm -rf dist
+rm -f \
+  dist/planeradar \
+  dist/planeradar.readelf.txt \
+  dist/planeradar.revision \
+  dist/planeradar.sha256
 mkdir -p dist
 docker buildx build --platform linux/arm64 \
   --build-arg "PLANERADAR_REVISION=${revision}" \
