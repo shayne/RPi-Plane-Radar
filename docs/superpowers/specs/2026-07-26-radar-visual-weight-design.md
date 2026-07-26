@@ -34,7 +34,11 @@ requested result.
 
 The shared display background changes from dark blue to opaque true black:
 `[0, 0, 0, 255]`. Radar and setup screens use the same background so the
-physical edge of the round panel disappears into the enclosure.
+physical edge of the round panel disappears into the enclosure. The setup
+screen composes a native white QR tile, including every light module and the
+full four-module quiet zone, over that black canvas; dark QR modules are
+opaque black. Its surrounding URL, instruction, and control text is light so
+it remains readable on black. This is not an inverted full-screen QR canvas.
 
 All foreground colors remain unchanged.
 

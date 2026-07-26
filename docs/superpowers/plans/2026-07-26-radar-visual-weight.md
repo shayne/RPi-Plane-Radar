@@ -4,7 +4,7 @@
 
 **Goal:** Make the radar and setup backgrounds true black and reduce radar visual weight with native whole-pixel sizes while preserving the edge-to-edge spatial layout.
 
-**Architecture:** Keep the existing 480×480 renderer, projection, cache, and SDL presentation path. Change only shared theme constants and the expectations derived from them; regenerate deterministic golden PNGs rather than adding a scaling layer.
+**Architecture:** Keep the existing 480×480 renderer, projection, cache, and SDL presentation path. The setup renderer composes a white QR tile (full quiet zone and light modules) with black dark modules over the shared black canvas, and uses light surrounding text; regenerate deterministic golden PNGs rather than adding a scaling layer.
 
 **Tech Stack:** Rust 1.97.1, tiny-skia, fontdue, PNG golden tests, mise, Docker Buildx/OrbStack, SDL2 KMSDRM with accelerated OpenGL ES 2, GitButler.
 
@@ -14,6 +14,7 @@
 - Outer grid radius remains 214 pixels, aircraft safe radius remains 188 pixels, and rim radius remains 238 pixels.
 - Ring positions, projected aircraft/airport/runway positions, track-vector scale, touch coordinates, and gesture regions do not move.
 - Shared background becomes opaque true black `[0, 0, 0, 255]`.
+- Setup uses that black canvas, a native white QR tile including the full quiet zone and light modules, black QR dark modules, and light surrounding text.
 - Every adjusted size is a whole number of native pixels; do not add a scene or frame scaling transform.
 - Curves, diagonals, and glyph edges retain normal antialiasing.
 - Production display remains `kmsdrm` plus hardware-accelerated `opengles2`; there is no software-renderer fallback.
@@ -25,6 +26,7 @@
 
 **Files:**
 - Modify: `src/render/theme.rs`
+- Modify: `src/render/setup.rs`
 - Modify: `tests/render_radar.rs`
 - Modify: `tests/render_setup.rs`
 - Regenerate: `tests/goldens/radar-empty.png`
@@ -89,7 +91,7 @@ fn visual_metrics_use_whole_pixels_without_moving_the_radar() {
 }
 ```
 
-Change the setup test's expected QR ink constant:
+Add setup rendering contracts that prove representative canvas pixels are black, the full QR tile including its quiet zone and light modules is white except for black dark modules, surrounding text is light, and opacity/circular-safe bounds remain intact. Change the setup test's expected QR ink constant:
 
 ```rust
 const INK: [u8; 4] = [0, 0, 0, 255];
