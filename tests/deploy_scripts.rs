@@ -1,7 +1,64 @@
+use std::env;
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
+use std::process::Command;
 
 const PUBLIC_TARGET: &str = "pi@raspberrypi.local";
+
+fn hard_coded_ssh_targets(source: &str) -> impl Iterator<Item = &str> {
+    source
+        .lines()
+        .filter(|line| {
+            let line = line.trim_start();
+            line.starts_with("target=") || line.starts_with("ssh ") || line.starts_with("scp ")
+        })
+        .flat_map(|line| {
+            line.split(|character: char| {
+                !character.is_ascii_alphanumeric() && !matches!(character, '.' | '_' | '-' | '@')
+            })
+        })
+        .map(|token| token.trim_matches('-'))
+        .filter(|token| {
+            let Some((user, host)) = token.split_once('@') else {
+                return false;
+            };
+            token.matches('@').count() == 1 && !user.is_empty() && !host.is_empty()
+        })
+}
+
+#[test]
+fn verify_hyperpixel_boot_does_not_reuse_the_expectation_flag_as_its_ssh_target() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let ssh = directory.path().join("ssh");
+    fs::write(
+        &ssh,
+        "#!/usr/bin/env bash\nprintf 'fake ssh invoked for %s\\n' \"$*\" >&2\nexit 1\n",
+    )
+    .expect("fake ssh");
+    fs::set_permissions(&ssh, fs::Permissions::from_mode(0o755)).expect("fake ssh mode");
+    let path = env::join_paths(
+        std::iter::once(directory.path().to_path_buf())
+            .chain(env::split_paths(&env::var_os("PATH").expect("PATH"))),
+    )
+    .expect("test PATH");
+
+    let output = Command::new("bash")
+        .arg("scripts/verify-hyperpixel-boot.sh")
+        .arg("--expect-normal")
+        .env("PATH", path)
+        .env("PLANERADAR_PI_TARGET", "fixture@target")
+        .output()
+        .expect("run verification script");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).expect("verification stderr");
+    assert!(
+        stderr.contains("fake ssh invoked for"),
+        "expectation flag must not fail target validation: {stderr}"
+    );
+    assert!(stderr.contains("fixture@target"));
+}
 
 #[test]
 fn pi_application_scripts_share_the_public_target_override() {
@@ -16,6 +73,17 @@ fn pi_application_scripts_share_the_public_target_override() {
 }
 
 #[test]
+fn ssh_target_scanner_rejects_nonempty_users_and_hosts() {
+    assert_eq!(
+        hard_coded_ssh_targets(
+            r#"target="1@192.0.2.1" target="9@host.example" target="8@localhost""#
+        )
+        .collect::<Vec<_>>(),
+        ["1@192.0.2.1", "9@host.example", "8@localhost"]
+    );
+}
+
+#[test]
 fn shell_scripts_contain_only_the_documented_public_ssh_target() {
     let scripts = Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts");
     for entry in fs::read_dir(scripts).expect("scripts directory must be readable") {
@@ -24,27 +92,7 @@ fn shell_scripts_contain_only_the_documented_public_ssh_target() {
             continue;
         }
         let source = fs::read_to_string(&path).expect("script must be readable");
-        for token in source.split(|character: char| {
-            !character.is_ascii_alphanumeric() && !matches!(character, '.' | '_' | '-' | '@')
-        }) {
-            let token = token.trim_matches('-');
-            let Some((user, host)) = token.split_once('@') else {
-                continue;
-            };
-            if token.matches('@').count() != 1
-                || user.is_empty()
-                || !user
-                    .chars()
-                    .next()
-                    .is_some_and(|character| character.is_ascii_alphabetic())
-                || !host.contains('.')
-                || !host
-                    .chars()
-                    .next()
-                    .is_some_and(|character| character.is_ascii_alphabetic())
-            {
-                continue;
-            }
+        for token in hard_coded_ssh_targets(&source) {
             assert_eq!(
                 token,
                 PUBLIC_TARGET,
