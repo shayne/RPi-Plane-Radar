@@ -308,7 +308,8 @@ overlay_file="$4"
 module_file="$5"
 root="${PLANERADAR_INSTALL_ROOT:-}"
 incoming="${root}${remote_stage}"
-artifact_parent="${root}/usr/lib/planeradar/hyperpixel/${revision}"
+artifact_root="${root}/usr/lib/planeradar/hyperpixel"
+artifact_parent="${artifact_root}/${revision}"
 artifact_dir="${artifact_parent}/${release}"
 module_dir="${root}/lib/modules/${release}/extra"
 overlay_dir="${root}/boot/firmware/overlays"
@@ -317,6 +318,12 @@ tryboot_config="${root}/boot/firmware/tryboot.txt"
 dkms_dir="${root}/usr/src/planeradar-hyperpixel2r-0.1.0"
 publish_tmp=""
 dkms_tmp=""
+dkms_backup_parent=""
+dkms_backup=""
+dkms_upgrade_active=false
+dkms_prior_registered=false
+dkms_remove_attempted=false
+dkms_add_attempted=false
 rollback_dir="$(mktemp -d "${root}/tmp/planeradar-tryboot-rollback.XXXXXX")"
 tryboot_backup=""
 tryboot_mode=""
@@ -477,8 +484,82 @@ validate_tree_metadata() {
   fi
 }
 
+validate_installed_revision_source() {
+  local candidate="$1"
+  local release_dir="${candidate%/dkms-source}"
+  local candidate_release="${release_dir##*/}"
+  local revision_dir="${release_dir%/*}"
+  local candidate_revision="${revision_dir##*/}"
+  local manifest="$release_dir/manifest.txt"
+  local revision_file="$release_dir/planeradar.revision"
+  local tree_file="$release_dir/planeradar.tree"
+  local path
+  local expected_mode
+
+  test "${revision_dir%/*}" = "$artifact_root" || {
+    echo "installed DKMS source candidate escapes revision root: $candidate" >&2
+    return 1
+  }
+  [[ "$candidate_revision" =~ ^[0-9a-f]{40}$ ]] || {
+    echo "installed DKMS source candidate has an unsafe revision: $candidate" >&2
+    return 1
+  }
+  case "$candidate_release" in
+    ""|"."|".."|*[!A-Za-z0-9._+-]*)
+      echo "installed DKMS source candidate has an unsafe release: $candidate" >&2
+      return 1
+      ;;
+  esac
+  for path in "$revision_dir" "$release_dir" "$candidate"; do
+    sudo test -d "$path"
+    sudo test ! -L "$path"
+    test "$(sudo stat -c '%a' "$path")" = 755
+    test "$(sudo stat -c '%U:%G' "$path")" = root:root
+  done
+  for path in "$manifest" "$revision_file" "$tree_file"; do
+    sudo test -f "$path"
+    sudo test ! -L "$path"
+    expected_mode="$(sudo stat -c '%a' "$path")"
+    test "$expected_mode" = 644
+    test "$(sudo stat -c '%U:%G' "$path")" = root:root
+  done
+  test "$(cat "$revision_file")" = "$candidate_revision"
+  [[ "$(cat "$tree_file")" =~ ^[0-9a-f]{40}$ ]]
+  awk -F '\t' -v wanted="$candidate_revision" '
+    $1 == "source_revision" {
+      count++
+      if (NF == 2 && $2 == wanted) matching++
+    }
+    END { exit !(count == 1 && matching == 1) }
+  ' "$manifest"
+  awk -F '\t' -v wanted="$candidate_release" '
+    $1 == "kernel_release" {
+      count++
+      if (NF == 2 && $2 == wanted) matching++
+    }
+    END { exit !(count == 1 && matching == 1) }
+  ' "$manifest"
+  validate_tree_metadata "$candidate" "$candidate" ""
+}
+
 cleanup_remote() {
   local status=$?
+  if "$dkms_upgrade_active" && ! "$stage_complete"; then
+    if "$dkms_remove_attempted" || "$dkms_add_attempted"; then
+      sudo dkms remove -m planeradar-hyperpixel2r -v 0.1.0 --all || status=1
+    fi
+    sudo rm -rf -- "$dkms_dir" || status=1
+    if test -n "$dkms_backup" && sudo test -d "$dkms_backup"; then
+      sudo mv "$dkms_backup" "$dkms_dir" || status=1
+      dkms_backup=""
+    else
+      echo "failed to restore prior DKMS source after staging failure" >&2
+      status=1
+    fi
+    if "$dkms_prior_registered"; then
+      sudo dkms add -m planeradar-hyperpixel2r -v 0.1.0 || status=1
+    fi
+  fi
   if "$tryboot_touched" && ! "$stage_complete"; then
     if "$tryboot_existed"; then
       atomic_install "$tryboot_backup" "$tryboot_config" "$tryboot_mode" || status=1
@@ -489,6 +570,7 @@ cleanup_remote() {
   fi
   test -z "$publish_tmp" || sudo rm -rf -- "$publish_tmp"
   test -z "$dkms_tmp" || sudo rm -rf -- "$dkms_tmp"
+  test -z "$dkms_backup_parent" || sudo rm -rf -- "$dkms_backup_parent" || status=1
   rm -rf -- "$rollback_dir"
   rm -rf -- "$incoming"
   return "$status"
@@ -598,39 +680,106 @@ sudo cp -a "$artifact_dir/dkms-source/." "$dkms_tmp/"
 sudo find "$dkms_tmp" -type d -exec chmod 0755 {} +
 sudo find "$dkms_tmp" -type f -exec chmod 0644 {} +
 sudo chown -R root:root "$dkms_tmp"
+dkms_status=""
+dkms_status_read=false
+if dkms_status="$(
+  sudo dkms status -m planeradar-hyperpixel2r -v 0.1.0 2>/dev/null
+)"; then
+  dkms_status_read=true
+else
+  dkms_status=""
+fi
+dkms_registered=false
+dkms_status_recognized=true
+dkms_built_record='^planeradar-hyperpixel2r/0\.1\.0, [A-Za-z0-9][A-Za-z0-9._+-]*, aarch64: (built|installed)$'
+while IFS= read -r dkms_record; do
+  test -n "$dkms_record" || continue
+  if test "$dkms_record" = "planeradar-hyperpixel2r/0.1.0: added" ||
+     [[ "$dkms_record" =~ $dkms_built_record ]]
+  then
+    dkms_registered=true
+  else
+    dkms_status_recognized=false
+  fi
+done <<<"$dkms_status"
+if ! "$dkms_status_recognized"; then
+  dkms_registered=false
+fi
+
+dkms_source_upgraded=false
 if sudo test -e "$dkms_dir"; then
   sudo test -d "$dkms_dir"
-  validate_tree_metadata "$dkms_dir" "$dkms_tmp" ""
-  sudo diff -qr "$dkms_tmp" "$dkms_dir" >/dev/null || {
-    echo "DKMS source directory already exists with different contents" >&2
-    exit 1
-  }
-  validate_tree_metadata "$dkms_dir" "$dkms_tmp" ""
-  sudo rm -rf -- "$dkms_tmp"
-  dkms_tmp=""
+  validate_tree_metadata "$dkms_dir" "$dkms_dir" ""
+  if sudo diff -qr "$dkms_tmp" "$dkms_dir" >/dev/null; then
+    validate_tree_metadata "$dkms_dir" "$dkms_tmp" ""
+    sudo rm -rf -- "$dkms_tmp"
+    dkms_tmp=""
+  else
+    "$dkms_status_read" && "$dkms_status_recognized" || {
+      echo "refusing DKMS source upgrade with unrecognized status" >&2
+      exit 1
+    }
+    installed_sources="$(mktemp "$rollback_dir/installed-dkms-sources.XXXXXX")"
+    sudo find "$artifact_root" \
+      -mindepth 3 \
+      -maxdepth 3 \
+      -type d \
+      -name dkms-source \
+      -print0 > "$installed_sources"
+    trusted_source=""
+    while IFS= read -r -d '' candidate_source; do
+      validate_installed_revision_source "$candidate_source"
+      if sudo diff -qr "$dkms_dir" "$candidate_source" >/dev/null; then
+        validate_tree_metadata "$dkms_dir" "$dkms_dir" ""
+        validate_installed_revision_source "$candidate_source"
+        trusted_source="$candidate_source"
+        break
+      fi
+    done < "$installed_sources"
+    test -n "$trusted_source" || {
+      echo "DKMS source directory differs from every installed Plane Radar revision" >&2
+      exit 1
+    }
+
+    dkms_backup_parent="$(
+      sudo mktemp -d \
+        "$(dirname "$dkms_dir")/.planeradar-hyperpixel2r-0.1.0.rollback.XXXXXX"
+    )"
+    dkms_backup="$dkms_backup_parent/source"
+    sudo install -d -m 0755 "$dkms_backup"
+    validate_tree_metadata "$dkms_dir" "$dkms_dir" ""
+    validate_installed_revision_source "$trusted_source"
+    sudo diff -qr "$dkms_dir" "$trusted_source" >/dev/null
+    sudo cp -a "$dkms_dir/." "$dkms_backup/"
+    sudo chown -R root:root "$dkms_backup"
+    validate_tree_metadata "$dkms_backup" "$dkms_dir" ""
+    sudo diff -qr "$dkms_backup" "$dkms_dir" >/dev/null
+    sudo diff -qr "$dkms_backup" "$trusted_source" >/dev/null
+    validate_tree_metadata "$dkms_dir" "$dkms_backup" ""
+    validate_installed_revision_source "$trusted_source"
+
+    dkms_prior_registered="$dkms_registered"
+    dkms_upgrade_active=true
+    if "$dkms_prior_registered"; then
+      dkms_remove_attempted=true
+      sudo dkms remove -m planeradar-hyperpixel2r -v 0.1.0 --all
+    fi
+    sudo rm -rf -- "$dkms_dir"
+    sudo mv "$dkms_tmp" "$dkms_dir"
+    dkms_tmp=""
+    validate_tree_metadata "$dkms_dir" "$dkms_dir" ""
+    dkms_source_upgraded=true
+  fi
 else
   sudo mv "$dkms_tmp" "$dkms_dir"
   dkms_tmp=""
 fi
 validate_tree_metadata "$dkms_dir" "$dkms_dir" ""
 
-dkms_status=""
-if ! dkms_status="$(
-  sudo dkms status -m planeradar-hyperpixel2r -v 0.1.0 2>/dev/null
-)"; then
-  dkms_status=""
-fi
-dkms_registered=false
-dkms_built_record='^planeradar-hyperpixel2r/0\.1\.0, [A-Za-z0-9][A-Za-z0-9._+-]*, aarch64: (built|installed)$'
-while IFS= read -r dkms_record; do
-  if test "$dkms_record" = "planeradar-hyperpixel2r/0.1.0: added" ||
-     [[ "$dkms_record" =~ $dkms_built_record ]]
-  then
-    dkms_registered=true
-    break
-  fi
-done <<<"$dkms_status"
-if ! "$dkms_registered"; then
+if "$dkms_source_upgraded"; then
+  dkms_add_attempted=true
+  sudo dkms add -m planeradar-hyperpixel2r -v 0.1.0
+elif ! "$dkms_registered"; then
   sudo dkms add -m planeradar-hyperpixel2r -v 0.1.0
 fi
 sudo depmod -a "$release"

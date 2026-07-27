@@ -46,6 +46,7 @@ struct ScriptFixture {
     ownership: PathBuf,
     fixture_path: String,
     revision: String,
+    source_tree: String,
     release: &'static str,
     overlay_file: String,
     module: Vec<u8>,
@@ -277,6 +278,8 @@ impl ScriptFixture {
             &format!(
                 "#!/usr/bin/env bash\n\
                  if test \"${{1-}}\" = status; then exit 0; fi\n\
+                 if test \"$*\" = 'rev-parse HEAD'; then printf '%s\\n' \"$PLANERADAR_TEST_REVISION\"; exit; fi\n\
+                 if test \"$*\" = 'rev-parse HEAD^{{tree}}'; then printf '%s\\n' \"$PLANERADAR_TEST_SOURCE_TREE\"; exit; fi\n\
                  exec '{real_git}' \"$@\"\n"
             ),
         );
@@ -362,6 +365,15 @@ source="$1"
 destination="${2#*:}"
 printf 'scp %s %s\n' "$source" "$destination" >> "$PLANERADAR_TEST_LOG"
 cp -Rp "${source%/.}/." "$PLANERADAR_TEST_ROOT$destination"
+if test -n "${PLANERADAR_TEST_DISTINCT_DKMS_SOURCE:-}"; then
+  printf '%s\n' "$PLANERADAR_TEST_DISTINCT_DKMS_SOURCE" \
+    >> "$PLANERADAR_TEST_ROOT$destination/dkms-source/planeradar_hyperpixel2r_main.c"
+fi
+if test -n "${PLANERADAR_TEST_RESHAPE_DKMS_SOURCE:-}"; then
+  rm -f "$PLANERADAR_TEST_ROOT$destination/dkms-source/README.md"
+  printf '%s\n' '/* revision B only */' \
+    > "$PLANERADAR_TEST_ROOT$destination/dkms-source/planeradar_hyperpixel2r_revision_b.c"
+fi
 "#,
         );
         write_executable(
@@ -378,6 +390,12 @@ if test "${1-}" = test && test "${2-}" = -c; then
     exit
   fi
   exec /usr/bin/test -c "$3"
+fi
+if test "${1-}" = install && test "${2-}" = -d; then
+  "$@"
+  target="${@: -1}"
+  printf 'root:root\t%s\n' "$target" >> "$PLANERADAR_TEST_OWNERSHIP"
+  exit
 fi
 if test "${1-}" = chown; then
   printf 'sudo chown %s\n' "${*:2}" >> "$PLANERADAR_TEST_LOG"
@@ -544,7 +562,7 @@ marker="$PLANERADAR_TEST_ROOT/var/lib/dkms/planeradar-hyperpixel2r/0.1.0/registe
 if test "${1-}" = status; then
   if test -n "${PLANERADAR_TEST_DKMS_STATUS+x}"; then
     printf '%s\n' "$PLANERADAR_TEST_DKMS_STATUS"
-    exit 0
+    exit "${PLANERADAR_TEST_DKMS_STATUS_EXIT:-0}"
   fi
   if test -f "$marker"; then
     printf 'planeradar-hyperpixel2r/0.1.0: added\n'
@@ -554,6 +572,11 @@ fi
 if test "${1-}" = add; then
   mkdir -p "$(dirname "$marker")"
   : > "$marker"
+  exit
+fi
+if test "${1-}" = remove; then
+  test "$*" = "remove -m planeradar-hyperpixel2r -v 0.1.0 --all"
+  rm -f "$marker"
   exit
 fi
 exit 64
@@ -984,6 +1007,7 @@ cmp -s "$2" "$PLANERADAR_TEST_VALID_PNG"
             ownership,
             fixture_path,
             revision,
+            source_tree,
             release,
             overlay_file,
             module,
@@ -1008,6 +1032,7 @@ cmp -s "$2" "$PLANERADAR_TEST_VALID_PNG"
             )
             .env("PLANERADAR_TEST_RELEASE", self.release)
             .env("PLANERADAR_TEST_REVISION", &self.revision)
+            .env("PLANERADAR_TEST_SOURCE_TREE", &self.source_tree)
             .env("PLANERADAR_TEST_VALID_PNG", &self.valid_png);
         command
     }
@@ -1047,8 +1072,58 @@ cmp -s "$2" "$PLANERADAR_TEST_VALID_PNG"
             .join(self.release)
     }
 
+    fn retarget_revision(&mut self, revision: &str, source_tree: &str) {
+        assert_eq!(revision.len(), 40, "fixture revision length");
+        assert_eq!(source_tree.len(), 40, "fixture source tree length");
+        let prior_revision = self.revision.clone();
+        let prior_source_tree = self.source_tree.clone();
+        let prior_overlay = self.overlay_file.clone();
+        let overlay_file = format!("planeradar-hyperpixel2r-{}.dtbo", &revision[..12]);
+
+        fs::rename(
+            self.driver.join(&prior_overlay),
+            self.driver.join(&overlay_file),
+        )
+        .expect("retarget overlay fixture");
+        let manifest =
+            fs::read_to_string(self.driver.join("manifest.txt")).expect("read manifest fixture");
+        fs::write(
+            self.driver.join("manifest.txt"),
+            manifest
+                .replace(
+                    &format!("source_revision\t{prior_revision}"),
+                    &format!("source_revision\t{revision}"),
+                )
+                .replace(
+                    &format!("source_tree\t{prior_source_tree}"),
+                    &format!("source_tree\t{source_tree}"),
+                )
+                .replace(
+                    &format!("overlay_file\t{prior_overlay}"),
+                    &format!("overlay_file\t{overlay_file}"),
+                ),
+        )
+        .expect("retarget manifest fixture");
+        fs::write(
+            self.app.join("planeradar.revision"),
+            format!("{revision}\n"),
+        )
+        .expect("retarget app revision");
+        fs::write(self.app.join("planeradar.tree"), format!("{source_tree}\n"))
+            .expect("retarget app source tree");
+
+        self.revision = revision.to_owned();
+        self.source_tree = source_tree.to_owned();
+        self.overlay_file = overlay_file;
+    }
+
     fn commands(&self) -> String {
         fs::read_to_string(&self.log).unwrap_or_default()
+    }
+
+    fn dkms_registration_marker(&self) -> PathBuf {
+        self.root
+            .join("var/lib/dkms/planeradar-hyperpixel2r/0.1.0/registered")
     }
 
     fn set_owner(&self, path: &Path, owner: &str) {
@@ -1495,6 +1570,336 @@ fn dkms_empty_then_real_source_only_status_registers_exactly_once_across_repeate
 }
 
 #[test]
+fn dkms_nonzero_status_discards_valid_looking_stdout_and_registers() {
+    let fixture = ScriptFixture::new();
+    let output = fixture.stage(&[
+        (
+            "PLANERADAR_TEST_DKMS_STATUS",
+            "planeradar-hyperpixel2r/0.1.0: added",
+        ),
+        ("PLANERADAR_TEST_DKMS_STATUS_EXIT", "69"),
+    ]);
+    assert!(
+        output.status.success(),
+        "stage rejected unreadable DKMS status: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let commands = fixture.commands();
+    assert_eq!(
+        commands
+            .matches("dkms add -m planeradar-hyperpixel2r -v 0.1.0")
+            .count(),
+        1,
+        "valid-looking stdout from failed status suppressed registration:\n{commands}"
+    );
+    assert!(
+        fixture.dkms_registration_marker().is_file(),
+        "stage completed without a registered fixed-version DKMS source"
+    );
+}
+
+#[test]
+fn staging_distinct_owned_revision_upgrades_the_fixed_version_dkms_source() {
+    let mut fixture = ScriptFixture::new();
+    let first = fixture.stage(&[]);
+    assert!(
+        first.status.success(),
+        "revision A stage failed: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let revision_a_source = fixture
+        .artifact_dir()
+        .join("dkms-source/planeradar_hyperpixel2r_main.c");
+    let revision_a_bytes = fs::read(&revision_a_source).expect("revision A source");
+
+    fixture.retarget_revision(&"b".repeat(40), &"c".repeat(40));
+    let second = fixture.stage(&[(
+        "PLANERADAR_TEST_DISTINCT_DKMS_SOURCE",
+        "/* committed revision B */",
+    )]);
+    assert!(
+        second.status.success(),
+        "legitimate revision A to B source upgrade failed: {}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+
+    let revision_b_source = fixture
+        .artifact_dir()
+        .join("dkms-source/planeradar_hyperpixel2r_main.c");
+    let revision_b_bytes = fs::read(&revision_b_source).expect("revision B source");
+    assert_ne!(
+        revision_a_bytes, revision_b_bytes,
+        "the two staged revisions did not carry distinct source"
+    );
+    let installed_source = fixture
+        .root
+        .join("usr/src/planeradar-hyperpixel2r-0.1.0/planeradar_hyperpixel2r_main.c");
+    assert_eq!(
+        fs::read(&installed_source).expect("upgraded fixed-version source"),
+        revision_b_bytes,
+        "fixed-version DKMS source did not advance to revision B"
+    );
+    fixture.assert_tree_root_owned(&fixture.root.join("usr/src/planeradar-hyperpixel2r-0.1.0"));
+    assert!(
+        fixture.dkms_registration_marker().is_file(),
+        "revision B was not registered after the source upgrade"
+    );
+
+    let commands = fixture.commands();
+    assert_eq!(
+        commands
+            .matches("dkms remove -m planeradar-hyperpixel2r -v 0.1.0 --all")
+            .count(),
+        1,
+        "registered revision A was not removed exactly once:\n{commands}"
+    );
+    assert_eq!(
+        commands
+            .matches("dkms add -m planeradar-hyperpixel2r -v 0.1.0")
+            .count(),
+        2,
+        "revision A and revision B were not each registered exactly once:\n{commands}"
+    );
+    let dkms_commands: Vec<_> = commands
+        .lines()
+        .filter(|line| line.starts_with("dkms "))
+        .collect();
+    assert_eq!(
+        dkms_commands,
+        [
+            "dkms status -m planeradar-hyperpixel2r -v 0.1.0",
+            "dkms add -m planeradar-hyperpixel2r -v 0.1.0",
+            "dkms status -m planeradar-hyperpixel2r -v 0.1.0",
+            "dkms remove -m planeradar-hyperpixel2r -v 0.1.0 --all",
+            "dkms add -m planeradar-hyperpixel2r -v 0.1.0",
+        ],
+        "source upgrade did not unregister A before registering B"
+    );
+}
+
+#[test]
+fn staging_distinct_revision_allows_safe_dkms_source_shape_change() {
+    let mut fixture = ScriptFixture::new();
+    let first = fixture.stage(&[]);
+    assert!(
+        first.status.success(),
+        "revision A stage failed: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+
+    fixture.retarget_revision(&"b".repeat(40), &"c".repeat(40));
+    let second = fixture.stage(&[
+        (
+            "PLANERADAR_TEST_DISTINCT_DKMS_SOURCE",
+            "/* committed revision B */",
+        ),
+        ("PLANERADAR_TEST_RESHAPE_DKMS_SOURCE", "1"),
+    ]);
+    assert!(
+        second.status.success(),
+        "safe revision B source-shape change failed: {}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+
+    let revision_b_source = fixture.artifact_dir().join("dkms-source");
+    let installed_source = fixture.root.join("usr/src/planeradar-hyperpixel2r-0.1.0");
+    assert_eq!(
+        fs::read(installed_source.join("planeradar_hyperpixel2r_main.c"))
+            .expect("installed revision B main source"),
+        fs::read(revision_b_source.join("planeradar_hyperpixel2r_main.c"))
+            .expect("revision B main source")
+    );
+    assert_eq!(
+        fs::read(installed_source.join("planeradar_hyperpixel2r_revision_b.c"))
+            .expect("installed revision B-only source"),
+        b"/* revision B only */\n"
+    );
+    assert!(
+        !installed_source.join("README.md").exists(),
+        "revision A-only source entry survived the revision B replacement"
+    );
+    assert!(
+        fixture.dkms_registration_marker().is_file(),
+        "reshaped revision B source was not registered"
+    );
+}
+
+#[test]
+fn staging_distinct_revision_rejects_writable_installed_revision_root_before_unregistering() {
+    let mut fixture = ScriptFixture::new();
+    assert!(fixture.stage(&[]).status.success());
+
+    let revision_dir = fixture
+        .artifact_dir()
+        .parent()
+        .expect("installed revision directory")
+        .to_path_buf();
+    fs::set_permissions(&revision_dir, fs::Permissions::from_mode(0o775))
+        .expect("make installed revision root writable");
+
+    let installed_source = fixture
+        .root
+        .join("usr/src/planeradar-hyperpixel2r-0.1.0/planeradar_hyperpixel2r_main.c");
+    let revision_a_bytes = fs::read(&installed_source).expect("revision A installed source");
+
+    fixture.retarget_revision(&"b".repeat(40), &"c".repeat(40));
+    let second = fixture.stage(&[(
+        "PLANERADAR_TEST_DISTINCT_DKMS_SOURCE",
+        "/* committed revision B */",
+    )]);
+    assert!(
+        !second.status.success(),
+        "writable installed revision root was trusted for source upgrade"
+    );
+    assert_eq!(
+        fs::read(&installed_source).expect("rejected installed source"),
+        revision_a_bytes,
+        "rejected revision-root drift changed the fixed-version source"
+    );
+    assert_eq!(
+        fixture
+            .commands()
+            .matches("dkms remove -m planeradar-hyperpixel2r -v 0.1.0 --all")
+            .count(),
+        0,
+        "unsafe revision root triggered unregister"
+    );
+}
+
+#[test]
+fn staging_distinct_revision_rejects_unproven_dkms_source_before_unregistering() {
+    let mut fixture = ScriptFixture::new();
+    assert!(fixture.stage(&[]).status.success());
+    let installed_source = fixture
+        .root
+        .join("usr/src/planeradar-hyperpixel2r-0.1.0/planeradar_hyperpixel2r_main.c");
+    let mut drifted = fs::read(&installed_source).expect("installed source");
+    drifted.extend_from_slice(b"\n/* arbitrary local mutation */\n");
+    fs::write(&installed_source, &drifted).expect("mutate installed source");
+
+    fixture.retarget_revision(&"b".repeat(40), &"c".repeat(40));
+    let second = fixture.stage(&[(
+        "PLANERADAR_TEST_DISTINCT_DKMS_SOURCE",
+        "/* committed revision B */",
+    )]);
+    assert!(
+        !second.status.success(),
+        "arbitrarily mutated fixed-version source was accepted"
+    );
+    assert_eq!(
+        fs::read(&installed_source).expect("rejected installed source"),
+        drifted,
+        "rejected source drift was modified"
+    );
+    assert!(
+        !fixture
+            .commands()
+            .contains("dkms remove -m planeradar-hyperpixel2r -v 0.1.0 --all"),
+        "unproven source was unregistered before rejection"
+    );
+}
+
+#[test]
+fn source_upgrade_rejects_mixed_dkms_status_before_unregistering() {
+    let mut fixture = ScriptFixture::new();
+    assert!(fixture.stage(&[]).status.success());
+    fixture.retarget_revision(&"b".repeat(40), &"c".repeat(40));
+
+    let second = fixture.stage(&[
+        (
+            "PLANERADAR_TEST_DISTINCT_DKMS_SOURCE",
+            "/* committed revision B */",
+        ),
+        (
+            "PLANERADAR_TEST_DKMS_STATUS",
+            "planeradar-hyperpixel2r/0.1.0: added\nplaneradar-hyperpixel2r/0.1.0: broken",
+        ),
+    ]);
+    assert!(
+        !second.status.success(),
+        "mixed exact and malformed DKMS status was accepted for source upgrade"
+    );
+    assert!(
+        String::from_utf8_lossy(&second.stderr)
+            .contains("refusing DKMS source upgrade with unrecognized status"),
+        "source upgrade did not report the malformed DKMS status: {}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    assert!(
+        !fixture
+            .commands()
+            .contains("dkms remove -m planeradar-hyperpixel2r -v 0.1.0 --all"),
+        "malformed DKMS status triggered unregister"
+    );
+}
+
+#[test]
+fn failed_stage_rolls_back_the_prior_dkms_source_and_registration() {
+    let mut fixture = ScriptFixture::new();
+    assert!(fixture.stage(&[]).status.success());
+    let installed_source = fixture
+        .root
+        .join("usr/src/planeradar-hyperpixel2r-0.1.0/planeradar_hyperpixel2r_main.c");
+    let revision_a_bytes = fs::read(&installed_source).expect("revision A installed source");
+
+    fixture.retarget_revision(&"b".repeat(40), &"c".repeat(40));
+    let failed = fixture.stage(&[
+        (
+            "PLANERADAR_TEST_DISTINCT_DKMS_SOURCE",
+            "/* committed revision B */",
+        ),
+        ("PLANERADAR_TEST_FAIL_STAGE", "1"),
+    ]);
+    assert!(
+        !failed.status.success(),
+        "forced stage failure was accepted"
+    );
+    assert_eq!(
+        fs::read(&installed_source).expect("rolled-back installed source"),
+        revision_a_bytes,
+        "failed revision B stage did not restore revision A source"
+    );
+    assert!(
+        fixture.dkms_registration_marker().is_file(),
+        "rollback did not restore revision A's DKMS registration"
+    );
+
+    let commands = fixture.commands();
+    assert_eq!(
+        commands
+            .matches("dkms remove -m planeradar-hyperpixel2r -v 0.1.0 --all")
+            .count(),
+        2,
+        "upgrade and rollback must each unregister once:\n{commands}"
+    );
+    assert_eq!(
+        commands
+            .matches("dkms add -m planeradar-hyperpixel2r -v 0.1.0")
+            .count(),
+        3,
+        "revision A, revision B, and restored revision A must each register:\n{commands}"
+    );
+    let dkms_commands: Vec<_> = commands
+        .lines()
+        .filter(|line| line.starts_with("dkms "))
+        .collect();
+    assert_eq!(
+        dkms_commands,
+        [
+            "dkms status -m planeradar-hyperpixel2r -v 0.1.0",
+            "dkms add -m planeradar-hyperpixel2r -v 0.1.0",
+            "dkms status -m planeradar-hyperpixel2r -v 0.1.0",
+            "dkms remove -m planeradar-hyperpixel2r -v 0.1.0 --all",
+            "dkms add -m planeradar-hyperpixel2r -v 0.1.0",
+            "dkms remove -m planeradar-hyperpixel2r -v 0.1.0 --all",
+            "dkms add -m planeradar-hyperpixel2r -v 0.1.0",
+        ],
+        "rollback did not replace A with B and then restore A in order"
+    );
+}
+
+#[test]
 fn dkms_exact_source_only_and_built_statuses_do_not_reregister() {
     for status in [
         "planeradar-hyperpixel2r/0.1.0: added",
@@ -1532,6 +1937,10 @@ fn dkms_status_rejects_malformed_records_disallowed_statuses_and_substring_colli
         "planeradar-hyperpixel2r/0.1.0, 6.18.34+rpt-rpi-v8, aarch64: installed trailing-data",
         "planeradar-hyperpixel2r/0.1.0, unsafe/release, aarch64: installed",
         "planeradar-hyperpixel2r/0.1.0, 6.18.34+rpt-rpi-v8, x86_64: installed",
+        concat!(
+            "planeradar-hyperpixel2r/0.1.0: added\n",
+            "planeradar-hyperpixel2r/0.1.0: broken",
+        ),
         concat!(
             "planeradar-hyperpixel2r-helper/0.1.0: added\n",
             "planeradar-hyperpixel2r/0.1.00: added\n",
