@@ -6,30 +6,31 @@ use std::process::Command;
 
 const PUBLIC_TARGET: &str = "pi@raspberrypi.local";
 
+fn is_device_tree_node_identifier(token: &str) -> bool {
+    let Some((name, suffix)) = token.split_once('@') else {
+        return false;
+    };
+    matches!(name, "fragment" | "touchscreen" | "v3d")
+        && !suffix.is_empty()
+        && suffix
+            .chars()
+            .all(|character| character.is_ascii_hexdigit())
+}
+
 fn hard_coded_ssh_targets(source: &str) -> impl Iterator<Item = &str> {
     source
-        .lines()
-        .filter(|line| {
-            line.split_ascii_whitespace().any(|word| {
-                ["target", "remote", "host"].iter().any(|name| {
-                    word.strip_prefix(name)
-                        .is_some_and(|suffix| suffix.starts_with('='))
-                })
-            }) || line
-                .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
-                .any(|word| matches!(word, "ssh" | "scp"))
-        })
-        .flat_map(|line| {
-            line.split(|character: char| {
-                !character.is_ascii_alphanumeric() && !matches!(character, '.' | '_' | '-' | '@')
-            })
+        .split(|character: char| {
+            !character.is_ascii_alphanumeric() && !matches!(character, '.' | '_' | '-' | '@')
         })
         .map(|token| token.trim_matches('-'))
         .filter(|token| {
             let Some((user, host)) = token.split_once('@') else {
                 return false;
             };
-            token.matches('@').count() == 1 && !user.is_empty() && !host.is_empty()
+            token.matches('@').count() == 1
+                && !user.is_empty()
+                && !host.is_empty()
+                && !is_device_tree_node_identifier(token)
         })
 }
 
@@ -85,7 +86,10 @@ fn ssh_target_scanner_rejects_nonempty_users_and_hosts() {
             r#"target="1@192.0.2.1" target="9@host.example" target="8@localhost"
 if ssh 2@192.0.2.2 true; then
 sudo ssh 3@host.example true
-remote=4@localhost"#
+remote=4@localhost
+endpoint=5@example
+printf %s 6@192.0.2.6
+# 7@comment.example"#
         )
         .collect::<Vec<_>>(),
         [
@@ -95,6 +99,9 @@ remote=4@localhost"#
             "2@192.0.2.2",
             "3@host.example",
             "4@localhost",
+            "5@example",
+            "6@192.0.2.6",
+            "7@comment.example",
         ]
     );
 }
