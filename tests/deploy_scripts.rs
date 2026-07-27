@@ -10,8 +10,14 @@ fn hard_coded_ssh_targets(source: &str) -> impl Iterator<Item = &str> {
     source
         .lines()
         .filter(|line| {
-            let line = line.trim_start();
-            line.starts_with("target=") || line.starts_with("ssh ") || line.starts_with("scp ")
+            line.split_ascii_whitespace().any(|word| {
+                ["target", "remote", "host"].iter().any(|name| {
+                    word.strip_prefix(name)
+                        .is_some_and(|suffix| suffix.starts_with('='))
+                })
+            }) || line
+                .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
+                .any(|word| matches!(word, "ssh" | "scp"))
         })
         .flat_map(|line| {
             line.split(|character: char| {
@@ -76,10 +82,31 @@ fn pi_application_scripts_share_the_public_target_override() {
 fn ssh_target_scanner_rejects_nonempty_users_and_hosts() {
     assert_eq!(
         hard_coded_ssh_targets(
-            r#"target="1@192.0.2.1" target="9@host.example" target="8@localhost""#
+            r#"target="1@192.0.2.1" target="9@host.example" target="8@localhost"
+if ssh 2@192.0.2.2 true; then
+sudo ssh 3@host.example true
+remote=4@localhost"#
         )
         .collect::<Vec<_>>(),
-        ["1@192.0.2.1", "9@host.example", "8@localhost"]
+        [
+            "1@192.0.2.1",
+            "9@host.example",
+            "8@localhost",
+            "2@192.0.2.2",
+            "3@host.example",
+            "4@localhost",
+        ]
+    );
+}
+
+#[test]
+fn ssh_target_scanner_ignores_device_tree_node_identifiers() {
+    assert!(
+        hard_coded_ssh_targets(
+            "fragment@0\ntouchscreen@15\nv3d_status=\"/proc/device-tree/soc/v3d@7ec00000/status\""
+        )
+        .next()
+        .is_none()
     );
 }
 
