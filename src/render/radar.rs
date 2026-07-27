@@ -4,7 +4,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tiny_skia::{FillRule, LineCap, Paint, PathBuilder, Pixmap, Rect, Stroke, Transform};
+use tiny_skia::{FillRule, LineCap, Paint, PathBuilder, Pixmap, Stroke, Transform};
 
 use crate::display::{DisplayConfig, DisplayHandler, DisplayUpdate, InputEvent, run_display};
 use crate::geometry::{offset_km, project_to_radar, rim_point};
@@ -19,7 +19,6 @@ use crate::render::{FontAsset, Frame, RenderError};
 const STALE_AFTER: Duration = Duration::from_secs(30);
 const MAX_AIRCRAFT: usize = 64;
 const MAX_AIRPORT_LABELS: usize = 32;
-const AIRCRAFT_TAG_BACKPLATE_PADDING: f32 = 2.0;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BackgroundKey {
@@ -205,16 +204,7 @@ impl RadarRenderer {
 
         let preset = range_preset(settings.range_index)?;
         let range_label = format_range_label(preset, settings.units);
-        let (width, height) = text.measure(&range_label, theme::SCALE_CAP_HEIGHT);
         let anchor_x = theme::CENTER.0 + theme::GRID_OUTER_RADIUS - 12.0;
-        fill_rectangle(
-            pixmap,
-            anchor_x - width - 6.0,
-            theme::CENTER.1 - height / 2.0 - 4.0,
-            width + 12.0,
-            height + 8.0,
-            theme::BACKGROUND,
-        );
         text.draw(
             pixmap,
             &range_label,
@@ -309,15 +299,6 @@ impl RadarRenderer {
                     y + outward_y / outward_length * f64::from(theme::RUNWAY_LABEL_GAP),
                 )
             };
-            let (width, height) = text.measure(&airport.ident, theme::RUNWAY_LABEL_CAP_HEIGHT);
-            fill_rectangle(
-                pixmap,
-                label_x as f32 - width / 2.0 - 4.0,
-                label_y as f32 - height - 2.0,
-                width + 8.0,
-                height + 4.0,
-                theme::BACKGROUND,
-            );
             text.draw(
                 pixmap,
                 &airport.ident,
@@ -463,11 +444,6 @@ impl RadarRenderer {
             )
         };
         let top = (y - block_height / 2.0).clamp(1.0, theme::SIZE as f32 - block_height - 1.0);
-        if let Some((left, top, width, height)) =
-            aircraft_tag_backplate(anchor_x, horizontal, top, block_width, block_height)
-        {
-            fill_rectangle(pixmap, left, top, width, height, theme::BACKGROUND);
-        }
         for (index, (line, color)) in lines.into_iter().enumerate() {
             text.draw(
                 pixmap,
@@ -788,50 +764,11 @@ fn draw_line(pixmap: &mut Pixmap, x0: f32, y0: f32, x1: f32, y1: f32, width: f32
     pixmap.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
 }
 
-fn fill_rectangle(pixmap: &mut Pixmap, x: f32, y: f32, width: f32, height: f32, rgba: [u8; 4]) {
-    let Some(rectangle) = Rect::from_xywh(x, y, width.max(0.0), height.max(0.0)) else {
-        return;
-    };
-    let paint = paint(rgba);
-    pixmap.fill_rect(rectangle, &paint, Transform::identity(), None);
-}
-
 fn paint(rgba: [u8; 4]) -> Paint<'static> {
     let mut paint = Paint::default();
     paint.set_color_rgba8(rgba[0], rgba[1], rgba[2], rgba[3]);
     paint.force_hq_pipeline = true;
     paint
-}
-
-fn aircraft_tag_backplate(
-    anchor_x: f32,
-    horizontal: HorizontalAnchor,
-    text_top: f32,
-    block_width: f32,
-    block_height: f32,
-) -> Option<(f32, f32, f32, f32)> {
-    if block_width <= 0.0 {
-        return None;
-    }
-    let text_left = match horizontal {
-        HorizontalAnchor::Left => anchor_x,
-        HorizontalAnchor::Center => anchor_x - block_width / 2.0,
-        HorizontalAnchor::Right => anchor_x - block_width,
-    };
-    let frame_edge = theme::SIZE as f32;
-    let left = (text_left - AIRCRAFT_TAG_BACKPLATE_PADDING)
-        .floor()
-        .clamp(0.0, frame_edge);
-    let top = (text_top - AIRCRAFT_TAG_BACKPLATE_PADDING)
-        .floor()
-        .clamp(0.0, frame_edge);
-    let right = (text_left + block_width + AIRCRAFT_TAG_BACKPLATE_PADDING)
-        .ceil()
-        .clamp(0.0, frame_edge);
-    let bottom = (text_top + block_height + AIRCRAFT_TAG_BACKPLATE_PADDING)
-        .ceil()
-        .clamp(0.0, frame_edge);
-    (right > left && bottom > top).then_some((left, top, right - left, bottom - top))
 }
 
 fn color(rgba: [u8; 4]) -> tiny_skia::Color {
