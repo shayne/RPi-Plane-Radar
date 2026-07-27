@@ -4,7 +4,7 @@ set -euo pipefail
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 source "$script_dir/hyperpixel-build-common.sh"
 
-target="${PLANERADAR_PI_TARGET:-shayne@planeradar.local}"
+target="${1:-${PLANERADAR_PI_TARGET:-pi@raspberrypi.local}}"
 release="$(ssh "$target" uname -r)"
 hp2r_validate_release "$release"
 hp2r_require_clean_source

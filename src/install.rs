@@ -18,7 +18,14 @@ const INSTALL_REVISION: &str = "opt/planeradar/REVISION";
 const INSTALL_CHECKSUM: &str = "opt/planeradar/SHA256";
 const INSTALL_SERVICE: &str = "etc/systemd/system/planeradar.service";
 const INSTALL_STATE: &str = "var/lib/planeradar";
-const REQUIRED_PACKAGES: &[&str] = &["libsdl2-2.0-0", "ca-certificates", "avahi-daemon"];
+const RUNTIME_PACKAGES: &[&str] = &[
+    "libsdl2-2.0-0",
+    "libegl1",
+    "libgles2",
+    "libgl1-mesa-dri",
+    "ca-certificates",
+    "avahi-daemon",
+];
 
 const SUPPORTED_DISPLAY_PARAMETERS: &[&str] = &[
     "rotate=0",
@@ -144,17 +151,9 @@ impl<'a> Installer<'a> {
         } = validate_installation(options)?;
 
         self.commands.run("apt-get", &["update"])?;
-        self.commands.run(
-            "apt-get",
-            &[
-                "install",
-                "--yes",
-                "--no-install-recommends",
-                REQUIRED_PACKAGES[0],
-                REQUIRED_PACKAGES[1],
-                REQUIRED_PACKAGES[2],
-            ],
-        )?;
+        let mut install_args = vec!["install", "--yes", "--no-install-recommends"];
+        install_args.extend_from_slice(RUNTIME_PACKAGES);
+        self.commands.run("apt-get", &install_args)?;
         self.ensure_service_account(&root)?;
 
         let mut files_changed = false;
