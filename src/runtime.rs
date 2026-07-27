@@ -361,7 +361,7 @@ impl<C: Fn() -> Duration + Send + Sync + 'static> HealthSource for RuntimeHealth
 fn state_for(snapshot: &RuntimeSnapshot) -> AppState {
     if snapshot.settings.location.is_none() {
         AppState::SetupRequired
-    } else if snapshot.fetched_at.is_some() {
+    } else if snapshot.has_successful_fetch_for_current_location {
         AppState::Radar
     } else {
         AppState::WaitingForNetwork
