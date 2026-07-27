@@ -199,7 +199,7 @@ fn east_aircraft_uses_unrounded_projection_and_draws_tag_and_heading() {
 }
 
 #[test]
-fn aircraft_tag_masks_the_range_label_where_they_overlap() {
+fn transparent_aircraft_tag_preserves_static_pixels_and_draws_text_last() {
     let settings = configured_settings();
     let plane = aircraft(11.6, 0.0);
     let snapshot = RadarSnapshot {
@@ -230,27 +230,32 @@ fn aircraft_tag_masks_the_range_label_where_they_overlap() {
     let overlap_left = tag_anchor_x.floor() as u32 - overlap_width;
     let overlap_top = (CENTER.1 - AIRCRAFT_TAG_CAP_HEIGHT / 2.0).floor() as u32;
     let overlap_height = AIRCRAFT_TAG_CAP_HEIGHT.ceil() as u32;
+    let empty_grid = empty.color_count(
+        GRID,
+        overlap_left,
+        overlap_top,
+        overlap_width,
+        overlap_height,
+    );
+    let traffic_grid = traffic.color_count(
+        GRID,
+        overlap_left,
+        overlap_top,
+        overlap_width,
+        overlap_height,
+    );
 
     assert!(
-        empty.color_count(
-            GRID,
-            overlap_left,
-            overlap_top,
-            overlap_width,
-            overlap_height
-        ) > 0,
-        "the empty background must contain pixels from the 10km label in the overlap region"
+        empty_grid > 0,
+        "overlap precondition needs range-label pixels"
     );
-    assert_eq!(
-        traffic.color_count(
-            GRID,
-            overlap_left,
-            overlap_top,
-            overlap_width,
-            overlap_height
-        ),
-        0,
-        "static range-label pixels must not show through the dynamic aircraft tag"
+    assert!(
+        traffic_grid > 0,
+        "static range pixels must remain visible through transparent glyph gaps"
+    );
+    assert!(
+        traffic_grid < empty_grid,
+        "later aircraft glyphs must replace directly overlapped static pixels"
     );
     assert!(
         traffic.color_count(
@@ -260,7 +265,60 @@ fn aircraft_tag_masks_the_range_label_where_they_overlap() {
             overlap_width,
             overlap_height
         ) > 0,
-        "the aircraft type text must remain visible over its opaque backing"
+        "aircraft type glyphs must remain visible"
+    );
+}
+
+#[test]
+fn transparent_range_label_preserves_the_east_scope_line() {
+    let frame = test_renderer()
+        .render(
+            &empty_snapshot(Some(Duration::ZERO)),
+            &configured_settings(),
+            &[],
+            Duration::ZERO,
+        )
+        .expect("render");
+
+    for x in 380..448 {
+        assert_ne!(
+            frame.pixel(x, CENTER.1 as u32),
+            BACKGROUND,
+            "range-label padding or glyph gap masked the scope line at x={x}"
+        );
+    }
+}
+
+#[test]
+fn whitespace_runway_label_does_not_mask_radar_geometry() {
+    let mut empty_ident = runway_airport();
+    empty_ident.ident.clear();
+    let mut whitespace_ident = empty_ident.clone();
+    whitespace_ident.ident = "                        ".to_owned();
+    let settings = configured_settings();
+    let snapshot = empty_snapshot(Some(Duration::ZERO));
+
+    let empty_frame = test_renderer()
+        .render(
+            &snapshot,
+            &settings,
+            std::slice::from_ref(&empty_ident),
+            Duration::ZERO,
+        )
+        .expect("empty-label render");
+    let whitespace_frame = test_renderer()
+        .render(
+            &snapshot,
+            &settings,
+            std::slice::from_ref(&whitespace_ident),
+            Duration::ZERO,
+        )
+        .expect("whitespace-label render");
+
+    assert_eq!(
+        whitespace_frame.pixels(),
+        empty_frame.pixels(),
+        "a label with no glyph coverage must not paint a background plate"
     );
 }
 
