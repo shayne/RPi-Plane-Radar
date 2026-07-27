@@ -178,6 +178,49 @@ declaration and its owned parameters, syncs storage, and retains all
 revisioned artifacts for diagnosis. It does not unload the running module;
 the normal reboot performs the lifecycle transition.
 
+## Accepted Raspberry Pi Zero 2 W installation
+
+The physically accepted installation on `planeradar.local` is:
+
+- source revision
+  `eefaf3ae40fd1b2728bea80fa2a7286f7426d34e`, source tree
+  `b01b6974b9681b5c4812be10f3606c025eb0ff8b`;
+- Raspberry Pi OS kernel `6.18.34+rpt-rpi-v8`;
+- overlay `planeradar-hyperpixel2r-eefaf3ae40fd.dtbo`, SHA-256
+  `82cd144d86fc88a31198b7d61f538ebaa2f990f2103a738c1fe34b52a52a5a92`;
+- module `planeradar_hyperpixel2r.ko`, SHA-256
+  `900de8a80d31d091682f5b00019f277a49869558dfb34d33d19f8bd685afb05b`,
+  with vermagic
+  `6.18.34+rpt-rpi-v8 SMP preempt mod_unload modversions aarch64`;
+- native `rotate=0` orientation with no optional touch inversion or axis-swap
+  parameters; and
+- normal-config SHA-256
+  `04491a62e16d6baf80654d552e1659aa423498137c53460d0f7353f86960ec0b`.
+
+The recovery baseline remains
+`/boot/firmware/config.txt.task6-baseline.20260727T003128Z.bak`, SHA-256
+`d237a211ad67b941f2c36e08917984143d256793f1aaf348cf7ee4249df7dbeb`.
+Do not replace or edit that file.
+
+Automated verification passed after both a normal reboot and a cold power
+cycle with `tryboot=0`, a connected `card0-DPI-1` at 480×480,
+`video_driver=KMSDRM`, `render_driver=opengles2`, VC4/V3D rendering, and zero
+failed units. The accepted touch device is `/dev/input/event0`,
+`11-0015 generic ft5x06 (00)`, with `ABS_X`, `ABS_Y`,
+`ABS_MT_POSITION_X`, and `ABS_MT_POSITION_Y` spanning 0 through 479.
+Physical samples landed at center `(256,264)`, top `(255,58)`, right
+`(430,265)`, bottom `(250,433)`, and left `(95,230)`. A continuous center
+hold lasted 3.60 seconds and showed the QR screen without a release tap; the
+following 0.12-second tap returned to radar. The accepted radar is
+edge-to-edge, sharp, true black, and uses the one-pixel outlined range label.
+
+The live app stopped in 0.907 seconds during the final measured shutdown,
+released port 80, and left zero failed units. A rollback-generation proof
+against a temporary copy produced exactly one stock declaration, zero custom
+declarations, and no boot-config line longer than 98 bytes; the live accepted
+normal configuration remained byte-identical and the temporary copy was
+deleted.
+
 ## Kernel upgrades and DKMS
 
 The source is installed as `/usr/src/planeradar-hyperpixel2r-0.1.0` and
