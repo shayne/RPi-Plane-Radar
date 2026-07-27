@@ -9,8 +9,9 @@ use planeradar::app::PlaneRadarApp;
 use planeradar::cli::{Cli, Command, DemoCommand, version_line};
 use planeradar::display::{DisplayConfig, run_display, run_probe};
 use planeradar::install::{
-    BootConfigEditor, DisplaySelection, commit_display_config, ensure_overlay,
-    rollback_display_config, stage_tryboot_config, stage_tryboot_config_if_source_matches,
+    BootConfigEditor, DisplaySelection, InstallOptions, Installer, SystemCommandRunner,
+    commit_display_config, ensure_overlay, rollback_display_config, stage_tryboot_config,
+    stage_tryboot_config_if_source_matches,
 };
 use planeradar::logging;
 use planeradar::render::FontAsset;
@@ -79,6 +80,24 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         Command::RenderFixtures { output } => {
             write_fixtures(&output)?;
             write_setup_fixtures(&output)?;
+        }
+        Command::Install {
+            artifact,
+            checksum_file,
+            revision_file,
+            reboot,
+        } => {
+            let result = Installer::new(&SystemCommandRunner).install(&InstallOptions {
+                root: "/".into(),
+                boot_config: "/boot/firmware/config.txt".into(),
+                artifact,
+                checksum_file,
+                revision_file,
+                reboot,
+            })?;
+            println!("files_changed={}", result.files_changed);
+            println!("boot_config_changed={}", result.boot_config_changed);
+            println!("reboot_required={}", result.reboot_required);
         }
         Command::ConfigureDisplay {
             boot_config,

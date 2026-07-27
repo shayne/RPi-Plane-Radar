@@ -18,3 +18,4 @@ scp \
   "${target}:${stage}/"
 ssh "$target" "cd '${stage}' && sha256sum -c planeradar.sha256 && chmod 0755 planeradar"
 printf '%s\n' "$stage" > dist/last-stage-path
+printf 'Staged verified installer at %s:%s/planeradar\n' "$target" "$stage"

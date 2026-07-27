@@ -2,6 +2,7 @@ use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -10,6 +11,14 @@ pub const STOCK_HYPERPIXEL_DECLARATION: &str = "dtoverlay=vc4-kms-dpi-hyperpixel
 pub const DEFAULT_HYPERPIXEL_DECLARATION: &str = STOCK_HYPERPIXEL_DECLARATION;
 pub const PLANERADAR_HYPERPIXEL_PREFIX: &str = "planeradar-hyperpixel2r-";
 pub const MAX_BOOT_CONFIG_LINE_BYTES: usize = 98;
+pub const PLANERADAR_SERVICE: &str = include_str!("../packaging/planeradar.service");
+
+const INSTALL_BINARY: &str = "opt/planeradar/bin/planeradar";
+const INSTALL_REVISION: &str = "opt/planeradar/REVISION";
+const INSTALL_CHECKSUM: &str = "opt/planeradar/SHA256";
+const INSTALL_SERVICE: &str = "etc/systemd/system/planeradar.service";
+const INSTALL_STATE: &str = "var/lib/planeradar";
+const REQUIRED_PACKAGES: &[&str] = &["libsdl2-2.0-0", "ca-certificates", "avahi-daemon"];
 
 const SUPPORTED_DISPLAY_PARAMETERS: &[&str] = &[
     "rotate=0",
@@ -53,10 +62,503 @@ pub enum InstallError {
     ConflictingConfigPath(PathBuf),
     #[error("refusing unsafe non-regular configuration file: {0}")]
     UnsafeFileType(PathBuf),
+    #[error("unsupported installation root: {0}")]
+    InvalidRoot(PathBuf),
+    #[error("unsupported operating system: {0}")]
+    UnsupportedOperatingSystem(String),
+    #[error("unsupported hardware model: {0}")]
+    UnsupportedHardware(String),
+    #[error("installer must run as an AArch64 binary on the live target")]
+    UnsupportedArchitecture,
+    #[error("invalid Plane Radar artifact: {0}")]
+    InvalidArtifact(String),
+    #[error("artifact checksum does not match the verified sidecar")]
+    ChecksumMismatch,
+    #[error("artifact revision does not match this installer: {0}")]
+    RevisionMismatch(String),
+    #[error("boot configuration has {0} active HyperPixel declarations; expected at most one")]
+    AmbiguousDisplay(usize),
+    #[error("path is not valid UTF-8: {0}")]
+    NonUtf8Path(PathBuf),
+    #[error("command failed: {program} exited with {status}")]
+    CommandFailed { program: String, status: String },
     #[error("failed to update boot configuration: {0}")]
     Io(#[from] io::Error),
     #[error("failed to persist boot configuration: {0}")]
     Persist(#[from] tempfile::PersistError),
+}
+
+#[derive(Clone, Debug)]
+pub struct InstallOptions {
+    pub root: PathBuf,
+    pub boot_config: PathBuf,
+    pub artifact: PathBuf,
+    pub checksum_file: PathBuf,
+    pub revision_file: PathBuf,
+    pub reboot: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InstallResult {
+    pub files_changed: bool,
+    pub boot_config_changed: bool,
+    pub reboot_required: bool,
+}
+
+pub trait CommandRunner: Send + Sync {
+    fn run(&self, program: &str, args: &[&str]) -> Result<(), InstallError>;
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SystemCommandRunner;
+
+impl CommandRunner for SystemCommandRunner {
+    fn run(&self, program: &str, args: &[&str]) -> Result<(), InstallError> {
+        let status = Command::new(program).args(args).status()?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(InstallError::CommandFailed {
+                program: program.to_owned(),
+                status: status.to_string(),
+            })
+        }
+    }
+}
+
+pub struct Installer<'a> {
+    commands: &'a dyn CommandRunner,
+}
+
+impl<'a> Installer<'a> {
+    pub fn new(commands: &'a dyn CommandRunner) -> Self {
+        Self { commands }
+    }
+
+    pub fn install(&self, options: &InstallOptions) -> Result<InstallResult, InstallError> {
+        let ValidatedInstallation {
+            root,
+            artifact,
+            checksum,
+            revision,
+        } = validate_installation(options)?;
+
+        self.commands.run("apt-get", &["update"])?;
+        self.commands.run(
+            "apt-get",
+            &[
+                "install",
+                "--yes",
+                "--no-install-recommends",
+                REQUIRED_PACKAGES[0],
+                REQUIRED_PACKAGES[1],
+                REQUIRED_PACKAGES[2],
+            ],
+        )?;
+        self.ensure_service_account(&root)?;
+
+        let mut files_changed = false;
+        files_changed |= ensure_install_directory(&root, Path::new("opt"), 0o755, false)?;
+        files_changed |= ensure_install_directory(&root, Path::new("opt/planeradar"), 0o755, true)?;
+        files_changed |=
+            ensure_install_directory(&root, Path::new("opt/planeradar/bin"), 0o755, true)?;
+        files_changed |= ensure_install_directory(&root, Path::new("var"), 0o755, false)?;
+        files_changed |= ensure_install_directory(&root, Path::new("var/lib"), 0o755, false)?;
+        files_changed |= ensure_install_directory(&root, Path::new(INSTALL_STATE), 0o750, true)?;
+        ensure_existing_directory(&root, Path::new("etc"))?;
+        files_changed |= ensure_install_directory(&root, Path::new("etc/systemd"), 0o755, false)?;
+        files_changed |=
+            ensure_install_directory(&root, Path::new("etc/systemd/system"), 0o755, false)?;
+
+        files_changed |=
+            durable_atomic_write_bytes(&install_path(&root, INSTALL_BINARY), &artifact, 0o755)?;
+        files_changed |=
+            durable_atomic_write_bytes(&install_path(&root, INSTALL_REVISION), &revision, 0o644)?;
+        files_changed |=
+            durable_atomic_write_bytes(&install_path(&root, INSTALL_CHECKSUM), &checksum, 0o644)?;
+        let service_changed = durable_atomic_write_bytes(
+            &install_path(&root, INSTALL_SERVICE),
+            PLANERADAR_SERVICE.as_bytes(),
+            0o644,
+        )?;
+        files_changed |= service_changed;
+
+        let backup_existed = backup_path(&options.boot_config).exists();
+        let boot_config_changed = ensure_calibrated_boot_config(&options.boot_config)?;
+        files_changed |= !backup_existed && backup_path(&options.boot_config).exists();
+
+        let state_path = install_path(&root, INSTALL_STATE);
+        let state = path_as_str(&state_path)?;
+        self.commands
+            .run("chown", &["--recursive", "planeradar:planeradar", state])?;
+        if service_changed {
+            self.commands.run("systemctl", &["daemon-reload"])?;
+        }
+        self.commands
+            .run("systemctl", &["enable", "planeradar.service"])?;
+        if files_changed {
+            self.commands
+                .run("systemctl", &["restart", "planeradar.service"])?;
+        } else {
+            self.commands
+                .run("systemctl", &["start", "planeradar.service"])?;
+        }
+
+        if boot_config_changed && options.reboot {
+            self.commands.run("systemctl", &["reboot"])?;
+        }
+
+        Ok(InstallResult {
+            files_changed,
+            boot_config_changed,
+            reboot_required: boot_config_changed,
+        })
+    }
+
+    fn ensure_service_account(&self, root: &Path) -> Result<(), InstallError> {
+        let passwd = fs::read_to_string(install_path(root, "etc/passwd"))?;
+        if !passwd
+            .lines()
+            .any(|line| line.split(':').next() == Some("planeradar"))
+        {
+            self.commands.run(
+                "useradd",
+                &[
+                    "--system",
+                    "--user-group",
+                    "--home-dir",
+                    "/var/lib/planeradar",
+                    "--no-create-home",
+                    "--shell",
+                    "/usr/sbin/nologin",
+                    "planeradar",
+                ],
+            )?;
+        }
+        self.commands.run(
+            "usermod",
+            &["--append", "--groups", "video,render,input", "planeradar"],
+        )
+    }
+}
+
+struct ValidatedInstallation {
+    root: PathBuf,
+    artifact: Vec<u8>,
+    checksum: Vec<u8>,
+    revision: Vec<u8>,
+}
+
+fn validate_installation(options: &InstallOptions) -> Result<ValidatedInstallation, InstallError> {
+    if !options.root.is_absolute() {
+        return Err(InstallError::InvalidRoot(options.root.clone()));
+    }
+    let root_metadata = fs::symlink_metadata(&options.root)?;
+    if !root_metadata.file_type().is_dir() {
+        return Err(InstallError::InvalidRoot(options.root.clone()));
+    }
+    let root = fs::canonicalize(&options.root)?;
+
+    if root == Path::new("/") && std::env::consts::ARCH != "aarch64" {
+        return Err(InstallError::UnsupportedArchitecture);
+    }
+
+    let os_release = read_regular_utf8(&install_path(&root, "etc/os-release"))?;
+    let operating_system = parse_os_release(&os_release);
+    let id = operating_system
+        .iter()
+        .find_map(|(key, value)| (key == "ID").then_some(value.as_str()))
+        .unwrap_or_default();
+    let version = operating_system
+        .iter()
+        .find_map(|(key, value)| (key == "VERSION_ID").then_some(value.as_str()))
+        .unwrap_or_default();
+    if !matches!(id, "debian" | "raspbian") || !matches!(version, "12" | "13") {
+        return Err(InstallError::UnsupportedOperatingSystem(format!(
+            "{id} {version}"
+        )));
+    }
+
+    let model = read_regular_utf8(&install_path(&root, "proc/device-tree/model"))?;
+    let model = model.trim_matches(['\0', '\r', '\n']);
+    if !model.starts_with("Raspberry Pi Zero 2 W") {
+        return Err(InstallError::UnsupportedHardware(model.to_owned()));
+    }
+
+    for input in [
+        &options.artifact,
+        &options.checksum_file,
+        &options.revision_file,
+        &options.boot_config,
+    ] {
+        require_regular_file(input)?;
+    }
+    let boot_parent = fs::canonicalize(
+        options
+            .boot_config
+            .parent()
+            .ok_or_else(|| InstallError::MissingParent(options.boot_config.clone()))?,
+    )?;
+    if !boot_parent.starts_with(&root) {
+        return Err(InstallError::InvalidRoot(options.boot_config.clone()));
+    }
+    let boot_source = fs::read_to_string(&options.boot_config)?;
+    validate_boot_config(&boot_source)?;
+    validate_display_preflight(&boot_source)?;
+    let backup = backup_path(&options.boot_config);
+    if let Ok(metadata) = fs::symlink_metadata(&backup)
+        && !metadata.file_type().is_file()
+    {
+        return Err(InstallError::UnsafeFileType(backup));
+    }
+
+    let artifact = fs::read(&options.artifact)?;
+    validate_aarch64_elf(&artifact)?;
+    let checksum = fs::read(&options.checksum_file)?;
+    let checksum_text = std::str::from_utf8(&checksum).map_err(|_| {
+        InstallError::InvalidArtifact(format!("{} is not UTF-8", options.checksum_file.display()))
+    })?;
+    let expected = parse_checksum_sidecar(checksum_text, &options.artifact)?;
+    if format!("{:x}", Sha256::digest(&artifact)) != expected {
+        return Err(InstallError::ChecksumMismatch);
+    }
+    let revision = fs::read(&options.revision_file)?;
+    let expected_revision = format!("{}\n", env!("PLANERADAR_REVISION"));
+    if revision != expected_revision.as_bytes() {
+        return Err(InstallError::RevisionMismatch(
+            String::from_utf8_lossy(&revision).trim().to_owned(),
+        ));
+    }
+
+    Ok(ValidatedInstallation {
+        root,
+        artifact,
+        checksum,
+        revision,
+    })
+}
+
+fn parse_os_release(input: &str) -> Vec<(String, String)> {
+    input
+        .lines()
+        .filter_map(|line| {
+            let (key, raw_value) = line.split_once('=')?;
+            let value = raw_value
+                .strip_prefix('"')
+                .and_then(|value| value.strip_suffix('"'))
+                .unwrap_or(raw_value);
+            Some((key.to_owned(), value.to_owned()))
+        })
+        .collect()
+}
+
+fn validate_aarch64_elf(artifact: &[u8]) -> Result<(), InstallError> {
+    let valid = artifact.len() >= 20
+        && artifact.starts_with(b"\x7fELF")
+        && artifact[4] == 2
+        && artifact[5] == 1
+        && artifact[18] == 0xb7
+        && artifact[19] == 0;
+    if valid {
+        Ok(())
+    } else {
+        Err(InstallError::InvalidArtifact(
+            "expected a little-endian ELF64 AArch64 executable".to_owned(),
+        ))
+    }
+}
+
+fn parse_checksum_sidecar(sidecar: &str, artifact: &Path) -> Result<String, InstallError> {
+    let mut lines = sidecar.lines();
+    let line = lines
+        .next()
+        .ok_or_else(|| InstallError::InvalidArtifact("checksum sidecar is empty".to_owned()))?;
+    if lines.next().is_some() {
+        return Err(InstallError::InvalidArtifact(
+            "checksum sidecar must contain exactly one row".to_owned(),
+        ));
+    }
+    let mut fields = line.split_whitespace();
+    let checksum = fields.next().unwrap_or_default();
+    let filename = fields.next().unwrap_or_default();
+    if fields.next().is_some()
+        || checksum.len() != 64
+        || !checksum
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        || artifact.file_name().and_then(|name| name.to_str()) != Some(filename)
+    {
+        return Err(InstallError::InvalidArtifact(
+            "checksum sidecar has an invalid digest or filename".to_owned(),
+        ));
+    }
+    Ok(checksum.to_owned())
+}
+
+fn validate_display_preflight(source: &str) -> Result<(), InstallError> {
+    let declarations = active_hyperpixel_declarations(source);
+    if declarations.len() > 1 {
+        return Err(InstallError::AmbiguousDisplay(declarations.len()));
+    }
+    if let Some(declaration) = declarations.first() {
+        let selection = declaration
+            .strip_prefix("dtoverlay=")
+            .ok_or_else(|| InstallError::InvalidOverlayName((*declaration).to_owned()))?;
+        let mut fields = selection.split(',');
+        let overlay = fields.next().unwrap_or_default();
+        if overlay != STOCK_HYPERPIXEL_DECLARATION.trim_start_matches("dtoverlay=") {
+            validate_overlay_name(overlay)?;
+        }
+        let mut parameters = Vec::new();
+        for parameter in fields {
+            if !SUPPORTED_DISPLAY_PARAMETERS.contains(&parameter) {
+                return Err(InstallError::InvalidDisplayParameter(parameter.to_owned()));
+            }
+            if parameters.contains(&parameter) {
+                return Err(InstallError::DuplicateDisplayParameter(
+                    parameter.to_owned(),
+                ));
+            }
+            parameters.push(parameter);
+        }
+    }
+    Ok(())
+}
+
+fn ensure_calibrated_boot_config(path: &Path) -> Result<bool, InstallError> {
+    let editor = BootConfigEditor::acquire(path)?;
+    let source = editor.read_source()?;
+    validate_display_preflight(&source)?;
+    if active_hyperpixel_declarations(&source).is_empty() {
+        return editor.edit_from_source(&source, STOCK_HYPERPIXEL_DECLARATION);
+    }
+
+    let mode = regular_file_mode(path)?;
+    preserve_backup(path, &source, mode)?;
+    Ok(false)
+}
+
+fn active_hyperpixel_declarations(source: &str) -> Vec<&str> {
+    source
+        .lines()
+        .map(str::trim)
+        .filter(|line| is_install_hyperpixel_declaration(line))
+        .collect()
+}
+
+fn is_install_hyperpixel_declaration(line: &str) -> bool {
+    let Some(selection) = line.strip_prefix("dtoverlay=") else {
+        return false;
+    };
+    let overlay = selection.split(',').next().unwrap_or_default();
+    overlay == STOCK_HYPERPIXEL_DECLARATION.trim_start_matches("dtoverlay=")
+        || overlay.starts_with(PLANERADAR_HYPERPIXEL_PREFIX)
+}
+
+fn require_regular_file(path: &Path) -> Result<(), InstallError> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_file() {
+        Ok(())
+    } else {
+        Err(InstallError::UnsafeFileType(path.to_owned()))
+    }
+}
+
+fn read_regular_utf8(path: &Path) -> Result<String, InstallError> {
+    require_regular_file(path)?;
+    String::from_utf8(fs::read(path)?)
+        .map_err(|_| InstallError::InvalidArtifact(format!("{} is not UTF-8", path.display())))
+}
+
+fn install_path(root: &Path, relative: impl AsRef<Path>) -> PathBuf {
+    root.join(relative)
+}
+
+fn ensure_existing_directory(root: &Path, relative: &Path) -> Result<(), InstallError> {
+    let path = install_path(root, relative);
+    let metadata = fs::symlink_metadata(&path)?;
+    if metadata.file_type().is_dir() {
+        Ok(())
+    } else {
+        Err(InstallError::UnsafeFileType(path))
+    }
+}
+
+fn ensure_install_directory(
+    root: &Path,
+    relative: &Path,
+    mode: u32,
+    enforce_mode: bool,
+) -> Result<bool, InstallError> {
+    let path = install_path(root, relative);
+    let mut changed = false;
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_dir() => {
+            if enforce_mode && metadata.permissions().mode() & 0o777 != mode {
+                fs::set_permissions(&path, fs::Permissions::from_mode(mode))?;
+                changed = true;
+            }
+        }
+        Ok(_) => return Err(InstallError::UnsafeFileType(path)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let parent = path
+                .parent()
+                .ok_or_else(|| InstallError::MissingParent(path.clone()))?;
+            if !fs::symlink_metadata(parent)?.file_type().is_dir() {
+                return Err(InstallError::UnsafeFileType(parent.to_owned()));
+            }
+            fs::create_dir(&path)?;
+            fs::set_permissions(&path, fs::Permissions::from_mode(mode))?;
+            changed = true;
+        }
+        Err(error) => return Err(error.into()),
+    }
+    Ok(changed)
+}
+
+fn durable_atomic_write_bytes(
+    path: &Path,
+    contents: &[u8],
+    mode: u32,
+) -> Result<bool, InstallError> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| InstallError::MissingParent(path.to_owned()))?;
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => {
+            let bytes_match = fs::read(path)? == contents;
+            let mode_matches = metadata.permissions().mode() & 0o777 == mode;
+            if bytes_match && mode_matches {
+                return Ok(false);
+            }
+            if bytes_match {
+                fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
+                File::open(path)?.sync_all()?;
+                File::open(parent)?.sync_all()?;
+                return Ok(true);
+            }
+        }
+        Ok(_) => return Err(InstallError::UnsafeFileType(path.to_owned())),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+
+    let mut temporary = tempfile::Builder::new()
+        .prefix(".planeradar-install-")
+        .tempfile_in(parent)?;
+    temporary.write_all(contents)?;
+    temporary
+        .as_file()
+        .set_permissions(fs::Permissions::from_mode(mode))?;
+    temporary.as_file().sync_all()?;
+    temporary.persist(path)?;
+    File::open(parent)?.sync_all()?;
+    Ok(true)
+}
+
+fn path_as_str(path: &Path) -> Result<&str, InstallError> {
+    path.to_str()
+        .ok_or_else(|| InstallError::NonUtf8Path(path.to_owned()))
 }
 
 pub struct BootConfigEditor {
