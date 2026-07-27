@@ -263,7 +263,7 @@ fn validate_installation(options: &InstallOptions) -> Result<ValidatedInstallati
         return Err(InstallError::UnsupportedArchitecture);
     }
 
-    let os_release = read_regular_utf8(&install_path(&root, "etc/os-release"))?;
+    let os_release = read_os_release(&root)?;
     let operating_system = parse_os_release(&os_release);
     let id = operating_system
         .iter()
@@ -468,6 +468,20 @@ fn read_regular_utf8(path: &Path) -> Result<String, InstallError> {
     require_regular_file(path)?;
     String::from_utf8(fs::read(path)?)
         .map_err(|_| InstallError::InvalidArtifact(format!("{} is not UTF-8", path.display())))
+}
+
+fn read_os_release(root: &Path) -> Result<String, InstallError> {
+    let path = install_path(root, "etc/os-release");
+    let metadata = fs::symlink_metadata(&path)?;
+    if metadata.file_type().is_file() {
+        return read_regular_utf8(&path);
+    }
+    if metadata.file_type().is_symlink()
+        && fs::read_link(&path)? == Path::new("../usr/lib/os-release")
+    {
+        return read_regular_utf8(&install_path(root, "usr/lib/os-release"));
+    }
+    Err(InstallError::UnsafeFileType(path))
 }
 
 fn install_path(root: &Path, relative: impl AsRef<Path>) -> PathBuf {

@@ -1,5 +1,6 @@
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -266,6 +267,25 @@ fn installer_preserves_inline_calibration_and_existing_private_settings() {
         fs::read(state.join("settings.json")).expect("preserved settings"),
         b"private settings\n"
     );
+}
+
+#[test]
+fn installer_accepts_debians_relative_os_release_symlink() {
+    let fixture = Fixture::new("[all]\n");
+    let canonical_os_release = fixture.root.join("usr/lib/os-release");
+    fs::create_dir_all(canonical_os_release.parent().expect("os-release parent"))
+        .expect("canonical os-release directory");
+    fs::rename(fixture.root.join("etc/os-release"), &canonical_os_release)
+        .expect("move canonical os-release");
+    symlink("../usr/lib/os-release", fixture.root.join("etc/os-release"))
+        .expect("Debian os-release symlink");
+    let runner = RecordingRunner::for_root(&fixture.root);
+
+    let result = Installer::new(&runner)
+        .install(&fixture.options(false))
+        .expect("install with Debian os-release symlink");
+
+    assert!(result.files_changed);
 }
 
 #[test]
