@@ -157,9 +157,12 @@ Plane Radar-specific identifiers are removed from the driver. Module, overlay,
 device-tree, DKMS, artifact, and source names use a generic
 `hyperpixel2r-kms` identity.
 
-The driver repository begins with one clean import commit containing the
-accepted implementation, tests, licenses, and provenance. It does not import a
-filtered copy of Plane Radar's mixed application history.
+The driver repository's first non-empty commit is one clean import containing
+the accepted implementation, tests, licenses, and provenance. GitButler's
+generated empty root commit may precede it because the tool requires a target
+base for its first authored change; that commit contains no project content.
+The repository does not import a filtered copy of Plane Radar's mixed
+application history.
 
 ### Driver dependency
 
