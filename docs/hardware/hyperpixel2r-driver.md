@@ -22,10 +22,16 @@ normally.
 
 ## Build the exact artifacts
 
-Start with a clean GitButler `rpi-port` workspace and a reachable
-`shayne@planeradar.local`. Exporting headers is read-only on the Pi and records
-the exact `uname -r`, AArch64 architecture, `.config`, `Module.symvers`, common
-headers, kbuild tools, Zero 2 W base DTB, and its checksum:
+Start with a clean GitButler workspace and a reachable Pi. Set the SSH target
+once for every driver script:
+
+```sh
+export PLANERADAR_PI_TARGET=your-user@planeradar.local
+```
+
+Exporting headers is read-only on the Pi and records the exact `uname -r`,
+AArch64 architecture, `.config`, `Module.symvers`, common headers, kbuild
+tools, Zero 2 W base DTB, and its checksum:
 
 ```sh
 but status
@@ -155,7 +161,7 @@ physical acceptance:
 ```sh
 mise run commit-hyperpixel-boot
 # Review the printed command, then explicitly run:
-ssh shayne@planeradar.local sudo reboot
+ssh "$PLANERADAR_PI_TARGET" sudo reboot
 ./scripts/verify-hyperpixel-boot.sh --expect-normal
 ```
 
@@ -169,7 +175,7 @@ Explicit stock rollback is:
 ```sh
 mise run rollback-hyperpixel-boot
 # Review the printed command, then explicitly run:
-ssh shayne@planeradar.local sudo reboot
+ssh "$PLANERADAR_PI_TARGET" sudo reboot
 ```
 
 Rollback atomically selects exactly one stock
