@@ -6,6 +6,7 @@
  * raspberrypi/linux commit 33bb14b06b3fb5a682d4a7a3db3963fe558fc6f9
  */
 
+#include <linux/build_bug.h>
 #include <linux/delay.h>
 #include <linux/device.h>
 #include <linux/gpio/consumer.h>
@@ -27,6 +28,9 @@
 #ifndef GPIOD_OUT_INACTIVE
 #define GPIOD_OUT_INACTIVE GPIOD_OUT_LOW
 #endif
+
+static_assert(HP2R_MEDIA_BUS_FORMAT ==
+	      MEDIA_BUS_FMT_RGB666_1X24_CPADHI);
 
 struct planeradar_hyperpixel2r {
 	struct device *dev;
@@ -305,7 +309,7 @@ static int hp2r_panel_get_modes(struct drm_panel *panel,
 		.flags = DRM_MODE_FLAG_NHSYNC | DRM_MODE_FLAG_NVSYNC,
 	};
 	static const u32 bus_formats[] = {
-		MEDIA_BUS_FMT_RGB666_1X18,
+		HP2R_MEDIA_BUS_FORMAT,
 	};
 	struct drm_display_mode *mode;
 	int ret;

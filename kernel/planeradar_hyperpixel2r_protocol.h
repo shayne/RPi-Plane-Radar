@@ -16,6 +16,7 @@ typedef uint16_t hp2r_u16;
 #define HP2R_WIDTH 480
 #define HP2R_HEIGHT 480
 #define HP2R_CLOCK_KHZ 19200
+#define HP2R_MEDIA_BUS_FORMAT 0x1015u
 #define HP2R_HSYNC_START 490
 #define HP2R_HSYNC_END 506
 #define HP2R_HTOTAL 562

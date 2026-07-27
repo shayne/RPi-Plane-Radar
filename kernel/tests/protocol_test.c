@@ -3,6 +3,10 @@
 
 #include "planeradar_hyperpixel2r_protocol.h"
 
+#ifndef HP2R_MEDIA_BUS_FORMAT
+#define HP2R_MEDIA_BUS_FORMAT 0u
+#endif
+
 struct word_capture {
     hp2r_u16 words[HP2R_MAX_DATA + 2];
     size_t count;
@@ -384,6 +388,12 @@ static int test_exact_480x480_timing_constants(void)
                   "480x480 timing constants match the HyperPixel mode");
 }
 
+static int test_rgb666_bus_format_matches_cpadhi_hardware_contract(void)
+{
+    return expect(HP2R_MEDIA_BUS_FORMAT == 0x1015u,
+                  "RGB666 bus format matches 1X24 CPADHI");
+}
+
 int main(void)
 {
     if (test_prepare_sequence_is_byte_exact() ||
@@ -398,7 +408,8 @@ int main(void)
         test_command_bank_disable_precedes_display_on() ||
         test_display_off_precedes_enter_sleep() ||
         test_every_command_has_at_most_16_data_bytes() ||
-        test_exact_480x480_timing_constants())
+        test_exact_480x480_timing_constants() ||
+        test_rgb666_bus_format_matches_cpadhi_hardware_contract())
         return 1;
 
     puts("protocol tests passed");
