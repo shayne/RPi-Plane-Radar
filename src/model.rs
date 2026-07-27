@@ -86,6 +86,7 @@ pub struct RuntimeSnapshot {
     pub settings: RadarSettings,
     pub aircraft: Arc<[Aircraft]>,
     pub fetched_at: Option<Duration>,
+    pub has_successful_fetch_for_current_location: bool,
     pub last_error_at: Option<Duration>,
     pub local_url: String,
     pub ip_url: Option<String>,
@@ -104,6 +105,7 @@ impl RuntimeModel {
                 settings,
                 aircraft: Arc::from([]),
                 fetched_at: None,
+                has_successful_fetch_for_current_location: false,
                 last_error_at: None,
                 local_url,
                 ip_url: None,
@@ -118,12 +120,16 @@ impl RuntimeModel {
 
     pub fn replace_settings(&self, settings: RadarSettings) -> u64 {
         let mut snapshot = self.snapshot.write().expect("runtime model lock");
-        let query_changed = snapshot.settings.location != settings.location
-            || snapshot.settings.range_index != settings.range_index;
+        let location_changed = snapshot.settings.location != settings.location;
+        let query_changed =
+            location_changed || snapshot.settings.range_index != settings.range_index;
         snapshot.settings = settings;
         if query_changed {
             snapshot.aircraft = Arc::from([]);
             snapshot.fetched_at = None;
+        }
+        if location_changed {
+            snapshot.has_successful_fetch_for_current_location = false;
         }
         bump(&mut snapshot)
     }
@@ -132,6 +138,7 @@ impl RuntimeModel {
         let mut snapshot = self.snapshot.write().expect("runtime model lock");
         snapshot.aircraft = Arc::from(aircraft);
         snapshot.fetched_at = Some(fetched_at);
+        snapshot.has_successful_fetch_for_current_location = true;
         bump(&mut snapshot)
     }
 
@@ -150,6 +157,7 @@ impl RuntimeModel {
         }
         snapshot.aircraft = Arc::from(aircraft);
         snapshot.fetched_at = Some(fetched_at);
+        snapshot.has_successful_fetch_for_current_location = true;
         Some(bump(&mut snapshot))
     }
 

@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use planeradar::adsb::AdsbClient;
 use planeradar::http::{HttpClient, HttpError, HttpRequest, HttpResponse};
-use planeradar::model::{Aircraft, AppState, Location, RadarSettings};
+use planeradar::model::{Aircraft, AppState, Location, RadarSettings, Units};
 use planeradar::runtime::{
     AdsbWorker, ChannelWaiter, RuntimeConfig, RuntimeHealthSource, RuntimeModel,
     RuntimeSettingsService, WaitResult, Waiter, WorkerCommand,
@@ -149,6 +149,71 @@ fn range_change_drops_aircraft_fetched_for_the_old_query_coverage() {
 }
 
 #[test]
+fn non_location_settings_change_preserves_successful_fetch_state() {
+    let model = RuntimeModel::new(configured(), "http://planeradar.local".to_owned());
+    model.record_aircraft(vec![aircraft()], Duration::from_secs(10));
+    let mut changed = configured();
+    changed.units = Units::Miles;
+    changed.show_runways = false;
+    model.replace_settings(changed);
+
+    let health = RuntimeHealthSource::new(model, Arc::new(|| Duration::from_secs(11)));
+    assert_eq!(health.health().state, AppState::Radar);
+}
+
+#[test]
+fn accepted_conditional_publication_records_success_for_the_current_location() {
+    let settings = configured();
+    let location = settings.location.clone().expect("location");
+    let model = RuntimeModel::new(settings.clone(), "http://planeradar.local".to_owned());
+    assert!(
+        model
+            .record_aircraft_if_query(
+                &location,
+                settings.range_index,
+                vec![aircraft()],
+                Duration::from_secs(10),
+            )
+            .is_some()
+    );
+
+    let health = RuntimeHealthSource::new(model, Arc::new(|| Duration::from_secs(11)));
+    assert_eq!(health.health().state, AppState::Radar);
+}
+
+#[test]
+fn location_change_resets_success_and_stale_publication_cannot_restore_it() {
+    let original = configured();
+    let original_location = original.location.clone().expect("original location");
+    let model = RuntimeModel::new(original, "http://planeradar.local".to_owned());
+    model.record_aircraft(vec![aircraft()], Duration::from_secs(10));
+
+    let mut moved = configured();
+    moved.location = Some(Location {
+        latitude: 41.0,
+        longitude: -73.0,
+        label: "new place".to_owned(),
+    });
+    model.replace_settings(moved);
+    let health = RuntimeHealthSource::new(model.clone(), Arc::new(|| Duration::from_secs(11)));
+    assert_eq!(health.health().state, AppState::WaitingForNetwork);
+
+    assert_eq!(
+        model.record_aircraft_if_query(
+            &original_location,
+            1,
+            vec![aircraft()],
+            Duration::from_secs(12),
+        ),
+        None
+    );
+    let snapshot = model.snapshot();
+    assert!(snapshot.aircraft.is_empty());
+    assert_eq!(snapshot.fetched_at, None);
+    assert_eq!(health.health().state, AppState::WaitingForNetwork);
+}
+
+#[test]
 fn conditional_publication_rejects_a_superseded_query_under_the_model_lock() {
     let original = configured();
     let original_location = original.location.clone().expect("location");
@@ -174,6 +239,8 @@ fn conditional_publication_rejects_a_superseded_query_under_the_model_lock() {
     assert!(snapshot.aircraft.is_empty());
     assert_eq!(snapshot.fetched_at, None);
     assert_eq!(snapshot.last_error_at, None);
+    let health = RuntimeHealthSource::new(model, Arc::new(|| Duration::from_secs(12)));
+    assert_eq!(health.health().state, AppState::WaitingForNetwork);
 }
 
 #[derive(Clone, Default)]

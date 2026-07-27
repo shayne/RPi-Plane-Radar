@@ -17,9 +17,10 @@ use planeradar::range::next_range_index;
 use planeradar::render::FontAsset;
 use planeradar::render::radar::RadarRenderer;
 use planeradar::render::setup::{CANONICAL_LOCAL_URL, SetupRenderer};
-use planeradar::runtime::{RuntimeError, RuntimeModel, RuntimeSnapshot};
+use planeradar::runtime::{RuntimeError, RuntimeHealthSource, RuntimeModel, RuntimeSnapshot};
 use planeradar::settings::SettingsStore;
 use planeradar::touch::Gesture;
+use planeradar::web::HealthSource;
 
 #[derive(Clone)]
 struct FakeControl {
@@ -258,7 +259,7 @@ fn long_press_release_cannot_cycle_the_range() {
 }
 
 #[test]
-fn range_change_persists_and_invalidates_the_old_poll_snapshot() {
+fn tap_range_change_keeps_radar_while_invalidating_the_old_poll_snapshot() {
     let directory = tempfile::tempdir().expect("tempdir");
     let (mut app, control, _) = app_fixture(
         configured(),
@@ -270,7 +271,29 @@ fn range_change_persists_and_invalidates_the_old_poll_snapshot() {
     assert_eq!(snapshot.settings.range_index, 2);
     assert!(snapshot.aircraft.is_empty());
     assert_eq!(snapshot.fetched_at, None);
-    assert_eq!(app.state(), AppState::WaitingForNetwork);
+
+    let health = RuntimeHealthSource::new(control.model.clone(), Arc::new(|| Duration::ZERO));
+    let rendered = app
+        .step(&[], Instant::now())
+        .frame
+        .expect("range-refetch frame");
+    let waiting = SetupRenderer::new(FontAsset::embedded().expect("font"))
+        .render(
+            CANONICAL_LOCAL_URL,
+            Some("http://10.0.4.74"),
+            true,
+            "WAITING FOR NETWORK",
+        )
+        .expect("waiting frame");
+    assert_eq!(
+        (
+            app.state(),
+            health.health().state,
+            rendered.as_slice() == waiting.pixels(),
+        ),
+        (AppState::Radar, AppState::Radar, false),
+        "range-only tap rendered the waiting QR while refetching"
+    );
 }
 
 #[test]

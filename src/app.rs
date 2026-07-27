@@ -352,7 +352,7 @@ fn select_state(snapshot: &RuntimeSnapshot, settings_open: bool) -> AppState {
     match (
         snapshot.settings.location.is_some(),
         settings_open,
-        snapshot.fetched_at.is_some(),
+        snapshot.has_successful_fetch_for_current_location,
     ) {
         (false, _, _) => AppState::SetupRequired,
         (true, true, _) => AppState::Settings,
