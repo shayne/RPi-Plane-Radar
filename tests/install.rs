@@ -12,6 +12,14 @@ use planeradar::install::{
 use sha2::{Digest, Sha256};
 
 const ACCEPTED_CUSTOM_OVERLAY: &str = "planeradar-hyperpixel2r-eefaf3ae40fd";
+const EXPECTED_PACKAGES: &[&str] = &[
+    "libsdl2-2.0-0",
+    "libegl1",
+    "libgles2",
+    "libgl1-mesa-dri",
+    "ca-certificates",
+    "avahi-daemon",
+];
 
 #[derive(Default)]
 struct RecordingRunner {
@@ -122,6 +130,28 @@ fn mode(path: impl AsRef<Path>) -> u32 {
 }
 
 #[test]
+fn installer_declares_every_graphics_runtime_package() {
+    let fixture = Fixture::new("[all]\n");
+    let runner = RecordingRunner::for_root(&fixture.root);
+    Installer::new(&runner)
+        .install(&fixture.options(false))
+        .expect("install");
+    let install = runner
+        .commands()
+        .into_iter()
+        .find(|(program, args)| {
+            program == "apt-get" && args.first().is_some_and(|value| value == "install")
+        })
+        .expect("apt install");
+    for package in EXPECTED_PACKAGES {
+        assert!(
+            install.1.iter().any(|value| value == package),
+            "missing {package}"
+        );
+    }
+}
+
+#[test]
 fn installer_verifies_then_installs_once_and_is_idempotent() {
     let original_boot = "[all]\ndtparam=audio=on\n";
     let fixture = Fixture::new(original_boot);
@@ -181,6 +211,9 @@ fn installer_verifies_then_installs_once_and_is_idempotent() {
             "--yes".into(),
             "--no-install-recommends".into(),
             "libsdl2-2.0-0".into(),
+            "libegl1".into(),
+            "libgles2".into(),
+            "libgl1-mesa-dri".into(),
             "ca-certificates".into(),
             "avahi-daemon".into(),
         ],

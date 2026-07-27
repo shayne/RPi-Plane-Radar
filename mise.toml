@@ -5,6 +5,7 @@ CMAKE_POLICY_VERSION_MINIMUM = "3.5"
 CC = "/usr/bin/clang"
 CXX = "/usr/bin/clang++"
 CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER = "/usr/bin/clang"
+_.file = { path = ".env", redact = true }
 
 [tools]
 rust = "1.97.1"

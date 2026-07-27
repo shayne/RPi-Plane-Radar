@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-target="${PLANERADAR_PI_TARGET:-shayne@planeradar.local}"
+target="${1:-${PLANERADAR_PI_TARGET:-pi@raspberrypi.local}}"
 for artifact in planeradar planeradar.sha256 planeradar.revision planeradar.readelf.txt; do
   test -f "dist/${artifact}" || {
     echo "missing dist/${artifact}; run mise run build-pi first" >&2

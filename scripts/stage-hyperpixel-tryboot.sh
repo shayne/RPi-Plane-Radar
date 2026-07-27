@@ -35,7 +35,7 @@ test -z "$(git status --porcelain=v1 --untracked-files=all)" || {
   exit 1
 }
 
-target="${PLANERADAR_PI_TARGET:-shayne@planeradar.local}"
+target="${1:-${PLANERADAR_PI_TARGET:-pi@raspberrypi.local}}"
 case "$target" in
   ""|-*|*[!A-Za-z0-9._@-]*|@*|*@|*@*@*)
     echo "unsafe Plane Radar SSH target: $target" >&2
