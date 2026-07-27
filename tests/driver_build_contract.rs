@@ -242,7 +242,7 @@ fn source_identity_rejects_dirty_stale_and_mismatched_overlay_provenance() {
 }
 
 #[test]
-fn app_build_uses_the_clean_workspace_head_identity_that_the_driver_manifest_records() {
+fn app_build_defaults_to_workspace_head_and_accepts_only_tree_identical_explicit_ref() {
     let temporary = TempDir::new().expect("temporary directory must be created");
     let fake_bin = temporary.path().join("bin");
     fs::create_dir(&fake_bin).expect("fake bin directory must be created");
@@ -260,6 +260,8 @@ fn app_build_uses_the_clean_workspace_head_identity_that_the_driver_manifest_rec
     let synthesized_revision = "1".repeat(40);
     let stack_revision = "2".repeat(40);
     let source_tree = "3".repeat(40);
+    let mismatched_revision = "4".repeat(40);
+    let mismatched_tree = "5".repeat(40);
     fs::create_dir_all(temporary.path().join("dist/hyperpixel/test"))
         .expect("driver artifact directory must be created");
     fs::write(
@@ -279,7 +281,12 @@ case "$*" in
   "rev-parse HEAD") printf '%s\n' '{synthesized_revision}' ;;
   "rev-parse HEAD^{{tree}}") printf '%s\n' '{source_tree}' ;;
   "rev-parse --verify rpi-port^{{commit}}") printf '%s\n' '{stack_revision}' ;;
+  "rev-parse --verify rpi-port^{{tree}}") printf '%s\n' '{source_tree}' ;;
+  "rev-parse --verify mismatched^{{commit}}") printf '%s\n' '{mismatched_revision}' ;;
+  "rev-parse --verify mismatched^{{tree}}") printf '%s\n' '{mismatched_tree}' ;;
   "archive --format=tar HEAD") exec '{real_git}' -C '{repository}' archive --format=tar HEAD ;;
+  "archive --format=tar {synthesized_revision}") exec '{real_git}' -C '{repository}' archive --format=tar HEAD ;;
+  "archive --format=tar {stack_revision}") exec '{real_git}' -C '{repository}' archive --format=tar HEAD ;;
   *) printf 'unexpected git command: %s\n' "$*" >&2; exit 64 ;;
 esac
 "#,
@@ -366,6 +373,69 @@ esac
         "--build-arg PLANERADAR_REVISION={synthesized_revision}"
     )));
     assert!(!docker_arguments.contains(&stack_revision));
+
+    let explicit_output = Command::new("bash")
+        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/build-pi.sh"))
+        .current_dir(temporary.path())
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                fake_bin.display(),
+                std::env::var("PATH").expect("PATH must be set")
+            ),
+        )
+        .env("PLANERADAR_SOURCE_REF", "rpi-port")
+        .output()
+        .expect("explicit source-ref app build script must run");
+    assert!(
+        explicit_output.status.success(),
+        "explicit source-ref app build failed: {}",
+        String::from_utf8_lossy(&explicit_output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(temporary.path().join("dist/planeradar.revision"))
+            .expect("explicit app revision")
+            .trim(),
+        stack_revision
+    );
+    assert_eq!(
+        fs::read_to_string(temporary.path().join("dist/planeradar.tree"))
+            .expect("explicit app source tree")
+            .trim(),
+        source_tree
+    );
+    let explicit_docker_arguments =
+        fs::read_to_string(temporary.path().join("docker-arguments.txt")).expect("docker args");
+    assert!(
+        explicit_docker_arguments
+            .contains(&format!("--build-arg PLANERADAR_REVISION={stack_revision}"))
+    );
+
+    let mismatched_output = Command::new("bash")
+        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/build-pi.sh"))
+        .current_dir(temporary.path())
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                fake_bin.display(),
+                std::env::var("PATH").expect("PATH must be set")
+            ),
+        )
+        .env("PLANERADAR_SOURCE_REF", "mismatched")
+        .output()
+        .expect("mismatched source-ref app build script must run");
+    assert!(
+        !mismatched_output.status.success(),
+        "source ref with a different tree was accepted"
+    );
+    assert!(
+        String::from_utf8_lossy(&mismatched_output.stderr)
+            .contains("source ref tree does not match the clean workspace: mismatched"),
+        "mismatched source ref failed for the wrong reason: {}",
+        String::from_utf8_lossy(&mismatched_output.stderr)
+    );
 }
 
 #[test]
