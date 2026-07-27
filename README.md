@@ -1,219 +1,236 @@
-# Plane Radar
+# Plane Radar for Raspberry Pi
 
-<img width="800" height="450" alt="plane-radar" src="https://github.com/user-attachments/assets/716d0992-dab8-47ba-8f1a-2aec7f607419" />
+[![Rust CI](https://github.com/shayne/RPi-Plane-Radar/actions/workflows/ci.yml/badge.svg)](https://github.com/shayne/RPi-Plane-Radar/actions/workflows/ci.yml)
 
-**3D printed case (STL + assembly):** [MakerWorld](https://makerworld.com/en/models/2872376-esp32-plane-radar-live-ads-b-on-a-round-display#profileId-3207083) · **Firmware:** [Releases](https://github.com/MatixYo/ESP32-Plane-Radar/releases)
+![Plane Radar showing live traffic](docs/images/radar.png)
 
-Firmware for an **ESP32-C3 Super Mini** and a **1.28″ round GC9A01** display (240×240). Shows a circular **ADS-B radar** around your configured location, with **WiFiManager** for first-time setup.
+Plane Radar turns a Raspberry Pi Zero 2 W and a Pimoroni HyperPixel 2.1 Round
+touchscreen into a dedicated, hardware-accelerated ADS-B radar. It has a native
+480×480 interface, a local settings page, touch gestures, airport runways,
+kilometre or mile ranges, and a hardened boot service.
 
-## What it does
+The Raspberry Pi must already have working networking. Plane Radar never
+configures, resets, or manages Wi-Fi.
 
-1. **Wi‑Fi setup** (if needed) — captive portal on AP **`PlaneRadar-Setup`**
-2. **Radar** — live aircraft from [adsb.fi](https://opendata.adsb.fi/) on a sonar-style grid
+## Supported system
 
-After Wi‑Fi is saved, the device reconnects automatically; the radar runs in the main loop with periodic ADS-B updates (~5 s).
+The tested product configuration is:
 
-## Controls (BOOT, GPIO 9, active LOW)
+- Raspberry Pi Zero 2 W;
+- Pimoroni HyperPixel 2.1 Round with touch, connected directly to the GPIO
+  header;
+- 64-bit Raspberry Pi OS based on Debian or Raspbian 12 or 13; and
+- the full KMS graphics stack with the repository's HyperPixel panel/touch
+  driver.
 
-| Action | Effect |
-|--------|--------|
-| **Short tap** | Cycle range preset (5 → 10 → 15 → 25 km); saved to flash |
-| **Hold 3 s** | Clear Wi‑Fi, location, and units; reboot into setup portal |
+The installer deliberately rejects other boards, operating-system releases,
+non-AArch64 artifacts, mismatched checksums, and mismatched revisions. The
+accepted hardware-driver build and recovery procedure are documented in
+[the HyperPixel runbook](docs/hardware/hyperpixel2r-driver.md). Kernel upgrades
+must repeat that driver acceptance process before the new kernel is trusted.
 
-During setup you can also hold BOOT at power-on to force a credential reset (same as the long press).
+## What it displays
 
-## Wi‑Fi setup portal
+- Live aircraft from the [adsb.fi open-data API](https://opendata.adsb.fi/).
+- Red heading symbols, magenta speed vectors, callsign/type/altitude labels,
+  and directional rim dots for traffic beyond the scope.
+- Nearby large-airport runways derived from
+  [OurAirports](https://ourairports.com/data/).
+- Four saved range presets, with labels in kilometres or miles.
+- A visible `DATA STALE` warning after 30 seconds without fresh traffic while
+  retaining the last good radar picture.
 
-**First-time setup** (no saved Wi‑Fi):
+The application polls successfully at most once every three seconds and uses
+bounded exponential backoff after failures. It does not put coordinates,
+search terms, aircraft data, form bodies, or security tokens in `/healthz` or
+normal logs.
 
-1. Connect to **`PlaneRadar-Setup`**
-2. Open **`http://plane-radar.local`** (preferred) or **`http://192.168.4.1`** — both are shown on the yellow setup screen; captive portal may open automatically
-3. Set home Wi‑Fi, then save
+## Touch controls
 
-**Reconfigure anytime** (after the device is on your network):
+| Gesture | Result |
+| --- | --- |
+| Short tap on radar | Advance to the next saved range |
+| Hold for 3 seconds | Open the settings QR screen |
+| Tap the settings QR screen | Return to radar |
+| Tap before location setup | No action; setup remains mandatory |
 
-1. Open **`http://plane-radar.local`** or **`http://<device-ip>`** (e.g. from your router or serial log at boot)
-2. Change Wi‑Fi, location, units, or runway overlay; save
+A long-press release is consumed, so it cannot also change the range.
 
-The same portal runs on the setup AP and on the device’s LAN IP while connected to Wi‑Fi. mDNS hostname is `plane-radar` → **plane-radar.local** (`kPortalHostname` in `config.h`). Some clients resolve `.local` slowly; use the IP if needed.
+## First-run setup
 
-**Custom fields** (stored in NVS):
+When no location is saved, the display shows a QR code and both available HTTP
+URLs:
 
-| Field | Purpose |
-|-------|---------|
-| **Latitude / Longitude** | Radar center and ADS-B query position (defaults in `config.h` until set) |
-| **Display distances in miles** | Ring scale label in **mi** instead of **km** (e.g. `6mi` vs `10km`) |
-| **Show airport runways** | Major-airport runway overlay on the radar (off to hide) |
+![First-run QR screen](docs/images/setup.png)
 
-After a reset, the device reboots and shows the setup screen immediately (no “Connecting” loop on stale credentials).
+Open `http://planeradar.local` or the displayed `http://<ip-address>` from a
+device on the same LAN. Search for a place using the OpenStreetMap Nominatim
+form, or enter latitude and longitude manually. The page also controls units,
+the runway overlay, and range. Saving writes one private settings file and the
+running display moves to radar as soon as the first ADS-B request succeeds.
 
-## Radar display
+Browser geolocation is not requested. Search results are not saved unless the
+user selects one and submits the settings form.
 
-### Grid
+## Development environment
 
-- Dark blue background, subdued green rings and crosshairs
-- White **N / S / E / W** at the bezel; range label on the **east** spoke (ring 3 = ¾ of outer radius)
-- White center dot
+The repository pins Rust and its development tools with
+[mise](https://mise.jdx.dev/). On macOS, the ARM64 build uses Docker Buildx;
+[OrbStack](https://orbstack.dev/) is a fast compatible runtime.
 
-Layout and colors: `include/ui/radar_theme.h`.
-
-### Range presets
-
-| Ring 3 label | Outer radius (aircraft scale) |
-|------------|-------------------------------|
-| 5 km / 3 mi | ~6.7 km |
-| 10 km / 6 mi | ~13.3 km (default) |
-| 15 km / 9 mi | ~20 km |
-| 25 km / 16 mi | ~33.3 km |
-
-Preset and miles/km choice persist across reboot (`planeradar` NVS namespace).
-
-### Runways
-
-- Major airports from OurAirports (`large_airport`); all open runway strips in range (helipads excluded)
-- Teal runway lines with one ICAO label per airport (e.g. `KJFK`); toggle in the Wi‑Fi setup portal
-- Update the embedded list: `python3 scripts/build_large_airports.py`
-
-### Aircraft
-
-- **Inside the outer ring** — red heading triangle, magenta speed vector (clipped at the ring), callsign / type / altitude tags
-- **Outside the ring** (still within ADS-B fetch) — small **red dot on the screen rim** at the correct bearing (direction cue; not distance-accurate past the ring)
-- **Tags** — placed toward the **center**: west (left) → tag on the **right** of the symbol; east (right) → tag on the **left**
-
-As range decreases (or aircraft approach), targets move inward; beyond-ring dots become full symbols when they cross the outer ring.
-
-### ADS-B
-
-- Source: `https://opendata.adsb.fi/api/v3/`
-- Fetch radius: `ui::radar::fetchRadiusKm()` — scales with the active preset to roughly the screen edge (so rim dots have data)
-- Poll interval: `kAdsbFetchIntervalMs` (5 s) in `config.h`
-- Ground aircraft hidden by default (`kAdsbShowGroundAircraft`)
-
-## Configuration
-
-Edit **`include/config.h`** for hardware and behavior:
-
-| Area | Keys / notes |
-|------|----------------|
-| Portal | `kPortalApName`, `kPortalIp`, `kPortalHostname` / `kPortalHostUrl` (mDNS; needs `-DWM_MDNS` in `platformio.ini`) |
-| Wi‑Fi timing | connect attempts, reconnect grace, portal timeout (`0` = no timeout) |
-| BOOT | `kBootPin`, `kBootResetHoldMs`, `kBootTapMinMs` |
-| Display SPI | pins, `kDisplayInvert`, `kDisplayRgbOrder`, `kDisplaySpiWriteHz` |
-| Default location | `kDefaultRadarLat`, `kDefaultRadarLon` (until portal overrides) |
-| ADS-B | `kAdsbFetchIntervalMs`, `kAdsbShowGroundAircraft` |
-
-Range presets: `include/ui/radar_range.h` (`kRangePresets`).
-
-## Project layout
-
-```
-include/
-  config.h
-  hardware/
-    lgfx_config.hpp
-    display.h
-    display_font.h
-  data/
-    large_airports.h
-  ui/
-    radar_theme.h
-    radar_range.h
-    radar_display.h
-    runway_overlay.h
-    status_screens.h
-  services/
-    wifi_setup.h
-    radar_location.h
-    adsb_client.h
-data/
-  ui_font.vlw              — embedded smooth UI font (Noto Sans Bold)
-scripts/
-  build_large_airports.py
-src/
-  main.cpp
-  data/
-    large_airports_data.cpp
-  hardware/
-  ui/
-  services/
+```sh
+git clone https://github.com/shayne/RPi-Plane-Radar.git
+cd RPi-Plane-Radar
+mise install
+mise run verify
+mise run test-driver-protocol
 ```
 
-## Wiring (GC9A01 ↔ ESP32-C3 Super Mini)
+`mise run verify` runs formatting, clippy with warnings denied, the complete
+test suite, and dependency policy checks. Native SDL development libraries are
+required when running checks on Linux.
 
-| Display | ESP32-C3 |
-|---------|----------|
-| VCC | 3V3 |
-| GND | GND |
-| RST | GPIO **0** |
-| CS | GPIO **1** |
-| DC | GPIO **10** |
-| SDA (MOSI) | GPIO **3** |
-| SCL (SCLK) | GPIO **4** |
-| BOOT (user) | GPIO **9** |
+## Build and deploy
 
-## Build
+Set the SSH target for the prepared Pi. The value is shared by the application
+and HyperPixel scripts:
 
-```bash
-pio run -t upload
-pio device monitor
+```sh
+export PLANERADAR_PI_TARGET=your-user@planeradar.local
+mise run build-pi
+mise run deploy-pi
 ```
 
-- PlatformIO env: **`supermini`**
-- Serial: **115200** baud
-- USB CDC on boot enabled in `platformio.ini` for the Super Mini
+The build requires a clean tracked workspace. It creates an AArch64 binary and
+four provenance files:
 
-### Web-flashable release image
-
-Single `.bin` for [esptool-js](https://espressif.github.io/esptool-js/) and similar tools (ESP32-C3, 4 MB, flash at **0x0**):
-
-```bash
-chmod +x scripts/merge-firmware.sh   # once
-./scripts/merge-firmware.sh
+```text
+dist/planeradar
+dist/planeradar.sha256
+dist/planeradar.revision
+dist/planeradar.tree
+dist/planeradar.readelf.txt
 ```
 
-Writes `release/plane-radar-merged.bin`. Skip rebuild if firmware is already built:
+Deployment verifies the checksum on the Pi and records its temporary staging
+directory in `dist/last-stage-path`.
 
-```bash
-./scripts/merge-firmware.sh --no-build
+## Install
+
+Run the staged, verified AArch64 binary as its own installer:
+
+```sh
+stage="$(cat dist/last-stage-path)"
+ssh -t "$PLANERADAR_PI_TARGET" \
+  "sudo '$stage/planeradar' install \
+    --artifact '$stage/planeradar' \
+    --checksum-file '$stage/planeradar.sha256' \
+    --revision-file '$stage/planeradar.revision'"
 ```
 
-Or via PlatformIO only (output: `.pio/build/supermini/firmware-merged.bin`):
+The installer:
 
-```bash
-pio run -e supermini
-pio run -t merge -e supermini
+1. verifies the Pi model, OS, artifact architecture, SHA-256, embedded
+   revision, display declaration, and filesystem types before mutation;
+2. installs the SDL runtime, CA certificates, and Avahi;
+3. creates the locked-down `planeradar` service account;
+4. atomically installs the binary, provenance files, and systemd unit;
+5. preserves existing settings and the accepted display calibration; and
+6. enables and starts `planeradar.service`.
+
+It prints three machine-readable result lines. Reboot only when
+`reboot_required=true`; an application-only update does not need one. Passing
+`--reboot` allows the installer to reboot automatically when it made a boot
+configuration change.
+
+Running the same installer again is supported and should report:
+
+```text
+files_changed=false
+boot_config_changed=false
+reboot_required=false
 ```
 
-Put the board in download mode (hold **BOOT**, tap **RESET**), then flash with Chrome/Edge over USB.
+## Update
 
-### CI and releases (GitHub Actions)
+Pull or select the desired clean revision, then repeat build, deploy, and
+install. The installer restarts the service only when installed content or
+permissions changed. It never replaces an accepted revisioned HyperPixel
+overlay during an application-only update.
 
-| Workflow | When | Output |
-|----------|------|--------|
-| [Build](.github/workflows/build.yml) | Push / PR to `main` | Artifact `plane-radar-supermini` (merged + split `.bin` files, ~90 days) |
-| [Release](.github/workflows/release.yml) | Git tag `v*` (e.g. `v1.0.0`) | GitHub Release asset `plane-radar-v1.0.0.bin` + `.sha256` |
+## Operate and diagnose
 
-To ship a version users can download:
-
-```bash
-git tag v1.0.0
-git push origin v1.0.0
+```sh
+ssh "$PLANERADAR_PI_TARGET" systemctl status planeradar
+ssh "$PLANERADAR_PI_TARGET" sudo journalctl -u planeradar -f
+curl --fail -H 'Host: planeradar.local' http://planeradar.local/healthz
 ```
 
-The release workflow builds firmware in CI and attaches the merged image to the release. Download from **Releases** on GitHub, then flash at **0x0** (ESP32-C3, 4 MB).
+`/healthz` reports only whether setup is complete, the current UI state,
+whether data are stale, and the exact application revision.
 
-## Dependencies
+To save the current logical 480×480 frame:
 
-- [LovyanGFX](https://github.com/lovyan03/LovyanGFX)
-- [WiFiManager](https://github.com/tzapu/WiFiManager)
-- [ArduinoJson](https://github.com/bblanchon/ArduinoJson)
-- The Rust renderer embeds DejaVu Sans Bold 2.37 from Debian's
-  `fonts-dejavu-core` 2.37-8 package. DejaVu incorporates Bitstream Vera and
-  Arev-derived glyphs by Tavmjong Bah; the complete upstream notices and terms
-  are preserved in
-  [`src/assets/DejaVu-FONT-LICENSE.txt`](src/assets/DejaVu-FONT-LICENSE.txt).
-  The sidecar is the canonical
-  [`version_2_37` LICENSE](https://github.com/dejavu-fonts/dejavu-fonts/blob/version_2_37/LICENSE)
-  at tag commit `0eda8a319c08835009849583cd090bb5b141ce25`
-  (SHA-256
-  `7a083b136e64d064794c3419751e5c7dd10d2f64c108fe5ba161eae5e5958a93`).
+```sh
+ssh "$PLANERADAR_PI_TARGET" 'sudo systemctl kill --signal=SIGUSR1 planeradar'
+ssh "$PLANERADAR_PI_TARGET" \
+  'sudo cp /var/lib/planeradar/debug.png "$HOME/planeradar-debug.png" &&
+   sudo chown "$USER:$USER" "$HOME/planeradar-debug.png"'
+scp "$PLANERADAR_PI_TARGET:planeradar-debug.png" .
+```
+
+The capture can contain live callsigns and should be treated as operational
+data. See [Troubleshooting](docs/troubleshooting.md) for display, touch,
+network, data, settings, and service checks.
+
+## Installed paths
+
+| Path | Purpose |
+| --- | --- |
+| `/opt/planeradar/bin/planeradar` | Root-owned application and installer |
+| `/opt/planeradar/REVISION` | Exact embedded source revision |
+| `/opt/planeradar/SHA256` | Installed artifact checksum sidecar |
+| `/etc/systemd/system/planeradar.service` | Hardened boot service |
+| `/var/lib/planeradar/settings.json` | Private persistent settings |
+| `/var/lib/planeradar/geocode-cache.json` | Private bounded search cache |
+| `/var/lib/planeradar/debug.png` | Latest requested logical frame |
+| `/boot/firmware/config.txt.planeradar-backup` | First installer boot backup |
+
+## Uninstall
+
+The following removes the application and service while preserving settings
+and the display driver:
+
+```sh
+sudo systemctl disable --now planeradar.service
+sudo rm /etc/systemd/system/planeradar.service
+sudo rm -r /opt/planeradar
+sudo systemctl daemon-reload
+sudo userdel planeradar
+```
+
+Remove `/var/lib/planeradar` separately only when its saved location,
+preferences, cache, and debug capture are no longer wanted. Display-driver
+rollback is a separate boot-critical operation; follow
+[the HyperPixel runbook](docs/hardware/hyperpixel2r-driver.md) instead of
+manually editing boot files.
+
+## Architecture and provenance
+
+[Architecture](docs/architecture.md) describes process ownership, immutable
+runtime snapshots, rendering, network policy, settings persistence, artifact
+verification, and hardware checkpoints.
+
+This repository is an independent Rust derivative of
+[MatixYo/ESP32-Plane-Radar](https://github.com/MatixYo/ESP32-Plane-Radar).
+It preserves the upstream history and credits the original radar concept, but
+it is intentionally not a GitHub fork: the Raspberry Pi hardware, operating
+model, graphics stack, touch input, web service, installer, and implementation
+are substantially different.
+
+Plane Radar is distributed under the [MIT License](LICENSE).
+
+The renderer embeds DejaVu Sans Bold 2.37. DejaVu incorporates Bitstream Vera
+and Arev-derived glyphs by Tavmjong Bah; the complete notices and terms are
+preserved in
+[`src/assets/DejaVu-FONT-LICENSE.txt`](src/assets/DejaVu-FONT-LICENSE.txt).

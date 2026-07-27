@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-target="shayne@planeradar.local"
+target="${PLANERADAR_PI_TARGET:-shayne@planeradar.local}"
 test -f dist/last-stage-path || {
   echo "missing dist/last-stage-path; run mise run deploy-pi first" >&2
   exit 1
