@@ -23,7 +23,7 @@ repository="$(cd "$script_dir/.." && pwd -P)"
 source "$script_dir/hyperpixel-build-common.sh"
 cd "$repository"
 
-target="${1:-${PLANERADAR_PI_TARGET:-pi@raspberrypi.local}}"
+target="${PLANERADAR_PI_TARGET:-pi@raspberrypi.local}"
 case "$target" in
   ""|-*|*[!A-Za-z0-9._@-]*|@*|*@|*@*@*)
     echo "unsafe Plane Radar SSH target: $target" >&2
