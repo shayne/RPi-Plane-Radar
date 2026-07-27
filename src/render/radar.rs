@@ -19,6 +19,16 @@ use crate::render::{FontAsset, Frame, RenderError};
 const STALE_AFTER: Duration = Duration::from_secs(30);
 const MAX_AIRCRAFT: usize = 64;
 const MAX_AIRPORT_LABELS: usize = 32;
+const RANGE_LABEL_OUTLINE_OFFSETS: [(f32, f32); 8] = [
+    (-1.0, -1.0),
+    (0.0, -1.0),
+    (1.0, -1.0),
+    (-1.0, 0.0),
+    (1.0, 0.0),
+    (-1.0, 1.0),
+    (0.0, 1.0),
+    (1.0, 1.0),
+];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BackgroundKey {
@@ -205,18 +215,25 @@ impl RadarRenderer {
         let preset = range_preset(settings.range_index)?;
         let range_label = format_range_label(preset, settings.units);
         let anchor_x = theme::CENTER.0 + theme::GRID_OUTER_RADIUS - 12.0;
-        text.draw(
-            pixmap,
-            &range_label,
-            anchor_x,
-            theme::CENTER.1,
-            TextStyle {
-                cap_height: theme::SCALE_CAP_HEIGHT,
-                color: theme::GRID,
-                horizontal: HorizontalAnchor::Right,
-                vertical: VerticalAnchor::Middle,
-            },
-        );
+        let style = TextStyle {
+            cap_height: theme::SCALE_CAP_HEIGHT,
+            color: theme::GRID,
+            horizontal: HorizontalAnchor::Right,
+            vertical: VerticalAnchor::Middle,
+        };
+        for (offset_x, offset_y) in RANGE_LABEL_OUTLINE_OFFSETS {
+            text.draw(
+                pixmap,
+                &range_label,
+                anchor_x + offset_x,
+                theme::CENTER.1 + offset_y,
+                TextStyle {
+                    color: theme::BACKGROUND,
+                    ..style
+                },
+            );
+        }
+        text.draw(pixmap, &range_label, anchor_x, theme::CENTER.1, style);
         Ok(())
     }
 

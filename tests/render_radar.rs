@@ -4,22 +4,25 @@ use std::fs;
 use std::sync::Arc;
 use std::time::Duration;
 
+use fontdue::{Font, FontSettings};
 use planeradar::geometry::offset_km;
 use planeradar::model::{
     Aircraft, Airport, GeoPoint, Location, RadarSettings, RadarSnapshot, Runway, Units,
 };
-use planeradar::range::range_preset;
+use planeradar::range::{format_range_label, range_preset};
 use planeradar::render::radar::{BackgroundKey, RadarRenderer};
+use planeradar::render::text::{HorizontalAnchor, TextRasterizer, TextStyle, VerticalAnchor};
 use planeradar::render::theme::{
     AIRCRAFT, AIRCRAFT_LABEL_GAP, AIRCRAFT_NOSE_LENGTH, AIRCRAFT_SAFE_RADIUS,
     AIRCRAFT_TAG_CAP_HEIGHT, AIRCRAFT_TAIL_HALF_WIDTH, AIRCRAFT_TAIL_LENGTH, BACKGROUND,
     CARDINAL_CAP_HEIGHT, CENTER, CENTER_DOT_RADIUS, GRID, GRID_OUTER_RADIUS, GRID_STROKE_WIDTH,
-    RIM_DOT_RADIUS, RIM_RADIUS, RUNWAY, RUNWAY_LABEL_CAP_HEIGHT, RUNWAY_LABEL_GAP,
+    LABEL, RIM_DOT_RADIUS, RIM_RADIUS, RUNWAY, RUNWAY_LABEL_CAP_HEIGHT, RUNWAY_LABEL_GAP,
     RUNWAY_STROKE_WIDTH, SCALE_CAP_HEIGHT, SIZE, STALE, STALE_CAP_HEIGHT, TAG_TYPE, TRACK,
     TRACK_MIN_LENGTH, TRACK_STROKE_WIDTH,
 };
 use planeradar::render::{FontAsset, Frame, RenderError};
 use support::FrameAssertions;
+use tiny_skia::Pixmap;
 
 const ORIGIN_LATITUDE: f64 = 40.0;
 const ORIGIN_LONGITUDE: f64 = -75.0;
@@ -69,6 +72,47 @@ fn visual_metrics_use_whole_pixels_without_moving_the_radar() {
 
 fn test_renderer() -> RadarRenderer {
     RadarRenderer::new(FontAsset::embedded().expect("embedded DejaVu font"))
+}
+
+fn range_glyph_mask(settings: &RadarSettings) -> Frame {
+    let font = Font::from_bytes(
+        include_bytes!("../src/assets/DejaVuSans-Bold.ttf") as &[u8],
+        FontSettings {
+            collection_index: 0,
+            scale: 40.0,
+            load_substitutions: true,
+        },
+    )
+    .expect("embedded DejaVu font");
+    let preset = range_preset(settings.range_index).expect("configured range");
+    let label = format_range_label(preset, settings.units);
+    let anchor_x = CENTER.0 + GRID_OUTER_RADIUS - 12.0;
+    let mut mask = Pixmap::new(SIZE, SIZE).expect("range mask");
+    TextRasterizer::new(&font).draw(
+        &mut mask,
+        &label,
+        anchor_x,
+        CENTER.1,
+        TextStyle {
+            cap_height: SCALE_CAP_HEIGHT,
+            color: LABEL,
+            horizontal: HorizontalAnchor::Right,
+            vertical: VerticalAnchor::Middle,
+        },
+    );
+    Frame::new(SIZE, SIZE, mask.take()).expect("range mask frame")
+}
+
+fn mask_covers(mask: &Frame, x: u32, y: u32) -> bool {
+    mask.pixel(x, y)[3] != 0
+}
+
+fn mask_within_one_pixel(mask: &Frame, x: u32, y: u32) -> bool {
+    let left = x.saturating_sub(1);
+    let top = y.saturating_sub(1);
+    let right = x.saturating_add(1).min(SIZE - 1);
+    let bottom = y.saturating_add(1).min(SIZE - 1);
+    (top..=bottom).any(|mask_y| (left..=right).any(|mask_x| mask_covers(mask, mask_x, mask_y)))
 }
 
 fn configured_settings() -> RadarSettings {
@@ -270,23 +314,67 @@ fn transparent_aircraft_tag_preserves_static_pixels_and_draws_text_last() {
 }
 
 #[test]
-fn transparent_range_label_preserves_the_east_scope_line() {
+fn range_label_has_a_one_pixel_shape_only_outline() {
+    let settings = configured_settings();
     let frame = test_renderer()
         .render(
             &empty_snapshot(Some(Duration::ZERO)),
-            &configured_settings(),
+            &settings,
             &[],
             Duration::ZERO,
         )
         .expect("render");
+    let mask = range_glyph_mask(&settings);
+    let center_y = CENTER.1 as u32;
+    let scope_x = 380..448;
+    let black_pixels = scope_x
+        .clone()
+        .filter(|&x| frame.pixel(x, center_y) == BACKGROUND)
+        .collect::<Vec<_>>();
 
-    for x in 380..448 {
-        assert_ne!(
-            frame.pixel(x, CENTER.1 as u32),
-            BACKGROUND,
-            "range-label padding or glyph gap masked the scope line at x={x}"
-        );
+    assert!(
+        !black_pixels.is_empty(),
+        "the black contour must separate the range label from the east scope line"
+    );
+    assert!(
+        black_pixels
+            .iter()
+            .all(|&x| mask_within_one_pixel(&mask, x, center_y)),
+        "the range outline must not extend beyond one pixel of glyph coverage"
+    );
+    assert!(
+        black_pixels
+            .iter()
+            .any(|&x| !mask_covers(&mask, x, center_y)),
+        "the black contour must extend outside the green glyph coverage"
+    );
+    for x in scope_x {
+        if !mask_within_one_pixel(&mask, x, center_y) {
+            assert_ne!(
+                frame.pixel(x, center_y),
+                BACKGROUND,
+                "a black backplate appeared outside the one-pixel glyph contour at x={x}"
+            );
+        }
     }
+
+    let mut opaque_glyph_pixels = 0;
+    for y in 220..260 {
+        for x in 370..450 {
+            if mask.pixel(x, y) == LABEL {
+                opaque_glyph_pixels += 1;
+                assert_eq!(
+                    frame.pixel(x, y),
+                    GRID,
+                    "the green range fill moved or changed at ({x}, {y})"
+                );
+            }
+        }
+    }
+    assert!(
+        opaque_glyph_pixels > 0,
+        "range mask must contain glyph pixels"
+    );
 }
 
 #[test]
