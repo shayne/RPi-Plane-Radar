@@ -4,17 +4,19 @@ use std::fs;
 use std::sync::Arc;
 use std::time::Duration;
 
+use planeradar::geometry::offset_km;
 use planeradar::model::{
     Aircraft, Airport, GeoPoint, Location, RadarSettings, RadarSnapshot, Runway, Units,
 };
+use planeradar::range::range_preset;
 use planeradar::render::radar::{BackgroundKey, RadarRenderer};
 use planeradar::render::theme::{
     AIRCRAFT, AIRCRAFT_LABEL_GAP, AIRCRAFT_NOSE_LENGTH, AIRCRAFT_SAFE_RADIUS,
     AIRCRAFT_TAG_CAP_HEIGHT, AIRCRAFT_TAIL_HALF_WIDTH, AIRCRAFT_TAIL_LENGTH, BACKGROUND,
     CARDINAL_CAP_HEIGHT, CENTER, CENTER_DOT_RADIUS, GRID, GRID_OUTER_RADIUS, GRID_STROKE_WIDTH,
     RIM_DOT_RADIUS, RIM_RADIUS, RUNWAY, RUNWAY_LABEL_CAP_HEIGHT, RUNWAY_LABEL_GAP,
-    RUNWAY_STROKE_WIDTH, SCALE_CAP_HEIGHT, SIZE, STALE, STALE_CAP_HEIGHT, TRACK, TRACK_MIN_LENGTH,
-    TRACK_STROKE_WIDTH,
+    RUNWAY_STROKE_WIDTH, SCALE_CAP_HEIGHT, SIZE, STALE, STALE_CAP_HEIGHT, TAG_TYPE, TRACK,
+    TRACK_MIN_LENGTH, TRACK_STROKE_WIDTH,
 };
 use planeradar::render::{FontAsset, Frame, RenderError};
 use support::FrameAssertions;
@@ -193,6 +195,72 @@ fn east_aircraft_uses_unrounded_projection_and_draws_tag_and_heading() {
     assert!(
         frame.region_is_white(220, 195, 100, 90),
         "callsign tag is drawn toward the center"
+    );
+}
+
+#[test]
+fn aircraft_tag_masks_the_range_label_where_they_overlap() {
+    let settings = configured_settings();
+    let plane = aircraft(11.6, 0.0);
+    let snapshot = RadarSnapshot {
+        aircraft: Arc::from([plane.clone()]),
+        fetched_at: Some(Duration::ZERO),
+        last_error_at: None,
+    };
+    let mut renderer = test_renderer();
+    let empty = renderer
+        .render(
+            &empty_snapshot(Some(Duration::ZERO)),
+            &settings,
+            &[],
+            Duration::ZERO,
+        )
+        .expect("empty render");
+    let traffic = renderer
+        .render(&snapshot, &settings, &[], Duration::ZERO)
+        .expect("traffic render");
+
+    let location = settings.location.as_ref().expect("configured location");
+    let preset = range_preset(settings.range_index).expect("configured range");
+    let east = offset_km(location, plane.latitude, plane.longitude).east;
+    let aircraft_x = CENTER.0 + (east * f64::from(GRID_OUTER_RADIUS) / preset.outer_km) as f32;
+    let tag_anchor_x =
+        aircraft_x - AIRCRAFT_NOSE_LENGTH - AIRCRAFT_TAIL_HALF_WIDTH - AIRCRAFT_LABEL_GAP;
+    let overlap_width = 24;
+    let overlap_left = tag_anchor_x.floor() as u32 - overlap_width;
+    let overlap_top = (CENTER.1 - AIRCRAFT_TAG_CAP_HEIGHT / 2.0).floor() as u32;
+    let overlap_height = AIRCRAFT_TAG_CAP_HEIGHT.ceil() as u32;
+
+    assert!(
+        empty.color_count(
+            GRID,
+            overlap_left,
+            overlap_top,
+            overlap_width,
+            overlap_height
+        ) > 0,
+        "the empty background must contain pixels from the 10km label in the overlap region"
+    );
+    assert_eq!(
+        traffic.color_count(
+            GRID,
+            overlap_left,
+            overlap_top,
+            overlap_width,
+            overlap_height
+        ),
+        0,
+        "static range-label pixels must not show through the dynamic aircraft tag"
+    );
+    assert!(
+        traffic.color_count(
+            TAG_TYPE,
+            overlap_left,
+            overlap_top,
+            overlap_width,
+            overlap_height
+        ) > 0,
+        "the aircraft type text must remain visible over its opaque backing"
     );
 }
 

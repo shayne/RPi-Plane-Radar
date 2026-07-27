@@ -19,6 +19,7 @@ use crate::render::{FontAsset, Frame, RenderError};
 const STALE_AFTER: Duration = Duration::from_secs(30);
 const MAX_AIRCRAFT: usize = 64;
 const MAX_AIRPORT_LABELS: usize = 32;
+const AIRCRAFT_TAG_BACKPLATE_PADDING: f32 = 2.0;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BackgroundKey {
@@ -462,6 +463,11 @@ impl RadarRenderer {
             )
         };
         let top = (y - block_height / 2.0).clamp(1.0, theme::SIZE as f32 - block_height - 1.0);
+        if let Some((left, top, width, height)) =
+            aircraft_tag_backplate(anchor_x, horizontal, top, block_width, block_height)
+        {
+            fill_rectangle(pixmap, left, top, width, height, theme::BACKGROUND);
+        }
         for (index, (line, color)) in lines.into_iter().enumerate() {
             text.draw(
                 pixmap,
@@ -795,6 +801,37 @@ fn paint(rgba: [u8; 4]) -> Paint<'static> {
     paint.set_color_rgba8(rgba[0], rgba[1], rgba[2], rgba[3]);
     paint.force_hq_pipeline = true;
     paint
+}
+
+fn aircraft_tag_backplate(
+    anchor_x: f32,
+    horizontal: HorizontalAnchor,
+    text_top: f32,
+    block_width: f32,
+    block_height: f32,
+) -> Option<(f32, f32, f32, f32)> {
+    if block_width <= 0.0 {
+        return None;
+    }
+    let text_left = match horizontal {
+        HorizontalAnchor::Left => anchor_x,
+        HorizontalAnchor::Center => anchor_x - block_width / 2.0,
+        HorizontalAnchor::Right => anchor_x - block_width,
+    };
+    let frame_edge = theme::SIZE as f32;
+    let left = (text_left - AIRCRAFT_TAG_BACKPLATE_PADDING)
+        .floor()
+        .clamp(0.0, frame_edge);
+    let top = (text_top - AIRCRAFT_TAG_BACKPLATE_PADDING)
+        .floor()
+        .clamp(0.0, frame_edge);
+    let right = (text_left + block_width + AIRCRAFT_TAG_BACKPLATE_PADDING)
+        .ceil()
+        .clamp(0.0, frame_edge);
+    let bottom = (text_top + block_height + AIRCRAFT_TAG_BACKPLATE_PADDING)
+        .ceil()
+        .clamp(0.0, frame_edge);
+    (right > left && bottom > top).then_some((left, top, right - left, bottom - top))
 }
 
 fn color(rgba: [u8; 4]) -> tiny_skia::Color {
