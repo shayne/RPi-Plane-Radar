@@ -1007,7 +1007,13 @@ exec "$@"
         r#"#!/usr/bin/env bash
 if test "${1-}" = -c; then
   case "$2" in
-    %a) /usr/bin/stat -f '%Lp' "$3" ;;
+    %a)
+      if /usr/bin/stat -c '%a' "$3" >/dev/null 2>&1; then
+        /usr/bin/stat -c '%a' "$3"
+      else
+        /usr/bin/stat -f '%Lp' "$3"
+      fi
+      ;;
     %U:%G) printf 'root:root\n' ;;
     *) exit 64 ;;
   esac
