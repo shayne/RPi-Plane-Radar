@@ -16,7 +16,8 @@ COPY . .
 ARG PLANERADAR_REVISION
 ENV PLANERADAR_REVISION=${PLANERADAR_REVISION}
 
-RUN cargo build --release --locked --bin planeradar \
+RUN test -f packaging/planeradar.service \
+    && cargo build --release --locked --bin planeradar \
     && mkdir -p /out \
     && file target/release/planeradar \
     && readelf -d target/release/planeradar > /out/planeradar.readelf.txt \

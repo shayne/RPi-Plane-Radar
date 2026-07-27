@@ -59,6 +59,16 @@ pub enum Command {
         #[arg(long)]
         output: PathBuf,
     },
+    Install {
+        #[arg(long)]
+        artifact: PathBuf,
+        #[arg(long)]
+        checksum_file: PathBuf,
+        #[arg(long)]
+        revision_file: PathBuf,
+        #[arg(long)]
+        reboot: bool,
+    },
     ConfigureDisplay {
         #[arg(long, default_value = "/boot/firmware/config.txt")]
         boot_config: PathBuf,
