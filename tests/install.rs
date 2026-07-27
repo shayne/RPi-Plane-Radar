@@ -392,9 +392,8 @@ fn service_unit_has_the_exact_hardening_and_device_contract() {
         "PrivateTmp=true",
         "PrivateDevices=false",
         "DevicePolicy=closed",
-        "DeviceAllow=/dev/dri/card* rw",
-        "DeviceAllow=/dev/dri/renderD* rw",
-        "DeviceAllow=/dev/input/event* r",
+        "DeviceAllow=char-drm rw",
+        "DeviceAllow=char-input r",
         "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK",
         "ReadWritePaths=/var/lib/planeradar",
         "StateDirectory=planeradar",
@@ -406,6 +405,18 @@ fn service_unit_has_the_exact_hardening_and_device_contract() {
         assert!(
             PLANERADAR_SERVICE.lines().any(|line| line == directive),
             "service is missing exact directive: {directive}"
+        );
+    }
+    for invalid_directive in [
+        "DeviceAllow=/dev/dri/card* rw",
+        "DeviceAllow=/dev/dri/renderD* rw",
+        "DeviceAllow=/dev/input/event* r",
+    ] {
+        assert!(
+            !PLANERADAR_SERVICE
+                .lines()
+                .any(|line| line == invalid_directive),
+            "service must not use unsupported device-path glob: {invalid_directive}"
         );
     }
 }
