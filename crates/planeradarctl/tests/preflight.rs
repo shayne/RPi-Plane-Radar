@@ -62,6 +62,7 @@ fn valid_target_json() -> Vec<u8> {
       "os_version":"13",
       "architecture":"arm64",
       "kernel_release":"6.18.34+rpt-rpi-v8",
+      "kernel_vermagic":"6.18.34+rpt-rpi-v8 SMP preempt mod_unload modversions aarch64",
       "default_target":"multi-user.target",
       "display_manager_active":false,
       "boot_config":"/boot/firmware/config.txt",
@@ -112,6 +113,36 @@ fn target_facts_accept_one_complete_canonical_json_value() {
     let facts = parsed_target();
     assert_eq!(facts.os_id, "debian");
     assert_eq!(facts.system_time_unix, 1_785_196_800);
+    assert_eq!(
+        facts.kernel_vermagic,
+        "6.18.34+rpt-rpi-v8 SMP preempt mod_unload modversions aarch64"
+    );
+}
+
+#[test]
+fn target_facts_require_exact_single_line_running_kernel_vermagic() {
+    let valid = String::from_utf8(valid_target_json()).expect("fixture utf8");
+    let expected =
+        "\"kernel_vermagic\":\"6.18.34+rpt-rpi-v8 SMP preempt mod_unload modversions aarch64\",";
+    for replacement in [
+        "",
+        "\"kernel_vermagic\":\"6.18.35+rpt-rpi-v8 SMP preempt mod_unload modversions aarch64\",",
+        "\"kernel_vermagic\":\"6.18.34+rpt-rpi-v8\",",
+        "\"kernel_vermagic\":\"6.18.34+rpt-rpi-v8 SMP\\npreempt\",",
+        "\"kernel_vermagic\":\"6.18.34+rpt-rpi-v8 SMP\\u0000preempt\",",
+    ] {
+        let hostile = valid.replacen(expected, replacement, 1);
+        assert!(
+            TargetFacts::parse(hostile.as_bytes()).is_err(),
+            "accepted replacement {replacement:?}"
+        );
+    }
+}
+
+#[test]
+fn target_facts_script_uses_only_the_fixed_supported_vc4_vermagic_probe() {
+    assert!(TARGET_FACTS_SCRIPT.contains("/usr/sbin/modinfo -F vermagic vc4"));
+    assert!(!TARGET_FACTS_SCRIPT.contains("find "));
 }
 
 #[test]

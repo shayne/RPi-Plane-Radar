@@ -6,12 +6,13 @@ use std::time::Duration;
 
 use clap::Parser;
 use planeradar::app::PlaneRadarApp;
-use planeradar::cli::{Cli, Command, DemoCommand, version_line};
+use planeradar::cli::{Cli, Command, DemoCommand, InstallerStateCommand, version_line};
 use planeradar::display::{DisplayConfig, run_display, run_probe};
 use planeradar::install::{
     BootConfigEditor, DisplaySelection, InstallOptions, Installer, SystemCommandRunner,
-    commit_display_config, ensure_overlay, rollback_display_config, stage_tryboot_config,
-    stage_tryboot_config_if_source_matches,
+    commit_display_config, ensure_overlay, read_installer_state_json,
+    read_optional_installer_state_json, rollback_display_config, stage_tryboot_config,
+    stage_tryboot_config_if_source_matches, write_installer_state_json,
 };
 use planeradar::logging;
 use planeradar::render::FontAsset;
@@ -93,6 +94,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             checksum_file,
             revision_file,
             reboot,
+            json,
         } => {
             let result = Installer::new(&SystemCommandRunner).install(&InstallOptions {
                 root: "/".into(),
@@ -102,9 +104,37 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 revision_file,
                 reboot,
             })?;
-            println!("files_changed={}", result.files_changed);
-            println!("boot_config_changed={}", result.boot_config_changed);
-            println!("reboot_required={}", result.reboot_required);
+            if json {
+                println!("{}", result.to_json()?);
+            } else {
+                println!("files_changed={}", result.files_changed);
+                println!("boot_config_changed={}", result.boot_config_changed);
+                println!("reboot_required={}", result.reboot_required);
+            }
+        }
+        Command::InstallerState {
+            command: InstallerStateCommand::Read,
+        } => {
+            println!(
+                "{}",
+                read_optional_installer_state_json(std::path::Path::new(
+                    "/var/lib/planeradar/installer/state.json",
+                ))?
+            );
+        }
+        Command::InstallerState {
+            command: InstallerStateCommand::Write { json },
+        } => {
+            write_installer_state_json(
+                std::path::Path::new("/var/lib/planeradar/installer/state.json"),
+                json.as_bytes(),
+            )?;
+            println!(
+                "{}",
+                read_installer_state_json(std::path::Path::new(
+                    "/var/lib/planeradar/installer/state.json",
+                ))?
+            );
         }
         Command::ConfigureDisplay {
             boot_config,

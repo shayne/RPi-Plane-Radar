@@ -1,9 +1,10 @@
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, Read, Write};
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
@@ -90,6 +91,8 @@ pub enum InstallError {
     ChecksumMismatch,
     #[error("artifact revision does not match this installer: {0}")]
     RevisionMismatch(String),
+    #[error("target installer state is invalid")]
+    InvalidInstallerState,
     #[error("boot configuration has {0} active HyperPixel declarations; expected at most one")]
     AmbiguousDisplay(usize),
     #[error("path is not valid UTF-8: {0}")]
@@ -102,6 +105,202 @@ pub enum InstallError {
     Persist(#[from] tempfile::PersistError),
 }
 
+const MAX_INSTALLER_STATE_BYTES: usize = 64 * 1024;
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct InstallerStateDocument {
+    schema_version: u32,
+    hardware: InstallerHardwareIdentity,
+    application: Option<InstallerArtifactIdentity>,
+    driver: Option<InstallerArtifactIdentity>,
+    owned_files: Vec<InstallerOwnedFile>,
+    last_verified_phase: InstallerPhase,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct InstallerHardwareIdentity {
+    model: String,
+    serial: String,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct InstallerArtifactIdentity {
+    version: String,
+    source_commit: String,
+    sha256: String,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct InstallerOwnedFile {
+    target_path: String,
+    sha256: String,
+}
+
+#[derive(Clone, Copy, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum InstallerPhase {
+    Discovered,
+    PreflightPassed,
+    ApplicationAcquired,
+    DriverReady,
+    TrybootStaged,
+    TrybootVerified,
+    DriverAccepted,
+    ApplicationInstalled,
+    HostnameChanged,
+    FinalRebooted,
+    FinalVerified,
+    Complete,
+}
+
+pub fn write_installer_state_json(path: &Path, contents: &[u8]) -> Result<(), InstallError> {
+    let state = parse_installer_state(contents)?;
+    let serialized = serde_json::to_vec(&state).map_err(|_| InstallError::InvalidInstallerState)?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| InstallError::MissingParent(path.into()))?;
+    ensure_private_installer_directory(parent)?;
+    reject_unsafe_installer_state_path(path)?;
+
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    temporary
+        .as_file()
+        .set_permissions(fs::Permissions::from_mode(0o600))?;
+    temporary.write_all(&serialized)?;
+    temporary.flush()?;
+    temporary.as_file().sync_all()?;
+    temporary.persist(path)?;
+    File::open(parent)?.sync_all()?;
+    Ok(())
+}
+
+fn ensure_private_installer_directory(path: &Path) -> Result<(), InstallError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() => {
+            return Ok(());
+        }
+        Ok(_) => return Err(InstallError::UnsafeFileType(path.into())),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| InstallError::MissingParent(path.into()))?;
+    ensure_private_installer_directory(parent)?;
+    let mut builder = fs::DirBuilder::new();
+    builder.mode(0o700);
+    builder.create(path)?;
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_dir()
+        || metadata.file_type().is_symlink()
+        || metadata.permissions().mode() & 0o777 != 0o700
+    {
+        return Err(InstallError::UnsafeFileType(path.into()));
+    }
+    File::open(parent)?.sync_all()?;
+    Ok(())
+}
+
+pub fn read_installer_state_json(path: &Path) -> Result<String, InstallError> {
+    reject_unsafe_installer_state_path(path)?;
+    let mut options = OpenOptions::new();
+    options.read(true).custom_flags(libc::O_NOFOLLOW);
+    let mut file = options.open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(InstallError::UnsafeFileType(path.into()));
+    }
+    let mut contents = Vec::new();
+    Read::by_ref(&mut file)
+        .take((MAX_INSTALLER_STATE_BYTES + 1) as u64)
+        .read_to_end(&mut contents)?;
+    let state = parse_installer_state(&contents)?;
+    serde_json::to_string(&state).map_err(|_| InstallError::InvalidInstallerState)
+}
+
+pub fn read_optional_installer_state_json(path: &Path) -> Result<String, InstallError> {
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok("null".into()),
+        Err(error) => Err(error.into()),
+        Ok(_) => read_installer_state_json(path),
+    }
+}
+
+fn parse_installer_state(contents: &[u8]) -> Result<InstallerStateDocument, InstallError> {
+    if contents.len() > MAX_INSTALLER_STATE_BYTES {
+        return Err(InstallError::InvalidInstallerState);
+    }
+    let mut deserializer = serde_json::Deserializer::from_slice(contents);
+    let state = InstallerStateDocument::deserialize(&mut deserializer)
+        .map_err(|_| InstallError::InvalidInstallerState)?;
+    deserializer
+        .end()
+        .map_err(|_| InstallError::InvalidInstallerState)?;
+    if state.schema_version != 1
+        || !valid_installer_hardware(&state.hardware)
+        || state
+            .application
+            .as_ref()
+            .is_some_and(|artifact| !valid_installer_artifact(artifact))
+        || state
+            .driver
+            .as_ref()
+            .is_some_and(|artifact| !valid_installer_artifact(artifact))
+        || state.owned_files.len() > 1024
+        || state
+            .owned_files
+            .iter()
+            .any(|file| !valid_installer_owned_file(file))
+    {
+        return Err(InstallError::InvalidInstallerState);
+    }
+    Ok(state)
+}
+
+fn valid_installer_hardware(hardware: &InstallerHardwareIdentity) -> bool {
+    (hardware.model == "Raspberry Pi Zero 2 W"
+        || hardware
+            .model
+            .strip_prefix("Raspberry Pi Zero 2 W Rev ")
+            .is_some_and(|revision| {
+                !revision.is_empty()
+                    && revision
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || byte == b'.')
+            }))
+        && is_lower_hex(&hardware.serial, 16)
+}
+
+fn valid_installer_artifact(artifact: &InstallerArtifactIdentity) -> bool {
+    semver::Version::parse(&artifact.version).is_ok()
+        && is_lower_hex(&artifact.source_commit, 40)
+        && is_lower_hex(&artifact.sha256, 64)
+}
+
+fn valid_installer_owned_file(file: &InstallerOwnedFile) -> bool {
+    file.target_path.starts_with('/')
+        && file.target_path != "/"
+        && !file.target_path.contains("//")
+        && !file
+            .target_path
+            .split('/')
+            .any(|part| part == "." || part == "..")
+        && !file.target_path.bytes().any(|byte| byte.is_ascii_control())
+        && is_lower_hex(&file.sha256, 64)
+}
+
+fn reject_unsafe_installer_state_path(path: &Path) -> Result<(), InstallError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => Ok(()),
+        Ok(_) => Err(InstallError::UnsafeFileType(path.into())),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct InstallOptions {
     pub root: PathBuf,
@@ -112,11 +311,48 @@ pub struct InstallOptions {
     pub reboot: bool,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InstallResult {
     pub files_changed: bool,
     pub boot_config_changed: bool,
     pub reboot_required: bool,
+    pub revision: String,
+    pub sha256: String,
+}
+
+#[derive(Serialize)]
+struct MachineInstallResult<'a> {
+    schema_version: u32,
+    files_changed: bool,
+    boot_config_changed: bool,
+    reboot_required: bool,
+    revision: &'a str,
+    sha256: &'a str,
+}
+
+impl InstallResult {
+    pub fn to_json(&self) -> Result<String, InstallMachineOutputError> {
+        if !is_lower_hex(&self.revision, 40) || !is_lower_hex(&self.sha256, 64) {
+            return Err(InstallMachineOutputError::InvalidIdentity);
+        }
+        serde_json::to_string(&MachineInstallResult {
+            schema_version: 1,
+            files_changed: self.files_changed,
+            boot_config_changed: self.boot_config_changed,
+            reboot_required: self.reboot_required,
+            revision: &self.revision,
+            sha256: &self.sha256,
+        })
+        .map_err(InstallMachineOutputError::Serialize)
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum InstallMachineOutputError {
+    #[error("install result artifact identity is invalid")]
+    InvalidIdentity,
+    #[error("install result JSON serialization failed")]
+    Serialize(#[source] serde_json::Error),
 }
 
 pub trait CommandRunner: Send + Sync {
@@ -155,6 +391,8 @@ impl<'a> Installer<'a> {
             artifact,
             checksum,
             revision,
+            revision_identity,
+            sha256_identity,
         } = validate_installation(options)?;
 
         self.commands.run("apt-get", &["update"])?;
@@ -220,6 +458,8 @@ impl<'a> Installer<'a> {
             files_changed,
             boot_config_changed,
             reboot_required,
+            revision: revision_identity,
+            sha256: sha256_identity,
         })
     }
 
@@ -255,6 +495,8 @@ struct ValidatedInstallation {
     artifact: Vec<u8>,
     checksum: Vec<u8>,
     revision: Vec<u8>,
+    revision_identity: String,
+    sha256_identity: String,
 }
 
 fn validate_installation(options: &InstallOptions) -> Result<ValidatedInstallation, InstallError> {
@@ -343,7 +585,16 @@ fn validate_installation(options: &InstallOptions) -> Result<ValidatedInstallati
         artifact,
         checksum,
         revision,
+        revision_identity: env!("PLANERADAR_REVISION").to_owned(),
+        sha256_identity: expected,
     })
+}
+
+fn is_lower_hex(value: &str, length: usize) -> bool {
+    value.len() == length
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn installed_kernel_reboot_required(root: &Path) -> Result<bool, InstallError> {

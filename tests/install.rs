@@ -7,7 +7,8 @@ use std::sync::Mutex;
 use clap::Parser;
 use planeradar::cli::{Cli, Command as CliCommand};
 use planeradar::install::{
-    CommandRunner, InstallError, InstallOptions, Installer, PLANERADAR_SERVICE,
+    CommandRunner, InstallError, InstallOptions, InstallResult, Installer, PLANERADAR_SERVICE,
+    read_installer_state_json, read_optional_installer_state_json, write_installer_state_json,
 };
 use sha2::{Digest, Sha256};
 
@@ -700,4 +701,115 @@ fn install_cli_requires_the_three_verified_artifact_sidecars() {
             && checksum_file == Path::new("/tmp/planeradar.sha256")
             && revision_file == Path::new("/tmp/planeradar.revision")
     ));
+}
+
+#[test]
+fn install_cli_accepts_an_explicit_machine_output_flag() {
+    let cli = Cli::try_parse_from([
+        "planeradar",
+        "install",
+        "--artifact",
+        "/tmp/planeradar",
+        "--checksum-file",
+        "/tmp/planeradar.sha256",
+        "--revision-file",
+        "/tmp/planeradar.revision",
+        "--json",
+    ])
+    .expect("parse install command");
+
+    assert!(matches!(
+        cli.command,
+        CliCommand::Install { json: true, .. }
+    ));
+}
+
+#[test]
+fn target_install_result_machine_json_has_the_exact_public_schema() {
+    let result = InstallResult {
+        files_changed: true,
+        boot_config_changed: false,
+        reboot_required: false,
+        revision: "0123456789abcdef0123456789abcdef01234567".into(),
+        sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+    };
+
+    assert_eq!(
+        result.to_json().expect("machine JSON"),
+        r#"{"schema_version":1,"files_changed":true,"boot_config_changed":false,"reboot_required":false,"revision":"0123456789abcdef0123456789abcdef01234567","sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}"#
+    );
+}
+
+#[test]
+fn target_install_result_refuses_invalid_machine_identity_fields() {
+    for result in [
+        InstallResult {
+            revision: "short".into(),
+            sha256: "2".repeat(64),
+            files_changed: false,
+            boot_config_changed: false,
+            reboot_required: false,
+        },
+        InstallResult {
+            revision: "1".repeat(40),
+            sha256: "UPPER".repeat(13),
+            files_changed: false,
+            boot_config_changed: false,
+            reboot_required: false,
+        },
+    ] {
+        assert!(result.to_json().is_err());
+    }
+}
+
+#[test]
+fn target_installer_state_helper_round_trips_strict_json_atomically() {
+    let directory = tempfile::tempdir().expect("temporary state directory");
+    let path = directory
+        .path()
+        .join("planeradar")
+        .join("installer")
+        .join("state.json");
+    let json = r#"{"schema_version":1,"hardware":{"model":"Raspberry Pi Zero 2 W Rev 1.0","serial":"0123456789abcdef"},"application":{"version":"1.2.3","source_commit":"1111111111111111111111111111111111111111","sha256":"2222222222222222222222222222222222222222222222222222222222222222"},"driver":null,"owned_files":[],"last_verified_phase":"application_acquired"}"#;
+
+    write_installer_state_json(&path, json.as_bytes()).expect("write state");
+
+    assert_eq!(read_installer_state_json(&path).expect("read state"), json);
+    assert_eq!(mode(&path), 0o600);
+    assert_eq!(mode(path.parent().expect("installer parent")), 0o700);
+}
+
+#[test]
+fn target_installer_state_helper_reports_absent_state_as_exact_null() {
+    let directory = tempfile::tempdir().expect("temporary state directory");
+    let path = directory.path().join("missing").join("state.json");
+
+    assert_eq!(
+        read_optional_installer_state_json(&path).expect("optional state"),
+        "null"
+    );
+}
+
+#[test]
+fn target_installer_state_helper_rejects_hostile_json_and_unsafe_final_paths() {
+    let directory = tempfile::tempdir().expect("temporary state directory");
+    let path = directory.path().join("state.json");
+    let valid = r#"{"schema_version":1,"hardware":{"model":"Raspberry Pi Zero 2 W","serial":"0123456789abcdef"},"application":null,"driver":null,"owned_files":[],"last_verified_phase":"discovered"}"#;
+    let hostile = [
+        "{}",
+        r#"{"schema_version":2,"hardware":{"model":"Raspberry Pi Zero 2 W","serial":"0123456789abcdef"},"application":null,"driver":null,"owned_files":[],"last_verified_phase":"discovered"}"#,
+        r#"{"schema_version":1,"hardware":{"model":"Raspberry Pi Zero 2 W","serial":"0123456789abcdef"},"application":null,"driver":null,"owned_files":[],"last_verified_phase":"unknown"}"#,
+        &format!("{valid}\n{{}}"),
+        &format!("{valid}\npartial"),
+    ];
+    for input in hostile {
+        assert!(write_installer_state_json(&path, input.as_bytes()).is_err());
+        assert!(!path.exists());
+    }
+
+    let outside = directory.path().join("outside");
+    fs::write(&outside, b"sentinel").expect("outside sentinel");
+    symlink(&outside, &path).expect("state symlink");
+    assert!(write_installer_state_json(&path, valid.as_bytes()).is_err());
+    assert_eq!(fs::read(&outside).expect("outside unchanged"), b"sentinel");
 }

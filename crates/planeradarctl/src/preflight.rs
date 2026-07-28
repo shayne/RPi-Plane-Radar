@@ -27,7 +27,7 @@ const MAX_SYSTEM_TIME_UNIX: u64 = 4_102_444_800;
 
 pub const TARGET_FACTS_SCRIPT: &str = concat!(
     r#"set -eu; model=$(tr -d '\000\r\n' </proc/device-tree/model); os_id=$(sed -n 's/^ID=//p' /etc/os-release | tr -d '"'); os_version=$(sed -n 's/^VERSION_ID=//p' /etc/os-release | tr -d '"'); "#,
-    r#"architecture=$(dpkg --print-architecture); kernel_release=$(uname -r); default_target=$(systemctl get-default); boot_config=/boot/firmware/config.txt; bool() { if "$@" >/dev/null 2>&1; then printf true; else printf false; fi; }; "#,
+    r#"architecture=$(dpkg --print-architecture); kernel_release=$(uname -r); kernel_vermagic=$(/usr/sbin/modinfo -F vermagic vc4); default_target=$(systemctl get-default); boot_config=/boot/firmware/config.txt; bool() { if "$@" >/dev/null 2>&1; then printf true; else printf false; fi; }; "#,
     r#"display_manager_active=$(bool systemctl is-active --quiet display-manager.service); boot_config_regular=$(bool test ! -L "$boot_config" && test -f "$boot_config"); tryboot_supported=$(bool test -f /boot/firmware/start4.elf); clock_synchronized=$(bool test "$(timedatectl show --property=NTPSynchronized --value)" = yes); system_time_unix=$(date +%s); "#,
     r#"repository_uri=$(apt-get indextargets --format '$(URI)' | head -n 1); repository_scheme=${repository_uri%%://*}; case "$repository_scheme" in http|https) repository_scheme_valid=true;; *) repository_scheme_valid=false;; esac; package_repository_reachable=$(if test "$repository_scheme_valid" = true && timeout 15 curl --fail --head --silent --show-error "$repository_uri" >/dev/null; then printf true; else printf false; fi); "#,
     r#"port_80_free=$(if ss -H -ltn 'sport = :80' | grep -q .; then printf false; else printf true; fi); root_available_bytes=$(df -B1 --output=avail / | tail -n 1 | tr -d ' '); boot_available_bytes=$(df -B1 --output=avail /boot/firmware | tail -n 1 | tr -d ' '); "#,
@@ -40,8 +40,8 @@ pub const TARGET_FACTS_SCRIPT: &str = concat!(
     r#"external_hyperpixel_module_count=$(awk '$1 == "hyperpixel2r_kms" { count++ } END { print count + 0 }' /proc/modules); external_hyperpixel_module_loaded=$(if test "$external_hyperpixel_module_count" = 1; then printf true; else printf false; fi); unexpected_hyperpixel_module_loaded=$(if awk '$1 ~ /hyperpixel/ && $1 != "hyperpixel2r_kms" { found=1 } END { exit !found }' /proc/modules; then printf true; else printf false; fi); "#,
     r#"external_hyperpixel_binding_count=0; generic_driver=/sys/bus/platform/drivers/hyperpixel2r-kms; if test ! -L "$generic_driver" && test -d "$generic_driver"; then for binding in "$generic_driver"/*; do test -L "$binding" || continue; resolved_binding=$(readlink -f -- "$binding") || continue; case "$resolved_binding" in /sys/devices/platform/*) ;; *) continue;; esac; compatible="$resolved_binding/of_node/compatible"; test ! -L "$compatible" && test -f "$compatible" || continue; if tr '\000' '\n' <"$compatible" | grep -Fxq shayne,hyperpixel2r-kms; then external_hyperpixel_binding_count=$((external_hyperpixel_binding_count + 1)); fi; done; fi; "#,
     r#"gpio_display_state_safe=$(if test "$hyperpixel_transaction_active" = false && test "$legacy_checkpoint_active" = false && test "$unexpected_hyperpixel_module_loaded" = false && { { test "$external_hyperpixel_overlay_count" = 0 && test "$external_hyperpixel_module_loaded" = false && test "$external_hyperpixel_binding_count" = 0; } || { test "$external_hyperpixel_overlay_count" = 1 && test "$external_hyperpixel_module_loaded" = true && test "$external_hyperpixel_binding_count" = 1; }; }; then printf true; else printf false; fi); "#,
-    r#"printf '{"model":"%s","os_id":"%s","os_version":"%s","architecture":"%s","kernel_release":"%s","default_target":"%s","display_manager_active":%s,"boot_config":"%s","boot_config_regular":%s,"tryboot_supported":%s,"clock_synchronized":%s,"system_time_unix":%s,"package_repository_reachable":%s,"port_80_free":%s,"root_available_bytes":%s,"boot_available_bytes":%s,"running_headers_available":%s,"running_headers_release":"%s","installed_kernel_header_pair_count":%s,"installed_kernel_release":"%s","installed_headers_release":"%s","boot_selected_kernel_match_count":%s,"boot_selected_kernel_release":"%s","boot_kernel_override_conflicting":%s,"unsafe_overlay_present":%s,"external_hyperpixel_overlay_count":%s,"external_hyperpixel_module_loaded":%s,"unexpected_hyperpixel_module_loaded":%s,"hyperpixel_state_dir_safe":%s,"hyperpixel_transaction_active":%s,"legacy_checkpoint_active":%s,"external_hyperpixel_binding_count":%s,"gpio_display_state_safe":%s}' "#,
-    r#""$model" "$os_id" "$os_version" "$architecture" "$kernel_release" "$default_target" "$display_manager_active" "$boot_config" "$boot_config_regular" "$tryboot_supported" "$clock_synchronized" "$system_time_unix" "$package_repository_reachable" "$port_80_free" "$root_available_bytes" "$boot_available_bytes" "$running_headers_available" "$running_headers_release" "$installed_kernel_header_pair_count" "$installed_kernel_release" "$installed_headers_release" "$boot_selected_kernel_match_count" "$boot_selected_kernel_release" "$boot_kernel_override_conflicting" "$unsafe_overlay_present" "$external_hyperpixel_overlay_count" "$external_hyperpixel_module_loaded" "$unexpected_hyperpixel_module_loaded" "$hyperpixel_state_dir_safe" "$hyperpixel_transaction_active" "$legacy_checkpoint_active" "$external_hyperpixel_binding_count" "$gpio_display_state_safe""#,
+    r#"printf '{"model":"%s","os_id":"%s","os_version":"%s","architecture":"%s","kernel_release":"%s","kernel_vermagic":"%s","default_target":"%s","display_manager_active":%s,"boot_config":"%s","boot_config_regular":%s,"tryboot_supported":%s,"clock_synchronized":%s,"system_time_unix":%s,"package_repository_reachable":%s,"port_80_free":%s,"root_available_bytes":%s,"boot_available_bytes":%s,"running_headers_available":%s,"running_headers_release":"%s","installed_kernel_header_pair_count":%s,"installed_kernel_release":"%s","installed_headers_release":"%s","boot_selected_kernel_match_count":%s,"boot_selected_kernel_release":"%s","boot_kernel_override_conflicting":%s,"unsafe_overlay_present":%s,"external_hyperpixel_overlay_count":%s,"external_hyperpixel_module_loaded":%s,"unexpected_hyperpixel_module_loaded":%s,"hyperpixel_state_dir_safe":%s,"hyperpixel_transaction_active":%s,"legacy_checkpoint_active":%s,"external_hyperpixel_binding_count":%s,"gpio_display_state_safe":%s}' "#,
+    r#""$model" "$os_id" "$os_version" "$architecture" "$kernel_release" "$kernel_vermagic" "$default_target" "$display_manager_active" "$boot_config" "$boot_config_regular" "$tryboot_supported" "$clock_synchronized" "$system_time_unix" "$package_repository_reachable" "$port_80_free" "$root_available_bytes" "$boot_available_bytes" "$running_headers_available" "$running_headers_release" "$installed_kernel_header_pair_count" "$installed_kernel_release" "$installed_headers_release" "$boot_selected_kernel_match_count" "$boot_selected_kernel_release" "$boot_kernel_override_conflicting" "$unsafe_overlay_present" "$external_hyperpixel_overlay_count" "$external_hyperpixel_module_loaded" "$unexpected_hyperpixel_module_loaded" "$hyperpixel_state_dir_safe" "$hyperpixel_transaction_active" "$legacy_checkpoint_active" "$external_hyperpixel_binding_count" "$gpio_display_state_safe""#,
 );
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -423,7 +423,18 @@ impl<'a, T: Transport, C: UnixClock> TargetPreflight<'a, T, C> {
             .ok()
             .and_then(|request| self.transport.run(target, request).ok())
             .is_some_and(|output| output.status() == 0);
-        let facts = RemoteCommand::ordinary(["sh", "-c", TARGET_FACTS_SCRIPT])
+        let facts = self.facts(target);
+        evaluate_target(
+            expected_identity,
+            observed.as_ref(),
+            sudo_available,
+            facts.as_ref().map_err(|error| *error),
+            self.clock.now_unix_seconds(),
+        )
+    }
+
+    pub fn facts(&self, target: &SshTarget) -> Result<TargetFacts, TargetFactsError> {
+        RemoteCommand::ordinary(["sh", "-c", TARGET_FACTS_SCRIPT])
             .ok()
             .and_then(|request| self.transport.run(target, request).ok())
             .map_or(Err(TargetFactsError::InvalidJson), |output| {
@@ -432,14 +443,7 @@ impl<'a, T: Transport, C: UnixClock> TargetPreflight<'a, T, C> {
                 } else {
                     Err(TargetFactsError::InvalidJson)
                 }
-            });
-        evaluate_target(
-            expected_identity,
-            observed.as_ref(),
-            sudo_available,
-            facts.as_ref().map_err(|error| *error),
-            self.clock.now_unix_seconds(),
-        )
+            })
     }
 }
 
@@ -528,6 +532,7 @@ pub struct TargetFacts {
     pub os_version: String,
     pub architecture: String,
     pub kernel_release: String,
+    pub kernel_vermagic: String,
     pub default_target: String,
     pub display_manager_active: bool,
     pub boot_config: String,
@@ -562,7 +567,7 @@ impl fmt::Debug for TargetFacts {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("TargetFacts")
-            .field("field_count", &33)
+            .field("field_count", &34)
             .finish_non_exhaustive()
     }
 }
@@ -585,6 +590,7 @@ impl TargetFacts {
             &self.os_version,
             &self.architecture,
             &self.kernel_release,
+            &self.kernel_vermagic,
             &self.default_target,
             &self.boot_config,
         ] {
@@ -595,6 +601,8 @@ impl TargetFacts {
             !self.running_headers_available,
         )?;
         require_kernel_release(&self.kernel_release)?;
+        crate::driver::TargetProbe::new(self.kernel_release.clone(), self.kernel_vermagic.clone())
+            .map_err(|_| TargetFactsError::NoncanonicalField)?;
         if !self.running_headers_release.is_empty() {
             require_kernel_release(&self.running_headers_release)?;
         }

@@ -3,6 +3,7 @@
 pub mod cli;
 pub mod config;
 pub mod driver;
+pub mod install;
 pub mod preflight;
 pub mod release;
 pub mod state;

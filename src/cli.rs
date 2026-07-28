@@ -64,6 +64,13 @@ pub enum Command {
         revision_file: PathBuf,
         #[arg(long)]
         reboot: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    #[command(hide = true)]
+    InstallerState {
+        #[command(subcommand)]
+        command: InstallerStateCommand,
     },
     ConfigureDisplay {
         #[arg(long, default_value = "/boot/firmware/config.txt")]
@@ -94,6 +101,15 @@ pub enum Command {
     RollbackDisplay {
         #[arg(long, default_value = "/boot/firmware/config.txt")]
         boot_config: PathBuf,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum InstallerStateCommand {
+    Read,
+    Write {
+        #[arg(long, value_name = "JSON")]
+        json: String,
     },
 }
 
