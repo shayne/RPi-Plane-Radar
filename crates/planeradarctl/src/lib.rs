@@ -4,5 +4,6 @@ pub mod cli;
 pub mod config;
 pub mod state;
 pub mod target;
+pub mod transport;
 
 pub use config::DriverLock;
