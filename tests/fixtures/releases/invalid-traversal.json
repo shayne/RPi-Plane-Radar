@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "version": "0.1.0-rc.1",
+  "source_commit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "supported": {
+    "model": "Raspberry Pi Zero 2 W",
+    "operating_system": "Raspberry Pi OS Lite Trixie (64-bit)",
+    "architecture": "aarch64"
+  },
+  "driver": {
+    "repository": "https://github.com/shayne/hyperpixel2r-kms",
+    "version": "0.1.0-rc.4",
+    "commit": "6826419b4f3ab01c2e1ce9a3ef870186ae2cc3b8",
+    "manifest_sha256": "93f413aac135b44585703a03717d5aa2e9ae6b2b2d4b178d193d4758dfdedee7"
+  },
+  "artifacts": {
+    "../planeradar": {
+      "architecture": "aarch64",
+      "size": 17,
+      "sha256": "a8b3f6f4320547c3ef85f3860638f2f0156459307aa4d9e7c369cb8917ace9da",
+      "runnable": true
+    }
+  }
+}

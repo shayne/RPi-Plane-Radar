@@ -1,0 +1,146 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/shayne/RPi-Plane-Radar/raw/main/release/release-manifest.schema.json",
+  "title": "RPi Plane Radar release manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "version",
+    "source_commit",
+    "supported",
+    "driver",
+    "artifacts"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "version": {
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(?:-(?:(?:0|[1-9][0-9]*)|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(?:\\.(?:(?:0|[1-9][0-9]*)|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*)?(?:\\+[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?$"
+    },
+    "source_commit": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "supported": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "model",
+        "operating_system",
+        "architecture"
+      ],
+      "properties": {
+        "model": {
+          "const": "Raspberry Pi Zero 2 W"
+        },
+        "operating_system": {
+          "const": "Raspberry Pi OS Lite Trixie (64-bit)"
+        },
+        "architecture": {
+          "const": "aarch64"
+        }
+      }
+    },
+    "driver": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "repository",
+        "version",
+        "commit",
+        "manifest_sha256"
+      ],
+      "properties": {
+        "repository": {
+          "const": "https://github.com/shayne/hyperpixel2r-kms"
+        },
+        "version": {
+          "type": "string",
+          "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(?:-(?:(?:0|[1-9][0-9]*)|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(?:\\.(?:(?:0|[1-9][0-9]*)|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*)?(?:\\+[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?$"
+        },
+        "commit": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40}$"
+        },
+        "manifest_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      }
+    },
+    "artifacts": {
+      "type": "object",
+      "minProperties": 1,
+      "maxProperties": 64,
+      "propertyNames": {
+        "type": "string",
+        "maxLength": 128,
+        "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$",
+        "not": {
+          "pattern": "\\.\\."
+        }
+      },
+      "required": [
+        "planeradar-aarch64-linux-gnu.tar.zst"
+      ],
+      "properties": {
+        "planeradar-aarch64-linux-gnu.tar.zst": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/artifact"
+            },
+            {
+              "properties": {
+                "architecture": {
+                  "const": "aarch64"
+                },
+                "runnable": {
+                  "const": true
+                }
+              }
+            }
+          ]
+        }
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/artifact"
+      }
+    }
+  },
+  "$defs": {
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "architecture",
+        "size",
+        "sha256",
+        "runnable"
+      ],
+      "properties": {
+        "architecture": {
+          "enum": [
+            "aarch64",
+            "x86_64",
+            "any"
+          ]
+        },
+        "size": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4294967296
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "runnable": {
+          "type": "boolean"
+        }
+      }
+    }
+  }
+}
