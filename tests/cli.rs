@@ -115,3 +115,12 @@ fn run_headless_accepts_the_runtime_paths_and_addresses() {
         CliCommand::Run { headless: true, .. }
     ));
 }
+
+#[test]
+fn run_leaves_the_local_url_unset_without_an_override() {
+    let cli = Cli::try_parse_from(["planeradar", "run"]).expect("parse runtime command");
+    let CliCommand::Run { local_url, .. } = cli.command else {
+        panic!("expected runtime command");
+    };
+    assert_eq!(local_url, None);
+}

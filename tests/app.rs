@@ -21,6 +21,8 @@ use planeradar::runtime::{RuntimeError, RuntimeHealthSource, RuntimeModel, Runti
 use planeradar::settings::SettingsStore;
 use planeradar::touch::Gesture;
 use planeradar::web::HealthSource;
+use qrcode::QrCode;
+use qrcode::types::{Color, EcLevel};
 
 #[derive(Clone)]
 struct FakeControl {
@@ -155,19 +157,43 @@ fn configured_without_data_is_waiting_for_network() {
 }
 
 #[test]
-fn waiting_for_network_uses_the_exact_setup_copy_and_current_ip() {
+fn waiting_for_network_uses_the_runtime_local_url_and_current_ip() {
     let directory = tempfile::tempdir().expect("tempdir");
-    let (mut app, _, _) = app_fixture(configured(), None, directory.path().join("debug.png"));
+    let (mut app, control, _) = app_fixture(configured(), None, directory.path().join("debug.png"));
+    let local_url = "http://hangar-2.local";
+    control
+        .model
+        .set_urls(local_url.to_owned(), Some("http://10.0.4.74".to_owned()));
     let actual = app.step(&[], Instant::now()).frame.expect("waiting frame");
-    let expected = SetupRenderer::new(FontAsset::embedded().expect("font"))
-        .render(
-            CANONICAL_LOCAL_URL,
-            Some("http://10.0.4.74"),
-            true,
-            "WAITING FOR NETWORK",
-        )
-        .expect("expected waiting frame");
-    assert_eq!(actual, expected.pixels());
+    assert_setup_qr(&actual, local_url);
+}
+
+fn assert_setup_qr(frame: &[u8], local_url: &str) {
+    const SIZE: usize = 480;
+    const QR_LEFT: usize = 108;
+    const QR_TOP: usize = 50;
+    const QR_MODULE_PIXELS: usize = 8;
+    const QR_QUIET_MODULES: usize = 4;
+
+    let code = QrCode::with_error_correction_level(local_url.as_bytes(), EcLevel::M)
+        .expect("expected local URL QR payload");
+    let code_width = code.width();
+    for (index, color) in code.into_colors().into_iter().enumerate() {
+        let row = index / code_width + QR_QUIET_MODULES;
+        let column = index % code_width + QR_QUIET_MODULES;
+        let x = QR_LEFT + column * QR_MODULE_PIXELS;
+        let y = QR_TOP + row * QR_MODULE_PIXELS;
+        let offset = (y * SIZE + x) * 4;
+        let expected = match color {
+            Color::Dark => [0, 0, 0, 255],
+            Color::Light => [255, 255, 255, 255],
+        };
+        assert_eq!(
+            &frame[offset..offset + 4],
+            expected,
+            "QR module ({column}, {row})"
+        );
+    }
 }
 
 #[test]
@@ -472,6 +498,8 @@ fn sigterm_requests_coordinated_shutdown() {
                 .expect("cache path"),
             "--http",
             &address.to_string(),
+            "--local-url",
+            "http://planeradar.local",
         ])
         .stdout(Stdio::null())
         .stderr(Stdio::piped())

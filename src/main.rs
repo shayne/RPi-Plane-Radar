@@ -43,6 +43,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             nominatim_url,
             debug_frame,
         } => {
+            let local_url = match local_url {
+                Some(url) => url,
+                None => {
+                    let hostname = std::fs::read_to_string("/etc/hostname")?;
+                    planeradar::network::local_url(hostname.trim())?
+                }
+            };
             let handle = RuntimeCoordinator::start(RuntimeConfig {
                 settings_path: settings,
                 geocode_cache_path: geocode_cache,

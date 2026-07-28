@@ -30,12 +30,8 @@ pub enum Command {
         geocode_cache: PathBuf,
         #[arg(long, env = "PLANERADAR_HTTP", default_value = "0.0.0.0:80")]
         http: SocketAddr,
-        #[arg(
-            long,
-            env = "PLANERADAR_LOCAL_URL",
-            default_value = "http://planeradar.local"
-        )]
-        local_url: String,
+        #[arg(long, env = "PLANERADAR_LOCAL_URL")]
+        local_url: Option<String>,
         #[arg(
             long,
             env = "PLANERADAR_NOMINATIM_URL",

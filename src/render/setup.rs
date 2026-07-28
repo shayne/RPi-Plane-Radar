@@ -29,6 +29,8 @@ const CONTROL_TOP: f32 = 428.0;
 const IP_URL_MAX_WIDTH: f32 = 350.0;
 const IP_URL_MAX_CAP_HEIGHT: u32 = 17;
 const IP_URL_MIN_CAP_HEIGHT: u32 = 12;
+const LOCAL_URL_MAX_WIDTH: f32 = 350.0;
+const LOCAL_URL_CAP_HEIGHT: u32 = 20;
 const MESSAGE_MAX_WIDTH: f32 = 270.0;
 const MAX_URL_BYTES: usize = 128;
 const MAX_MESSAGE_CHARACTERS: usize = 512;
@@ -48,12 +50,14 @@ impl SetupRenderer {
 
     pub fn render(
         &self,
-        _local_url: &str,
+        local_url: &str,
         ip_url: Option<&str>,
         configured: bool,
         message: &str,
     ) -> Result<Frame, RenderError> {
-        let code = QrCode::with_error_correction_level(CANONICAL_LOCAL_URL.as_bytes(), EcLevel::M)?;
+        let local_url =
+            validated_local_url(local_url).unwrap_or_else(|| CANONICAL_LOCAL_URL.to_owned());
+        let code = QrCode::with_error_correction_level(local_url.as_bytes(), EcLevel::M)?;
         let code_modules =
             u32::try_from(code.width()).map_err(|_| RenderError::DimensionsOverflow)?;
         let total_modules = code_modules
@@ -94,7 +98,15 @@ impl SetupRenderer {
         )?;
 
         let text = TextRasterizer::new(self.font.font());
-        draw_centered_line(&text, &mut pixmap, CANONICAL_LOCAL_URL, LOCAL_URL_TOP, 20.0);
+        draw_fitted_centered_line(
+            &text,
+            &mut pixmap,
+            &local_url,
+            LOCAL_URL_TOP,
+            LOCAL_URL_MAX_WIDTH,
+            LOCAL_URL_CAP_HEIGHT,
+            LOCAL_URL_CAP_HEIGHT,
+        );
         draw_fitted_centered_line(
             &text,
             &mut pixmap,
@@ -337,6 +349,25 @@ fn validated_ip_url(candidate: Option<&str>) -> Option<String> {
         || parsed.fragment().is_some()
         || parsed.path() != "/"
         || !matches!(parsed.host()?, Host::Ipv4(_) | Host::Ipv6(_))
+    {
+        return None;
+    }
+    Some(parsed.as_str().trim_end_matches('/').to_owned())
+}
+
+fn validated_local_url(candidate: &str) -> Option<String> {
+    let candidate = bounded_url_candidate_with(candidate, str::trim)?;
+    if candidate.is_empty() || candidate.chars().any(char::is_control) {
+        return None;
+    }
+    let parsed = url::Url::parse(candidate).ok()?;
+    if parsed.scheme() != "http"
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+        || parsed.path() != "/"
+        || parsed.host().is_none()
     {
         return None;
     }

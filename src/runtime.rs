@@ -476,6 +476,7 @@ impl RuntimeCoordinator {
             settings.clone(),
             Arc::new(Mutex::new(geocoder)),
             health,
+            config.local_url,
             allowed_hosts,
         )?);
         let web_stop = stop.clone();

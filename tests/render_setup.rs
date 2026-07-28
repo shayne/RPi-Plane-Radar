@@ -34,13 +34,12 @@ fn render(local_url: &str, ip_url: Option<&str>, configured: bool, message: &str
         .expect("render setup frame")
 }
 
-fn expected_code() -> QrCode {
-    QrCode::with_error_correction_level(b"http://planeradar.local", EcLevel::M)
-        .expect("canonical QR payload")
+fn expected_code(local_url: &str) -> QrCode {
+    QrCode::with_error_correction_level(local_url.as_bytes(), EcLevel::M).expect("QR payload")
 }
 
-fn assert_canonical_qr(frame: &Frame) {
-    let code = expected_code();
+fn assert_qr(frame: &Frame, local_url: &str) {
+    let code = expected_code(local_url);
     let code_width = u32::try_from(code.width()).expect("QR width");
     let colors = code.into_colors();
     let total_modules = code_width + QR_QUIET_MODULES * 2;
@@ -147,33 +146,17 @@ fn assert_region_matches_reference(
 }
 
 #[test]
-fn setup_frame_encodes_only_the_stable_medium_ec_local_url() {
-    let cases = [
-        (
-            "http://planeradar.local",
-            Some("http://10.0.4.74"),
-            false,
-            "Open this page to set the radar location",
-        ),
-        (
-            "https://evil.example/\0?payload=changed",
-            Some("http://[::1]/not-a-numeric-ip-url"),
-            true,
-            "A different message must not alter the code",
-        ),
-        (
-            "not a URL",
-            None,
-            false,
-            "Tap to dismiss and return to the radar",
-        ),
-    ];
+fn setup_frame_encodes_the_provided_local_url() {
+    let local_url = "http://hangar-2.local";
+    let frame = render(
+        local_url,
+        Some("http://10.0.4.74"),
+        false,
+        "Open this page to set the radar location",
+    );
 
-    for (local_url, ip_url, configured, message) in cases {
-        let frame = render(local_url, ip_url, configured, message);
-        assert_eq!(frame.dimensions(), (SIZE, SIZE));
-        assert_canonical_qr(&frame);
-    }
+    assert_eq!(frame.dimensions(), (SIZE, SIZE));
+    assert_qr(&frame, local_url);
 }
 
 #[test]
@@ -188,7 +171,7 @@ fn setup_frame_uses_a_black_canvas_white_qr_tile_and_light_text() {
     for (x, y) in [(0, 0), (479, 0), (0, 479), (479, 479), (240, 470)] {
         assert_eq!(frame.pixel(x, y), BACKGROUND, "canvas pixel ({x}, {y})");
     }
-    assert_canonical_qr(&frame);
+    assert_qr(&frame, CANONICAL_LOCAL_URL);
     assert!(
         frame.color_count(LIGHT_TEXT, 0, 318, SIZE, 145) > 0,
         "surrounding setup text must remain light and readable"
@@ -204,7 +187,7 @@ fn qr_has_exactly_four_quiet_modules_and_the_largest_safe_integer_scale() {
         false,
         "Open this page to set the radar location",
     );
-    let code_modules = u32::try_from(expected_code().width()).expect("QR width");
+    let code_modules = u32::try_from(expected_code(CANONICAL_LOCAL_URL).width()).expect("QR width");
     let total_modules = code_modules + QR_QUIET_MODULES * 2;
     let total_pixels = total_modules * QR_MODULE_PIXELS;
     assert_eq!(code_modules, 25);
@@ -269,7 +252,7 @@ fn longest_valid_ipv6_urls_are_measured_to_fit_the_round_safe_region() {
             true,
             "Settings are available on this page",
         );
-        assert_canonical_qr(&frame);
+        assert_qr(&frame, CANONICAL_LOCAL_URL);
         assert_opaque_and_content_stays_inside_the_circular_safe_region(&frame);
     }
 }

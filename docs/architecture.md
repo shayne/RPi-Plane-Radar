@@ -97,9 +97,10 @@ aircraft, vectors, tags, and stale status. Aircraft and airport input are
 bounded before drawing. Text is painted last with transparent glyph
 backgrounds; only the range label receives a one-pixel shape outline.
 
-The setup renderer creates a medium-error-correction QR code for the stable
-`http://planeradar.local` URL. It uses the largest integer module scale that
-fits the circular safe region and preserves an exact four-module quiet zone.
+The setup renderer creates a medium-error-correction QR code for the URL
+derived from the installed hostname (or an explicit local-URL override). It
+uses the largest integer module scale that fits the circular safe region and
+preserves an exact four-module quiet zone.
 
 SIGUSR1 atomically saves the current logical frame to
 `/var/lib/planeradar/debug.png`; it does not scrape the physical framebuffer.

@@ -11,6 +11,8 @@ use planeradar::model::{AppState, Location, RadarSettings, Units};
 use planeradar::web::{HealthSnapshot, HealthSource, SettingsServer, SettingsService, WebError};
 
 const SESSION_COOKIE: &str = "planeradar_session";
+const LOCAL_URL: &str = "http://hangar-2.local";
+const LOCAL_HOST: &str = "hangar-2.local";
 
 #[derive(Clone)]
 struct TestSettings {
@@ -139,7 +141,7 @@ impl TestServer {
         let allowed_address = address;
         let allowed_hosts = Arc::new(move || {
             HashSet::from([
-                "planeradar.local".to_owned(),
+                LOCAL_HOST.to_owned(),
                 format!("127.0.0.1:{}", allowed_address.port()),
             ])
         });
@@ -149,6 +151,7 @@ impl TestServer {
                 Arc::new(settings.clone()),
                 Arc::new(Mutex::new(geocoder)),
                 Arc::new(TestHealth),
+                LOCAL_URL.to_owned(),
                 allowed_hosts,
             )
             .unwrap(),
@@ -443,7 +446,7 @@ fn page_exposes_local_settings_without_wifi_or_browser_geolocation() {
     }
     let page = response.body.to_lowercase();
     for expected in [
-        "http://planeradar.local",
+        LOCAL_URL,
         "search",
         "latitude",
         "longitude",
@@ -520,7 +523,7 @@ fn host_header_requires_an_exact_allowlist_entry() {
 
     assert_eq!(
         server
-            .request("GET", "/", "planeradar.local", Vec::new(), &[], true)
+            .request("GET", "/", LOCAL_HOST, Vec::new(), &[], true)
             .status,
         200
     );
@@ -535,7 +538,7 @@ fn host_header_requires_an_exact_allowlist_entry() {
             .request(
                 "GET",
                 "/",
-                "planeradar.local.evil.example",
+                "hangar-2.local.evil.example",
                 Vec::new(),
                 &[],
                 true,
@@ -545,7 +548,7 @@ fn host_header_requires_an_exact_allowlist_entry() {
     );
     assert_eq!(
         server
-            .request("GET", "/", "user@planeradar.local", Vec::new(), &[], true,)
+            .request("GET", "/", "user@hangar-2.local", Vec::new(), &[], true,)
             .status,
         403
     );
@@ -625,7 +628,7 @@ fn posts_accept_exact_local_name_and_current_ip_origins() {
         "/search",
         &[("query", "Boston")],
         &session,
-        Some("http://planeradar.local"),
+        Some(LOCAL_URL),
         None,
     );
     assert_eq!(local_name.status, 200);
@@ -666,7 +669,7 @@ fn absent_origin_requires_a_same_host_allowlisted_referer() {
                 &fields,
                 &session,
                 None,
-                Some("http://planeradar.local/settings"),
+                Some("http://hangar-2.local/settings"),
             )
             .status,
         403
@@ -687,7 +690,7 @@ fn duplicate_or_malformed_provenance_headers_are_rejected() {
     ];
     let mut duplicate = base_headers.clone();
     duplicate.push(("Origin".to_owned(), server.current_ip_origin()));
-    duplicate.push(("Origin".to_owned(), "http://planeradar.local".to_owned()));
+    duplicate.push(("Origin".to_owned(), LOCAL_URL.to_owned()));
     assert_eq!(
         server
             .request(
@@ -703,10 +706,7 @@ fn duplicate_or_malformed_provenance_headers_are_rejected() {
     );
 
     let mut malformed = base_headers;
-    malformed.push((
-        "Origin".to_owned(),
-        "http://user@planeradar.local".to_owned(),
-    ));
+    malformed.push(("Origin".to_owned(), "http://user@hangar-2.local".to_owned()));
     assert_eq!(
         server
             .request(
@@ -844,7 +844,7 @@ fn search_results_are_selectable_escaped_and_never_persist() {
         "/search",
         &[("query", "New York")],
         &session,
-        Some("http://planeradar.local"),
+        Some(LOCAL_URL),
         None,
     );
 
