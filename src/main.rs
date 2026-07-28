@@ -118,7 +118,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             println!(
                 "{}",
                 read_optional_installer_state_json(std::path::Path::new(
-                    "/var/lib/planeradar/installer/state.json",
+                    "/var/lib/planeradar-installer/state.json",
                 ))?
             );
         }
@@ -126,13 +126,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             command: InstallerStateCommand::Write { json },
         } => {
             write_installer_state_json(
-                std::path::Path::new("/var/lib/planeradar/installer/state.json"),
+                std::path::Path::new("/var/lib/planeradar-installer/state.json"),
                 json.as_bytes(),
             )?;
             println!(
                 "{}",
                 read_installer_state_json(std::path::Path::new(
-                    "/var/lib/planeradar/installer/state.json",
+                    "/var/lib/planeradar-installer/state.json",
                 ))?
             );
         }

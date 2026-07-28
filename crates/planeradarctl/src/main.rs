@@ -24,8 +24,8 @@ use planeradarctl::{
     preflight::{HostPreflight, SystemUnixClock, TargetPreflight},
     release::{GhReleaseSource, MANIFEST_NAME, ReleaseClient, ReleaseInput, Verifier},
     state::{
-        ArtifactIdentity, LocalStateStore, StateError, TARGET_STATE_PATH, TargetInstallState,
-        TargetStateStore,
+        ArtifactIdentity, InstallPhase, InstallState, LocalStateStore, StateError, StateStore,
+        TARGET_STATE_PATH, TargetInstallState, TargetStateStore,
     },
     target::{SshTarget, TargetIdentity},
     transport::{
@@ -98,16 +98,35 @@ fn run_install(config: InstallConfig) -> Result<(), Box<dyn std::error::Error>> 
                 "release has no supported application artifact",
             )
         })?;
-    let application_payload =
-        extract_application_payload(&application_artifact.path, &cache_root.join("payloads"))?;
+    let application_payload = extract_application_payload(
+        &application_artifact.path,
+        &application_artifact.artifact.sha256,
+        &cache_root.join("payloads"),
+    )?;
     let payload_sha256 = application_payload.sha256().to_owned();
     let source_commit = release.manifest.source_commit.clone();
     let release_version = release.manifest.version.clone();
 
+    let application_identity = ArtifactIdentity {
+        version: release_version.to_string(),
+        source_commit,
+        sha256: payload_sha256.clone(),
+    };
+    let driver_identity = ArtifactIdentity {
+        version: lock.version.to_string(),
+        source_commit: lock.commit.clone(),
+        sha256: lock.manifest_sha256.clone(),
+    };
     let transport =
         OpenSshTransport::system(TransportConfig::new(home.join(".ssh").join("known_hosts"))?);
-    let observed = transport.probe(&target)?.identity;
-    let state_store = LocalStateStore::from_environment(&home, observed.clone())?;
+    let (target, observed, state_store) = select_install_target(
+        &transport,
+        target,
+        &config.hostname,
+        &home,
+        &application_identity,
+        &driver_identity,
+    )?;
     let backend = SystemInstallBackend {
         transport,
         target: RefCell::new(target),
@@ -119,20 +138,12 @@ fn run_install(config: InstallConfig) -> Result<(), Box<dyn std::error::Error>> 
         application_payload,
         driver_tool: RefCell::new(None),
         persisted_target_phase: RefCell::new(None),
-        helper_path: format!("/var/tmp/planeradar-installer-{}", &payload_sha256[..12]),
+        helper_path: format!("/var/lib/planeradar-installer/helpers/{payload_sha256}/planeradar"),
     };
     let request = InstallRequest {
         target: observed,
-        application: ArtifactIdentity {
-            version: release_version.to_string(),
-            source_commit,
-            sha256: payload_sha256,
-        },
-        driver: ArtifactIdentity {
-            version: lock.version.to_string(),
-            source_commit: lock.commit.clone(),
-            sha256: lock.manifest_sha256.clone(),
-        },
+        application: application_identity,
+        driver: driver_identity,
         desired_hostname: config.hostname,
     };
 
@@ -159,6 +170,50 @@ fn run_install(config: InstallConfig) -> Result<(), Box<dyn std::error::Error>> 
             .into())
         }
     }
+}
+
+fn select_install_target(
+    transport: &OpenSshTransport<SystemCommandRunner>,
+    original: SshTarget,
+    desired_hostname: &str,
+    home: &Path,
+    application: &ArtifactIdentity,
+    driver: &ArtifactIdentity,
+) -> Result<(SshTarget, TargetIdentity, LocalStateStore), Box<dyn std::error::Error>> {
+    if let Ok(probe) = transport.probe(&original) {
+        let store = LocalStateStore::from_environment(home, probe.identity.clone())?;
+        return Ok((original, probe.identity, store));
+    }
+    let desired = format!("{}@{desired_hostname}.local", original.username().as_str())
+        .parse::<SshTarget>()?;
+    let observed = transport.probe(&desired)?.identity;
+    let store = LocalStateStore::from_environment(home, observed.clone())?;
+    let persisted = store.load()?.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "original target is unavailable and the desired hostname has no persisted identity",
+        )
+    })?;
+    if !resume_state_matches(&persisted, &observed, application, driver) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "desired hostname does not match the persisted installation identity",
+        )
+        .into());
+    }
+    Ok((desired, observed, store))
+}
+
+fn resume_state_matches(
+    persisted: &InstallState,
+    observed: &TargetIdentity,
+    application: &ArtifactIdentity,
+    driver: &ArtifactIdentity,
+) -> bool {
+    persisted.phase >= InstallPhase::HostnameChanged
+        && &persisted.target == observed
+        && persisted.application.as_ref() == Some(application)
+        && persisted.driver.as_ref() == Some(driver)
 }
 
 fn requested_version(config: &InstallConfig) -> Result<Version, Box<dyn std::error::Error>> {
@@ -216,6 +271,17 @@ fn tryboot_reboot_command() -> Result<RemoteCommand, TransportError> {
     RemoteCommand::interactive_sudo(["sudo", "reboot", "0 tryboot"])
 }
 
+fn sudo_reboot_validation_command() -> Result<RemoteCommand, TransportError> {
+    RemoteCommand::interactive_sudo(["sudo", "-v"])
+}
+
+fn tryboot_wait_failure(error: TransportError) -> BackendFailure {
+    match error {
+        TransportError::ReconnectTimedOut => BackendFailure::TrybootTimedOut,
+        _ => BackendFailure::OperationFailed,
+    }
+}
+
 fn final_reboot_command() -> Result<RemoteCommand, TransportError> {
     RemoteCommand::interactive_sudo(["sudo", "systemctl", "reboot"])
 }
@@ -240,6 +306,55 @@ fn target_install_command(
         "--revision-file",
         revision_path,
         "--json",
+    ])
+}
+
+fn deploy_helper_command(
+    upload_path: &str,
+    helper_path: &str,
+    sha256: &str,
+    revision: &str,
+) -> Result<RemoteCommand, TransportError> {
+    RemoteCommand::interactive_sudo([
+        "sudo",
+        "sh",
+        "-c",
+        r#"set -eu; upload=$1; helper=$2; digest=$3; revision=$4; case "$helper" in /var/lib/planeradar-installer/helpers/"$digest"/planeradar) ;; *) exit 64 ;; esac; test ! -L "$upload" && test -f "$upload"; test "$(sha256sum -- "$upload" | awk '{print $1}')" = "$digest"; root=${helper%/planeradar}; install -d -o root -g root -m 0700 /var/lib/planeradar-installer; install -d -o root -g root -m 0700 /var/lib/planeradar-installer/helpers; install -d -o root -g root -m 0700 "$root"; binary_tmp="$root/.planeradar.$$"; checksum_tmp="$root/.planeradar.sha256.$$"; revision_tmp="$root/.planeradar.revision.$$"; trap 'rm -f -- "$binary_tmp" "$checksum_tmp" "$revision_tmp"' EXIT HUP INT TERM; install -o root -g root -m 0700 -- "$upload" "$binary_tmp"; printf '%s  planeradar\n' "$digest" >"$checksum_tmp"; printf '%s\n' "$revision" >"$revision_tmp"; chown root:root "$checksum_tmp" "$revision_tmp"; chmod 0600 "$checksum_tmp" "$revision_tmp"; test "$(sha256sum -- "$binary_tmp" | awk '{print $1}')" = "$digest"; mv -f -- "$binary_tmp" "$helper"; mv -f -- "$checksum_tmp" "$helper.sha256"; mv -f -- "$revision_tmp" "$helper.revision"; trap - EXIT HUP INT TERM; test ! -L "$helper" && test -f "$helper" && test -x "$helper"; test "$(stat -c '%u:%g:%a' -- "$helper")" = "0:0:700"; test "$(sha256sum -- "$helper" | awk '{print $1}')" = "$digest""#,
+        "planeradar-helper-deploy",
+        upload_path,
+        helper_path,
+        sha256,
+        revision,
+    ])
+}
+
+fn staged_driver_transaction_command(
+    driver_version: &str,
+    source_revision: &str,
+    kernel_release: &str,
+    overlay_file: &str,
+) -> Result<RemoteCommand, TransportError> {
+    RemoteCommand::interactive_sudo([
+        "sudo",
+        "sh",
+        "-c",
+        r#"set -eu; state=/var/lib/hyperpixel2r-kms/tryboot-state; test ! -L "$state" && test -f "$state"; test "$(stat -c '%u:%g:%a' -- "$state")" = "0:0:600"; test "$(awk -F= 'NF != 2 || $1 == "" || $2 == "" || seen[$1]++ { bad=1 } END { print bad+0 }' "$state")" = 0; value() { awk -F= -v key="$1" '$1 == key { print $2 }' "$state"; }; test "$(value driver_version)" = "$1"; test "$(value source_revision)" = "$2"; test "$(value kernel_release)" = "$3"; test "$(value overlay_file)" = "$4"; artifact="/var/lib/hyperpixel2r-kms/artifacts/$1/$2/$3"; test ! -L "$artifact" && test -d "$artifact"; manifest="$artifact/manifest.txt"; test ! -L "$manifest" && test -f "$manifest"; test "$(awk -F '\t' -v key=driver_version '$1 == key { print $2 }' "$manifest")" = "$1"; test "$(awk -F '\t' -v key=source_revision '$1 == key { print $2 }' "$manifest")" = "$2"; test "$(awk -F '\t' -v key=kernel_release '$1 == key { print $2 }' "$manifest")" = "$3"; module_sha=$(value module_sha256); overlay_sha=$(value overlay_sha256); case "$module_sha$overlay_sha" in *[!0-9a-f]*|'') exit 1 ;; esac; test "${#module_sha}" = 64 && test "${#overlay_sha}" = 64; test "$(sha256sum -- "/lib/modules/$3/extra/hyperpixel2r_kms.ko" | awk '{print $1}')" = "$module_sha"; test "$(sha256sum -- "/boot/firmware/overlays/$4" | awk '{print $1}')" = "$overlay_sha""#,
+        "planeradar-driver-transaction",
+        driver_version,
+        source_revision,
+        kernel_release,
+        overlay_file,
+    ])
+}
+
+fn committed_driver_command(overlay_file: &str) -> Result<RemoteCommand, TransportError> {
+    RemoteCommand::interactive_sudo([
+        "sudo",
+        "sh",
+        "-c",
+        r#"set -eu; state=/var/lib/hyperpixel2r-kms/tryboot-state; test ! -L "$state" && test ! -e "$state"; config=/boot/firmware/config.txt; overlay="/boot/firmware/overlays/$1"; test ! -L "$config" && test -f "$config"; test ! -L "$overlay" && test -f "$overlay"; test "$(awk -v wanted="dtoverlay=$1" '{ line=$0; sub(/^[[:space:]]+/, "", line); sub(/[[:space:]]+$/, "", line); if (line == wanted) count++ } END { print count+0 }' "$config")" = 1"#,
+        "planeradar-driver-committed",
+        overlay_file,
     ])
 }
 
@@ -334,10 +449,11 @@ impl SystemInstallBackend {
     }
 
     fn verify_remote_helper(&self, expected_sha256: &str) -> Result<bool, BackendFailure> {
-        let request = RemoteCommand::ordinary([
+        let request = RemoteCommand::interactive_sudo([
+            "sudo",
             "sh",
             "-c",
-            "test ! -L \"$1\" && test -f \"$1\" && test -x \"$1\" && test \"$(sha256sum -- \"$1\" | awk '{print $1}')\" = \"$2\"",
+            "test ! -L \"$1\" && test -f \"$1\" && test -x \"$1\" && test \"$(stat -c '%u:%g:%a' -- \"$1\")\" = '0:0:700' && test \"$(sha256sum -- \"$1\" | awk '{print $1}')\" = \"$2\"",
             "planeradar-helper",
             &self.helper_path,
             expected_sha256,
@@ -370,6 +486,29 @@ impl SystemInstallBackend {
         ])
         .map_err(|_| BackendFailure::FinalServiceFailed)?;
         self.run_remote_check(request)
+    }
+
+    fn verify_staged_driver_transaction(&self) -> Result<bool, BackendFailure> {
+        self.ensure_driver_tool()?;
+        let tool = self.driver_tool.borrow();
+        let tool = tool.as_ref().ok_or(BackendFailure::OperationFailed)?;
+        let command = staged_driver_transaction_command(
+            tool.driver_version(),
+            tool.source_revision(),
+            tool.kernel_release(),
+            tool.expected_overlay_file(),
+        )
+        .map_err(|_| BackendFailure::OperationFailed)?;
+        self.run_remote_check(command)
+    }
+
+    fn verify_committed_driver(&self) -> Result<bool, BackendFailure> {
+        self.ensure_driver_tool()?;
+        let tool = self.driver_tool.borrow();
+        let tool = tool.as_ref().ok_or(BackendFailure::OperationFailed)?;
+        let command = committed_driver_command(tool.expected_overlay_file())
+            .map_err(|_| BackendFailure::OperationFailed)?;
+        self.run_remote_check(command)
     }
 
     fn desired_target(&self, hostname: &str) -> Result<SshTarget, BackendFailure> {
@@ -407,7 +546,7 @@ impl SystemInstallBackend {
 impl TargetStateStore for SystemInstallBackend {
     fn load_target_state(&self) -> Result<Option<TargetInstallState>, StateError> {
         let target = self.target.borrow().clone();
-        let exists = RemoteCommand::ordinary(["test", "-x", &self.helper_path])
+        let exists = RemoteCommand::interactive_sudo(["sudo", "test", "-x", &self.helper_path])
             .map_err(target_state_transport_error)?;
         if self.transport.run(&target, exists).is_err() {
             return Ok(None);
@@ -489,18 +628,55 @@ impl InstallBackend for SystemInstallBackend {
         if self.application_payload.sha256() != request.application.sha256 {
             return Err(BackendFailure::OperationFailed);
         }
+        let create_upload = RemoteCommand::ordinary([
+            "sh",
+            "-c",
+            "umask 077; mktemp -d /var/tmp/planeradar-upload.XXXXXXXXXX",
+        ])
+        .map_err(|_| BackendFailure::OperationFailed)?;
+        let upload_output = self
+            .transport
+            .run(&self.current_target(), create_upload)
+            .map_err(|_| BackendFailure::SshLost)?;
+        let upload_directory = std::str::from_utf8(upload_output.stdout())
+            .ok()
+            .map(str::trim)
+            .filter(|path| {
+                path.strip_prefix("/var/tmp/planeradar-upload.")
+                    .is_some_and(|suffix| {
+                        suffix.len() == 10
+                            && suffix.bytes().all(|byte| byte.is_ascii_alphanumeric())
+                    })
+            })
+            .ok_or(BackendFailure::OperationFailed)?
+            .to_owned();
+        let upload_path = format!("{upload_directory}/payload");
         self.transport
             .copy_to(
                 &self.current_target(),
                 self.application_payload.path(),
-                Path::new(&self.helper_path),
+                Path::new(&upload_path),
             )
             .map_err(|_| BackendFailure::SshLost)?;
-        let chmod = RemoteCommand::ordinary(["chmod", "700", &self.helper_path])
+        let deploy = deploy_helper_command(
+            &upload_path,
+            &self.helper_path,
+            &request.application.sha256,
+            &request.application.source_commit,
+        )
+        .map_err(|_| BackendFailure::OperationFailed)?;
+        let deployed = self
+            .transport
+            .run(&self.current_target(), deploy)
+            .map_err(|_| BackendFailure::OperationFailed);
+        let cleanup = RemoteCommand::ordinary(["rm", "-rf", "--", &upload_directory])
             .map_err(|_| BackendFailure::OperationFailed)?;
-        self.transport
-            .run(&self.current_target(), chmod)
-            .map_err(|_| BackendFailure::OperationFailed)?;
+        let cleaned = self
+            .transport
+            .run(&self.current_target(), cleanup)
+            .map_err(|_| BackendFailure::OperationFailed);
+        deployed?;
+        cleaned?;
         if !self.verify_remote_helper(&request.application.sha256)? {
             return Err(BackendFailure::OperationFailed);
         }
@@ -524,6 +700,11 @@ impl InstallBackend for SystemInstallBackend {
 
     fn boot_and_verify_tryboot(&self, _request: &InstallRequest) -> Result<(), BackendFailure> {
         let original = self.current_target();
+        let validate =
+            sudo_reboot_validation_command().map_err(|_| BackendFailure::OperationFailed)?;
+        self.transport
+            .run(&original, validate)
+            .map_err(|_| BackendFailure::OperationFailed)?;
         let reboot = tryboot_reboot_command().map_err(|_| BackendFailure::OperationFailed)?;
         let _expected_disconnect = self.transport.run(&original, reboot);
         let reconnected = self
@@ -533,12 +714,7 @@ impl InstallBackend for SystemInstallBackend {
                 std::slice::from_ref(&original),
                 self.reconnect_policy(None)?,
             )
-            .map_err(|error| match error {
-                TransportError::ReconnectTimedOut | TransportError::NeverDisconnected => {
-                    BackendFailure::TrybootTimedOut
-                }
-                _ => BackendFailure::OperationFailed,
-            })?;
+            .map_err(tryboot_wait_failure)?;
         *self.target.borrow_mut() = reconnected;
         self.ensure_driver_tool()?;
         self.driver_tool
@@ -557,8 +733,12 @@ impl InstallBackend for SystemInstallBackend {
             .as_ref()
             .ok_or(BackendFailure::OperationFailed)?
             .run(DriverAction::CommitBoot)
-            .map(|_| ())
-            .map_err(|_| BackendFailure::OperationFailed)
+            .map_err(|_| BackendFailure::OperationFailed)?;
+        if self.verify_committed_driver()? {
+            Ok(())
+        } else {
+            Err(BackendFailure::OperationFailed)
+        }
     }
 
     fn install_application(
@@ -568,19 +748,6 @@ impl InstallBackend for SystemInstallBackend {
         if !self.verify_remote_helper(&request.application.sha256)? {
             return Err(BackendFailure::OperationFailed);
         }
-        let sidecars = RemoteCommand::ordinary([
-            "sh",
-            "-c",
-            "umask 077; printf '%s  planeradar\\n' \"$2\" >\"$1.sha256\" && printf '%s\\n' \"$3\" >\"$1.revision\"",
-            "planeradar-sidecars",
-            &self.helper_path,
-            &request.application.sha256,
-            &request.application.source_commit,
-        ])
-        .map_err(|_| BackendFailure::OperationFailed)?;
-        self.transport
-            .run(&self.current_target(), sidecars)
-            .map_err(|_| BackendFailure::SshLost)?;
         let checksum_path = format!("{}.sha256", self.helper_path);
         let revision_path = format!("{}.revision", self.helper_path);
         let install = target_install_command(&self.helper_path, &checksum_path, &revision_path)
@@ -638,7 +805,11 @@ impl InstallBackend for SystemInstallBackend {
     }
 
     fn finish(&self, _request: &InstallRequest) -> Result<(), BackendFailure> {
-        Ok(())
+        if self.verify_service_health()? {
+            Ok(())
+        } else {
+            Err(BackendFailure::FinalServiceFailed)
+        }
     }
 
     fn verify_phase(
@@ -680,42 +851,20 @@ impl InstallBackend for SystemInstallBackend {
             InstallPhase::DriverReady => self.ensure_driver_tool().map(|()| true),
             InstallPhase::TrybootStaged => {
                 let persisted = *self.persisted_target_phase.borrow();
-                if persisted.is_some_and(|phase| phase >= InstallPhase::FinalRebooted) {
-                    self.ensure_driver_tool()?;
-                    self.driver_tool
-                        .borrow()
-                        .as_ref()
-                        .ok_or(BackendFailure::OperationFailed)?
-                        .verify_normal_boot()
-                        .map(|_| true)
-                        .or(Ok(false))
-                } else if persisted.is_some_and(|phase| phase >= InstallPhase::TrybootVerified) {
-                    self.ensure_driver_tool()?;
-                    self.driver_tool
-                        .borrow()
-                        .as_ref()
-                        .ok_or(BackendFailure::OperationFailed)?
-                        .run(DriverAction::VerifyBoot)
-                        .map(|_| true)
-                        .or(Ok(false))
+                if persisted.is_some_and(|phase| phase >= InstallPhase::DriverAccepted) {
+                    self.verify_committed_driver()
                 } else {
-                    let command = RemoteCommand::interactive_sudo([
-                        "sudo",
-                        "test",
-                        "-f",
-                        "/var/lib/hyperpixel2r-kms/tryboot-state",
-                    ])
-                    .map_err(|_| BackendFailure::OperationFailed)?;
-                    self.run_remote_check(command)
+                    self.verify_staged_driver_transaction()
                 }
             }
-            InstallPhase::TrybootVerified | InstallPhase::DriverAccepted => {
+            InstallPhase::TrybootVerified => {
                 self.ensure_driver_tool()?;
                 if self
                     .persisted_target_phase
                     .borrow()
                     .is_some_and(|phase| phase >= InstallPhase::FinalRebooted)
                 {
+                    self.ensure_driver_tool()?;
                     self.driver_tool
                         .borrow()
                         .as_ref()
@@ -733,6 +882,7 @@ impl InstallBackend for SystemInstallBackend {
                         .or(Ok(false))
                 }
             }
+            InstallPhase::DriverAccepted => self.verify_committed_driver(),
             InstallPhase::ApplicationInstalled => self.verify_installed_application(request),
             InstallPhase::HostnameChanged => {
                 let desired = self.desired_target(&request.desired_hostname)?;
@@ -798,7 +948,10 @@ fn run_driver(command: DriverCommand) -> Result<(), Box<dyn std::error::Error>> 
 #[cfg(test)]
 mod tests {
     use super::{
-        final_reboot_command, hostname_command, target_install_command, tryboot_reboot_command,
+        ArtifactIdentity, BackendFailure, InstallPhase, InstallState, TargetIdentity,
+        TransportError, committed_driver_command, deploy_helper_command, final_reboot_command,
+        hostname_command, resume_state_matches, staged_driver_transaction_command,
+        target_install_command, tryboot_reboot_command, tryboot_wait_failure,
     };
 
     #[test]
@@ -820,29 +973,147 @@ mod tests {
     }
 
     #[test]
-    fn production_adapter_invokes_the_versioned_helper_with_exact_machine_arguments() {
-        let helper = "/var/tmp/planeradar-installer-0123456789ab";
-        let command = target_install_command(
-            helper,
-            "/var/tmp/planeradar-installer-0123456789ab.sha256",
-            "/var/tmp/planeradar-installer-0123456789ab.revision",
+    fn tryboot_timeout_requires_an_observed_disconnect() {
+        assert_eq!(
+            tryboot_wait_failure(TransportError::ReconnectTimedOut),
+            BackendFailure::TrybootTimedOut
+        );
+        assert_eq!(
+            tryboot_wait_failure(TransportError::NeverDisconnected),
+            BackendFailure::OperationFailed
+        );
+        assert_eq!(
+            tryboot_wait_failure(TransportError::CommandFailed),
+            BackendFailure::OperationFailed
+        );
+    }
+
+    #[test]
+    fn fresh_process_hostname_resume_requires_the_persisted_exact_identity_and_artifacts() {
+        let target = TargetIdentity {
+            host_key_sha256: "SHA256:8R2K6pFDwIKY2fWb/4mMxwAA7PY8VYyLmWucTx7D99A".into(),
+            model: "Raspberry Pi Zero 2 W Rev 1.0".into(),
+            serial: "10000000abcdef01".into(),
+        };
+        let application = ArtifactIdentity {
+            version: "1.2.3".into(),
+            source_commit: "1".repeat(40),
+            sha256: "2".repeat(64),
+        };
+        let driver = ArtifactIdentity {
+            version: "1.2.3".into(),
+            source_commit: "3".repeat(40),
+            sha256: "4".repeat(64),
+        };
+        let resumed = InstallState {
+            schema_version: 1,
+            target: target.clone(),
+            phase: InstallPhase::HostnameChanged,
+            application: Some(application.clone()),
+            driver: Some(driver.clone()),
+        };
+
+        assert!(resume_state_matches(
+            &resumed,
+            &target,
+            &application,
+            &driver
+        ));
+        let mut wrong_identity = target.clone();
+        wrong_identity.serial = "10000000abcdef02".into();
+        assert!(!resume_state_matches(
+            &resumed,
+            &wrong_identity,
+            &application,
+            &driver
+        ));
+        let mut too_early = resumed;
+        too_early.phase = InstallPhase::ApplicationInstalled;
+        assert!(!resume_state_matches(
+            &too_early,
+            &target,
+            &application,
+            &driver
+        ));
+    }
+
+    #[test]
+    fn driver_postconditions_are_bound_to_exact_transaction_and_committed_identity() {
+        let command = staged_driver_transaction_command(
+            "0.1.0",
+            "f6213007a8e780309e34b220351fc229e3c7d554",
+            "6.12.47+rpt-rpi-v8",
+            "hyperpixel2r-kms-f6213007a8e7.dtbo",
         )
-        .expect("target install command");
+        .expect("staged transaction command");
+        assert!(command.is_interactive_sudo());
+        assert_eq!(
+            &command.arguments()[4..],
+            [
+                "planeradar-driver-transaction",
+                "0.1.0",
+                "f6213007a8e780309e34b220351fc229e3c7d554",
+                "6.12.47+rpt-rpi-v8",
+                "hyperpixel2r-kms-f6213007a8e7.dtbo",
+            ]
+        );
+
+        let committed =
+            committed_driver_command("hyperpixel2r-kms-f6213007a8e7.dtbo").expect("committed");
+        assert!(committed.is_interactive_sudo());
+        assert_eq!(
+            &committed.arguments()[4..],
+            [
+                "planeradar-driver-committed",
+                "hyperpixel2r-kms-f6213007a8e7.dtbo",
+            ]
+        );
+    }
+
+    #[test]
+    fn production_adapter_invokes_the_versioned_helper_with_exact_machine_arguments() {
+        let digest = "2".repeat(64);
+        let helper = format!("/var/lib/planeradar-installer/helpers/{digest}/planeradar");
+        let checksum = format!("{helper}.sha256");
+        let revision = format!("{helper}.revision");
+        let command =
+            target_install_command(&helper, &checksum, &revision).expect("target install command");
 
         assert!(command.is_interactive_sudo());
         assert_eq!(
             command.arguments(),
             [
                 "sudo",
-                helper,
+                helper.as_str(),
                 "install",
                 "--artifact",
-                helper,
+                helper.as_str(),
                 "--checksum-file",
-                "/var/tmp/planeradar-installer-0123456789ab.sha256",
+                checksum.as_str(),
                 "--revision-file",
-                "/var/tmp/planeradar-installer-0123456789ab.revision",
+                revision.as_str(),
                 "--json",
+            ]
+        );
+
+        let revision_identity = "1".repeat(40);
+        let deploy = deploy_helper_command(
+            "/var/tmp/planeradar-upload.ABCDEF1234/payload",
+            &helper,
+            &digest,
+            &revision_identity,
+        )
+        .expect("deployment command");
+        assert!(deploy.is_interactive_sudo());
+        assert_eq!(deploy.arguments()[0..3], ["sudo", "sh", "-c"]);
+        assert_eq!(
+            &deploy.arguments()[4..],
+            [
+                "planeradar-helper-deploy",
+                "/var/tmp/planeradar-upload.ABCDEF1234/payload",
+                helper.as_str(),
+                digest.as_str(),
+                revision_identity.as_str(),
             ]
         );
     }

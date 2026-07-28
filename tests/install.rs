@@ -247,6 +247,29 @@ fn installer_verifies_then_installs_once_and_is_idempotent() {
             .expect("installed service"),
         PLANERADAR_SERVICE
     );
+    assert_eq!(
+        first
+            .owned_files
+            .iter()
+            .map(|file| file.target_path.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "/opt/planeradar/bin/planeradar",
+            "/opt/planeradar/REVISION",
+            "/opt/planeradar/SHA256",
+            "/etc/systemd/system/planeradar.service",
+        ]
+    );
+    for owned in &first.owned_files {
+        let installed_path = fixture.root.join(owned.target_path.trim_start_matches('/'));
+        assert_eq!(
+            owned.sha256,
+            format!(
+                "{:x}",
+                Sha256::digest(fs::read(installed_path).expect("read owned file"))
+            )
+        );
+    }
     let boot = fs::read_to_string(&fixture.boot_config).expect("updated boot config");
     assert_eq!(
         boot.matches("dtoverlay=vc4-kms-dpi-hyperpixel2r").count(),
@@ -293,6 +316,10 @@ fn installer_verifies_then_installs_once_and_is_idempotent() {
     }));
     assert!(first_commands.iter().any(|(program, args)| {
         program == "useradd" && args.last().map(String::as_str) == Some("planeradar")
+    }));
+    assert!(!first_commands.iter().any(|(_, args)| {
+        args.iter()
+            .any(|argument| argument.contains("planeradar-installer"))
     }));
     assert!(first_commands.contains(&(
         "usermod".into(),
@@ -732,11 +759,15 @@ fn target_install_result_machine_json_has_the_exact_public_schema() {
         reboot_required: false,
         revision: "0123456789abcdef0123456789abcdef01234567".into(),
         sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+        owned_files: vec![planeradar::install::InstalledFile {
+            target_path: "/opt/planeradar/bin/planeradar".into(),
+            sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+        }],
     };
 
     assert_eq!(
         result.to_json().expect("machine JSON"),
-        r#"{"schema_version":1,"files_changed":true,"boot_config_changed":false,"reboot_required":false,"revision":"0123456789abcdef0123456789abcdef01234567","sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}"#
+        r#"{"schema_version":1,"files_changed":true,"boot_config_changed":false,"reboot_required":false,"revision":"0123456789abcdef0123456789abcdef01234567","sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","owned_files":[{"target_path":"/opt/planeradar/bin/planeradar","sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}]}"#
     );
 }
 
@@ -749,6 +780,7 @@ fn target_install_result_refuses_invalid_machine_identity_fields() {
             files_changed: false,
             boot_config_changed: false,
             reboot_required: false,
+            owned_files: vec![],
         },
         InstallResult {
             revision: "1".repeat(40),
@@ -756,6 +788,7 @@ fn target_install_result_refuses_invalid_machine_identity_fields() {
             files_changed: false,
             boot_config_changed: false,
             reboot_required: false,
+            owned_files: vec![],
         },
     ] {
         assert!(result.to_json().is_err());
@@ -767,8 +800,9 @@ fn target_installer_state_helper_round_trips_strict_json_atomically() {
     let directory = tempfile::tempdir().expect("temporary state directory");
     let path = directory
         .path()
-        .join("planeradar")
-        .join("installer")
+        .canonicalize()
+        .expect("canonical temporary directory")
+        .join("planeradar-installer")
         .join("state.json");
     let json = r#"{"schema_version":1,"hardware":{"model":"Raspberry Pi Zero 2 W Rev 1.0","serial":"0123456789abcdef"},"application":{"version":"1.2.3","source_commit":"1111111111111111111111111111111111111111","sha256":"2222222222222222222222222222222222222222222222222222222222222222"},"driver":null,"owned_files":[],"last_verified_phase":"application_acquired"}"#;
 
@@ -782,7 +816,12 @@ fn target_installer_state_helper_round_trips_strict_json_atomically() {
 #[test]
 fn target_installer_state_helper_reports_absent_state_as_exact_null() {
     let directory = tempfile::tempdir().expect("temporary state directory");
-    let path = directory.path().join("missing").join("state.json");
+    let path = directory
+        .path()
+        .canonicalize()
+        .expect("canonical temporary directory")
+        .join("missing")
+        .join("state.json");
 
     assert_eq!(
         read_optional_installer_state_json(&path).expect("optional state"),
@@ -793,12 +832,21 @@ fn target_installer_state_helper_reports_absent_state_as_exact_null() {
 #[test]
 fn target_installer_state_helper_rejects_hostile_json_and_unsafe_final_paths() {
     let directory = tempfile::tempdir().expect("temporary state directory");
-    let path = directory.path().join("state.json");
+    let root = directory
+        .path()
+        .canonicalize()
+        .expect("canonical temporary directory");
+    let private = root.join("planeradar-installer");
+    fs::create_dir(&private).expect("private state directory");
+    fs::set_permissions(&private, fs::Permissions::from_mode(0o700)).expect("private permissions");
+    let path = private.join("state.json");
     let valid = r#"{"schema_version":1,"hardware":{"model":"Raspberry Pi Zero 2 W","serial":"0123456789abcdef"},"application":null,"driver":null,"owned_files":[],"last_verified_phase":"discovered"}"#;
     let hostile = [
         "{}",
         r#"{"schema_version":2,"hardware":{"model":"Raspberry Pi Zero 2 W","serial":"0123456789abcdef"},"application":null,"driver":null,"owned_files":[],"last_verified_phase":"discovered"}"#,
         r#"{"schema_version":1,"hardware":{"model":"Raspberry Pi Zero 2 W","serial":"0123456789abcdef"},"application":null,"driver":null,"owned_files":[],"last_verified_phase":"unknown"}"#,
+        r#"{"schema_version":1,"hardware":{"model":"Raspberry Pi Zero 2 W","serial":"0123456789abcdef"},"application":null,"driver":null,"owned_files":[],"last_verified_phase":"complete"}"#,
+        r#"{"schema_version":1,"hardware":{"model":"Raspberry Pi Zero 2 W","serial":"0123456789abcdef"},"application":{"version":"1.2.3","source_commit":"1111111111111111111111111111111111111111","sha256":"2222222222222222222222222222222222222222222222222222222222222222"},"driver":null,"owned_files":[],"last_verified_phase":"discovered"}"#,
         &format!("{valid}\n{{}}"),
         &format!("{valid}\npartial"),
     ];
@@ -812,4 +860,28 @@ fn target_installer_state_helper_rejects_hostile_json_and_unsafe_final_paths() {
     symlink(&outside, &path).expect("state symlink");
     assert!(write_installer_state_json(&path, valid.as_bytes()).is_err());
     assert_eq!(fs::read(&outside).expect("outside unchanged"), b"sentinel");
+}
+
+#[test]
+fn target_installer_state_rejects_non_private_or_symlinked_state_directories() {
+    let directory = tempfile::tempdir().expect("temporary state directory");
+    let root = directory
+        .path()
+        .canonicalize()
+        .expect("canonical temporary directory");
+    let valid = r#"{"schema_version":1,"hardware":{"model":"Raspberry Pi Zero 2 W","serial":"0123456789abcdef"},"application":null,"driver":null,"owned_files":[],"last_verified_phase":"discovered"}"#;
+
+    let permissive = root.join("permissive");
+    fs::create_dir(&permissive).expect("permissive directory");
+    fs::set_permissions(&permissive, fs::Permissions::from_mode(0o755))
+        .expect("permissive permissions");
+    assert!(write_installer_state_json(&permissive.join("state.json"), valid.as_bytes()).is_err());
+
+    let outside = root.join("outside-state");
+    fs::create_dir(&outside).expect("outside directory");
+    fs::set_permissions(&outside, fs::Permissions::from_mode(0o700)).expect("outside permissions");
+    let linked = root.join("linked-state");
+    symlink(&outside, &linked).expect("linked state directory");
+    assert!(write_installer_state_json(&linked.join("state.json"), valid.as_bytes()).is_err());
+    assert!(!outside.join("state.json").exists());
 }

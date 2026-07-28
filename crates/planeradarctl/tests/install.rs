@@ -15,6 +15,7 @@ use planeradarctl::state::{
     StateStore, TargetHardwareIdentity, TargetInstallState, TargetStateStore,
 };
 use planeradarctl::target::TargetIdentity;
+use sha2::{Digest, Sha256};
 
 #[derive(Clone, Default)]
 struct MemoryStateStore {
@@ -99,6 +100,7 @@ impl TargetStateStore for ScriptedBackend {
     }
 
     fn save_target_state(&self, state: &TargetInstallState) -> Result<(), StateError> {
+        state.to_json()?;
         self.state.borrow_mut().target_state = Some(state.clone());
         Ok(())
     }
@@ -151,6 +153,7 @@ impl InstallBackend for ScriptedBackend {
             reboot_required: false,
             revision: request.application.source_commit.clone(),
             sha256: request.application.sha256.clone(),
+            owned_files: expected_owned_files(&request.application),
         })
     }
 
@@ -265,9 +268,28 @@ fn expected_target_state(phase: InstallPhase) -> TargetInstallState {
         },
         application: state.application,
         driver: state.driver,
-        owned_files: vec![],
+        owned_files: if phase >= InstallPhase::ApplicationInstalled {
+            expected_owned_files(&application())
+        } else {
+            vec![]
+        },
         last_verified_phase: phase,
     }
+}
+
+fn expected_owned_files(application: &ArtifactIdentity) -> Vec<OwnedFile> {
+    [
+        ("/opt/planeradar/bin/planeradar", application.sha256.clone()),
+        ("/opt/planeradar/REVISION", "7".repeat(64)),
+        ("/opt/planeradar/SHA256", "8".repeat(64)),
+        ("/etc/systemd/system/planeradar.service", "9".repeat(64)),
+    ]
+    .into_iter()
+    .map(|(target_path, sha256)| OwnedFile {
+        target_path: target_path.into(),
+        sha256,
+    })
+    .collect()
 }
 
 fn assert_records_agree(store: &MemoryStateStore, backend: &ScriptedBackend, phase: InstallPhase) {
@@ -639,7 +661,13 @@ fn target_install_json_is_strict_complete_and_contains_no_local_data() {
         "boot_config_changed": false,
         "reboot_required": false,
         "revision": "0123456789abcdef0123456789abcdef01234567",
-        "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        "owned_files": [
+            {"target_path": "/opt/planeradar/bin/planeradar", "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},
+            {"target_path": "/opt/planeradar/REVISION", "sha256": "7777777777777777777777777777777777777777777777777777777777777777"},
+            {"target_path": "/opt/planeradar/SHA256", "sha256": "8888888888888888888888888888888888888888888888888888888888888888"},
+            {"target_path": "/etc/systemd/system/planeradar.service", "sha256": "9999999999999999999999999999999999999999999999999999999999999999"}
+        ]
     }"#;
 
     let parsed = TargetInstallResult::from_json(json).expect("valid result");
@@ -653,6 +681,7 @@ fn target_install_json_is_strict_complete_and_contains_no_local_data() {
         parsed.sha256,
         "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
     );
+    assert_eq!(parsed.owned_files.len(), 4);
     let encoded = parsed.to_json().expect("serialize");
     assert!(!encoded.contains("/Users/"));
     assert!(!encoded.contains("password"));
@@ -710,6 +739,21 @@ fn target_state_owned_files_survive_phase_persistence() {
     );
 }
 
+#[test]
+fn first_install_persists_the_exact_owned_files_returned_by_the_target() {
+    let backend = ScriptedBackend::default();
+    let store = MemoryStateStore::default();
+
+    Installer::new(&backend, &store)
+        .run(request())
+        .expect("fresh install");
+
+    assert_eq!(
+        backend.target_state().expect("target state").owned_files,
+        expected_owned_files(&request().application)
+    );
+}
+
 fn application_archive(members: &[(&str, &[u8], u32, u64, u64, u64, tar::EntryType)]) -> Vec<u8> {
     let mut tar_bytes = Vec::new();
     {
@@ -762,6 +806,13 @@ fn application_archive_with_raw_name(raw_name: &[u8]) -> Vec<u8> {
     zstd::stream::encode_all(Cursor::new(tar_bytes), 3).expect("compress raw archive")
 }
 
+fn archive_digest(path: &std::path::Path) -> String {
+    format!(
+        "{:x}",
+        Sha256::digest(fs::read(path).expect("read archive for test digest"))
+    )
+}
+
 #[test]
 fn application_archive_extracts_only_the_normalized_root_executable() {
     let temporary = tempfile::tempdir().expect("temporary");
@@ -780,8 +831,12 @@ fn application_archive_extracts_only_the_normalized_root_executable() {
     )
     .expect("write archive");
 
-    let payload = extract_application_payload(&archive, &temporary.path().join("cache"))
-        .expect("extract payload");
+    let payload = extract_application_payload(
+        &archive,
+        &archive_digest(&archive),
+        &temporary.path().join("cache"),
+    )
+    .expect("extract payload");
 
     assert_eq!(
         fs::read(payload.path()).expect("payload bytes"),
@@ -872,7 +927,12 @@ fn application_archive_rejects_hostile_members_and_metadata() {
         let archive = temporary.path().join(format!("hostile-{index}.tar.zst"));
         fs::write(&archive, bytes).expect("write hostile archive");
         assert!(
-            extract_application_payload(&archive, &temporary.path().join("cache")).is_err(),
+            extract_application_payload(
+                &archive,
+                &archive_digest(&archive),
+                &temporary.path().join("cache")
+            )
+            .is_err(),
             "hostile case {index} was accepted"
         );
     }
@@ -895,10 +955,68 @@ fn application_archive_rejects_symlink_inputs_and_concatenated_archives() {
 
     let linked = temporary.path().join("linked.tar.zst");
     std::os::unix::fs::symlink(&archive, &linked).expect("archive symlink");
-    assert!(extract_application_payload(&linked, &temporary.path().join("cache")).is_err());
+    assert!(
+        extract_application_payload(
+            &linked,
+            &archive_digest(&archive),
+            &temporary.path().join("cache")
+        )
+        .is_err()
+    );
 
     let concatenated = temporary.path().join("concatenated.tar.zst");
     fs::write(&concatenated, [bytes.as_slice(), bytes.as_slice()].concat())
         .expect("concatenated archive");
-    assert!(extract_application_payload(&concatenated, &temporary.path().join("cache")).is_err());
+    assert!(
+        extract_application_payload(
+            &concatenated,
+            &archive_digest(&concatenated),
+            &temporary.path().join("cache")
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn application_archive_is_bound_to_the_manifest_digest_and_total_expansion() {
+    let temporary = tempfile::tempdir().expect("temporary");
+    let archive = temporary.path().join("application.tar.zst");
+    fs::write(
+        &archive,
+        application_archive(&[(
+            "planeradar",
+            b"payload",
+            0o755,
+            0,
+            0,
+            0,
+            tar::EntryType::Regular,
+        )]),
+    )
+    .expect("write archive");
+
+    assert!(
+        extract_application_payload(
+            &archive,
+            &"0".repeat(64),
+            &temporary.path().join("digest-cache")
+        )
+        .is_err()
+    );
+
+    let expansion = temporary.path().join("expansion.tar.zst");
+    let oversized = vec![0_u8; 66 * 1024 * 1024 + 1];
+    fs::write(
+        &expansion,
+        zstd::stream::encode_all(Cursor::new(oversized), 3).expect("compress expansion"),
+    )
+    .expect("write expansion");
+    assert!(
+        extract_application_payload(
+            &expansion,
+            &archive_digest(&expansion),
+            &temporary.path().join("expansion-cache")
+        )
+        .is_err()
+    );
 }

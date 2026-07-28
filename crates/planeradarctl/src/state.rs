@@ -15,7 +15,7 @@ use thiserror::Error;
 use crate::target::TargetIdentity;
 
 pub const STATE_SCHEMA_VERSION: u32 = 1;
-pub const TARGET_STATE_PATH: &str = "/var/lib/planeradar/installer/state.json";
+pub const TARGET_STATE_PATH: &str = "/var/lib/planeradar-installer/state.json";
 pub const TARGET_STATE_OWNER: &str = "root";
 pub const TARGET_STATE_FILE_MODE: u32 = 0o600;
 
@@ -155,6 +155,7 @@ impl InstallState {
             .map(validate_artifact)
             .transpose()?;
         self.driver.as_ref().map(validate_artifact).transpose()?;
+        validate_phase_artifacts(self.phase, &self.application, &self.driver)?;
         Ok(())
     }
 }
@@ -239,11 +240,31 @@ impl TargetInstallState {
             .map(validate_artifact)
             .transpose()?;
         self.driver.as_ref().map(validate_artifact).transpose()?;
+        validate_phase_artifacts(self.last_verified_phase, &self.application, &self.driver)?;
         for owned_file in &self.owned_files {
             validate_owned_file(owned_file)?;
         }
+        if (self.last_verified_phase >= InstallPhase::ApplicationInstalled)
+            != !self.owned_files.is_empty()
+        {
+            return Err("owned files do not match persisted phase");
+        }
         Ok(())
     }
+}
+
+fn validate_phase_artifacts(
+    phase: InstallPhase,
+    application: &Option<ArtifactIdentity>,
+    driver: &Option<ArtifactIdentity>,
+) -> Result<(), &'static str> {
+    if (phase >= InstallPhase::ApplicationAcquired) != application.is_some() {
+        return Err("application identity does not match persisted phase");
+    }
+    if (phase >= InstallPhase::DriverReady) != driver.is_some() {
+        return Err("driver identity does not match persisted phase");
+    }
+    Ok(())
 }
 
 /// A durable state store bound to one expected target identity.

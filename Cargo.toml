@@ -19,7 +19,7 @@ fontdue = "0.9"
 log = "0.4"
 libc = "0.2"
 env_logger = "0.11"
-nix = { version = "0.30", features = ["net", "signal"] }
+nix = { version = "0.30", features = ["fs", "net", "signal"] }
 png = "0.18"
 qrcode = "0.14"
 rand = "0.9"

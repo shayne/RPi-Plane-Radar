@@ -1446,6 +1446,22 @@ impl<R> DriverTool<R> {
             expected_overlay_file,
         })
     }
+
+    pub fn driver_version(&self) -> &str {
+        &self.driver_version
+    }
+
+    pub fn source_revision(&self) -> &str {
+        &self.source_revision
+    }
+
+    pub fn kernel_release(&self) -> &str {
+        &self.context.kernel_release
+    }
+
+    pub fn expected_overlay_file(&self) -> &str {
+        &self.expected_overlay_file
+    }
 }
 
 impl<R: CommandRunner> DriverTool<R> {

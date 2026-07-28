@@ -17,6 +17,7 @@ use crate::target::TargetIdentity;
 const MAX_TARGET_INSTALL_JSON_BYTES: usize = 4 * 1024;
 const MAX_APPLICATION_ARCHIVE_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_APPLICATION_PAYLOAD_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_APPLICATION_EXPANDED_BYTES: u64 = MAX_APPLICATION_PAYLOAD_BYTES + 2 * 1024 * 1024;
 
 pub const TRYBOOT_TIMEOUT_GUIDANCE: &str = "The one-shot tryboot did not return. The target will fall back to the normal boot on its next power cycle; the staged transaction remains available to doctor, rollback, or a resumed install.";
 
@@ -54,6 +55,7 @@ impl ApplicationPayload {
 
 pub fn extract_application_payload(
     archive_path: &Path,
+    expected_archive_sha256: &str,
     private_cache_root: &Path,
 ) -> Result<ApplicationPayload, ApplicationArchiveError> {
     let archive_metadata = fs::symlink_metadata(archive_path)?;
@@ -91,15 +93,47 @@ pub fn extract_application_payload(
 
     let mut archive_options = OpenOptions::new();
     archive_options.read(true).custom_flags(libc::O_NOFOLLOW);
-    let archive_file = archive_options.open(archive_path)?;
+    let mut archive_file = archive_options.open(archive_path)?;
     let opened_metadata = archive_file.metadata()?;
     if !opened_metadata.is_file() || opened_metadata.len() != archive_metadata.len() {
         return Err(ApplicationArchiveError::InvalidArchive);
     }
-    let decoder = zstd::stream::read::Decoder::new(archive_file)
+    let mut compressed = Vec::with_capacity(opened_metadata.len() as usize);
+    Read::by_ref(&mut archive_file)
+        .take(MAX_APPLICATION_ARCHIVE_BYTES + 1)
+        .read_to_end(&mut compressed)?;
+    if compressed.len() as u64 != opened_metadata.len()
+        || compressed.len() as u64 > MAX_APPLICATION_ARCHIVE_BYTES
+        || expected_archive_sha256.len() != 64
+        || !expected_archive_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        || format!("{:x}", Sha256::digest(&compressed)) != expected_archive_sha256
+    {
+        return Err(ApplicationArchiveError::InvalidArchive);
+    }
+
+    let mut decoder = zstd::stream::read::Decoder::new(io::Cursor::new(compressed.as_slice()))
+        .map_err(|_| ApplicationArchiveError::InvalidArchive)?
+        .single_frame();
+    let mut expanded = Vec::new();
+    Read::by_ref(&mut decoder)
+        .take(MAX_APPLICATION_EXPANDED_BYTES + 1)
+        .read_to_end(&mut expanded)
         .map_err(|_| ApplicationArchiveError::InvalidArchive)?;
-    let mut archive = tar::Archive::new(decoder);
-    archive.set_ignore_zeros(true);
+    if expanded.len() as u64 > MAX_APPLICATION_EXPANDED_BYTES {
+        return Err(ApplicationArchiveError::InvalidArchive);
+    }
+    let buffered = decoder.finish();
+    let consumed = buffered
+        .get_ref()
+        .position()
+        .saturating_sub(buffered.buffer().len() as u64);
+    if consumed != compressed.len() as u64 {
+        return Err(ApplicationArchiveError::InvalidArchive);
+    }
+
+    let mut archive = tar::Archive::new(io::Cursor::new(expanded.as_slice()));
     let mut entries = archive
         .entries()
         .map_err(|_| ApplicationArchiveError::InvalidArchive)?;
@@ -149,6 +183,11 @@ pub fn extract_application_payload(
     drop(entry);
     if entries.next().is_some() {
         return Err(ApplicationArchiveError::InvalidMember);
+    }
+    drop(entries);
+    let decoded_position = archive.into_inner().position() as usize;
+    if expanded[decoded_position..].iter().any(|byte| *byte != 0) {
+        return Err(ApplicationArchiveError::InvalidArchive);
     }
     output.sync_all()?;
     drop(output);
@@ -274,8 +313,8 @@ impl<'a, B: InstallBackend, S: StateStore> Installer<'a, B, S> {
     pub fn run(&self, request: InstallRequest) -> Result<InstallOutcome, InstallError> {
         let mac_state = self.state_store.load()?;
         let target_state = self.backend.load_target_state()?;
-        let (mut state, owned_files) = match (mac_state, target_state) {
-            (None, None) => return self.run_first_pass(request),
+        let (mut state, mut owned_files) = match (mac_state, target_state) {
+            (None, None) => return self.run_from_phase(None, vec![], 0, &request),
             (Some(mac), None) if mac.phase <= InstallPhase::PreflightPassed => (mac, vec![]),
             (Some(mac), Some(target)) if records_agree(&mac, &target, &request) => {
                 (mac, target.owned_files)
@@ -321,11 +360,15 @@ impl<'a, B: InstallBackend, S: StateStore> Installer<'a, B, S> {
             match previous_phase(drifted) {
                 Some(previous) => {
                     state = state_at_phase(&state, previous, &request);
+                    if previous < InstallPhase::ApplicationInstalled {
+                        owned_files.clear();
+                    }
                     self.persist(&state, &owned_files)?;
                     phase_index(drifted)
                 }
                 None => {
-                    return self.run_from_phase(None, &owned_files, 0, &request);
+                    owned_files.clear();
+                    return self.run_from_phase(None, owned_files, 0, &request);
                 }
             }
         } else if state.phase == InstallPhase::Complete {
@@ -334,13 +377,13 @@ impl<'a, B: InstallBackend, S: StateStore> Installer<'a, B, S> {
             phase_index(state.phase) + 1
         };
 
-        self.run_from_phase(Some(state), &owned_files, start, &request)
+        self.run_from_phase(Some(state), owned_files, start, &request)
     }
 
     fn run_from_phase(
         &self,
         mut state: Option<InstallState>,
-        owned_files: &[crate::state::OwnedFile],
+        mut owned_files: Vec<crate::state::OwnedFile>,
         start: usize,
         request: &InstallRequest,
     ) -> Result<InstallOutcome, InstallError> {
@@ -349,14 +392,14 @@ impl<'a, B: InstallBackend, S: StateStore> Installer<'a, B, S> {
                 .as_ref()
                 .map(|state| state.phase)
                 .unwrap_or(InstallPhase::Discovered);
-            let candidate = match self.perform_phase(phase, state.as_ref(), request) {
-                Ok(candidate) => candidate,
+            let performed = match self.perform_phase(phase, state.as_ref(), request) {
+                Ok(performed) => performed,
                 Err(ActionError::Backend(failure)) => {
                     return Ok(interrupted(durable_phase, failure));
                 }
                 Err(ActionError::Install(error)) => return Err(error),
             };
-            match self.backend.verify_phase(phase, request, &candidate) {
+            match self.backend.verify_phase(phase, request, &performed.state) {
                 Ok(PhaseVerification::Valid) => {}
                 Ok(PhaseVerification::Drifted) => {
                     return Ok(InstallOutcome::Interrupted {
@@ -367,11 +410,14 @@ impl<'a, B: InstallBackend, S: StateStore> Installer<'a, B, S> {
                 }
                 Err(failure) => return Ok(interrupted(durable_phase, failure)),
             }
-            self.persist(&candidate, owned_files)?;
+            if let Some(installed_owned_files) = performed.owned_files {
+                owned_files = installed_owned_files;
+            }
+            self.persist(&performed.state, &owned_files)?;
             if let Err(failure) = self.backend.emit_status(status(phase)) {
                 return Ok(interrupted(phase, failure));
             }
-            state = Some(candidate);
+            state = Some(performed.state);
         }
         Ok(InstallOutcome::Complete)
     }
@@ -381,7 +427,7 @@ impl<'a, B: InstallBackend, S: StateStore> Installer<'a, B, S> {
         phase: InstallPhase,
         state: Option<&InstallState>,
         request: &InstallRequest,
-    ) -> Result<InstallState, ActionError> {
+    ) -> Result<PerformedPhase, ActionError> {
         let mut next = match state {
             Some(state) => state.clone(),
             None => InstallState {
@@ -392,6 +438,7 @@ impl<'a, B: InstallBackend, S: StateStore> Installer<'a, B, S> {
                 driver: None,
             },
         };
+        let mut owned_files = None;
         match phase {
             InstallPhase::Discovered => {
                 let observed = self
@@ -461,6 +508,7 @@ impl<'a, B: InstallBackend, S: StateStore> Installer<'a, B, S> {
                         InstallError::ArtifactIdentityMismatch { phase },
                     ));
                 }
+                owned_files = Some(installed.owned_files);
             }
             InstallPhase::HostnameChanged => self
                 .backend
@@ -477,398 +525,10 @@ impl<'a, B: InstallBackend, S: StateStore> Installer<'a, B, S> {
             InstallPhase::Complete => self.backend.finish(request).map_err(ActionError::Backend)?,
         }
         next.phase = phase;
-        Ok(next)
-    }
-
-    fn run_first_pass(&self, request: InstallRequest) -> Result<InstallOutcome, InstallError> {
-        let mac_state = self.state_store.load()?;
-        let target_state = self.backend.load_target_state()?;
-        match (mac_state, target_state) {
-            (None, None) => {}
-            (Some(mac), Some(target)) if records_agree(&mac, &target, &request) => {
-                return Ok(InstallOutcome::AlreadyComplete);
-            }
-            _ => return Err(InstallError::StateDisagreement),
-        }
-
-        let observed = match self.backend.discover(&request) {
-            Ok(observed) => observed,
-            Err(failure) => return Ok(interrupted(InstallPhase::Discovered, failure)),
-        };
-        if observed != request.target {
-            return Err(InstallError::DiscoveredIdentityMismatch);
-        }
-        let state = InstallState {
-            schema_version: STATE_SCHEMA_VERSION,
-            target: observed,
-            phase: InstallPhase::Discovered,
-            application: None,
-            driver: None,
-        };
-        match self
-            .backend
-            .verify_phase(InstallPhase::Discovered, &request, &state)
-        {
-            Ok(PhaseVerification::Valid) => {}
-            Ok(PhaseVerification::Drifted) => {
-                return Ok(InstallOutcome::Interrupted {
-                    phase: InstallPhase::Discovered,
-                    reason: InterruptionReason::PostconditionFailed(InstallPhase::Discovered),
-                    guidance: None,
-                });
-            }
-            Err(failure) => return Ok(interrupted(InstallPhase::Discovered, failure)),
-        }
-        self.persist(&state, &[])?;
-        if let Err(failure) = self.backend.emit_status(status(InstallPhase::Discovered)) {
-            return Ok(interrupted(InstallPhase::Discovered, failure));
-        }
-
-        if let Err(failure) = self.backend.run_preflight(&request) {
-            return Ok(interrupted(InstallPhase::Discovered, failure));
-        }
-        let state = InstallState {
-            phase: InstallPhase::PreflightPassed,
-            ..state
-        };
-        match self
-            .backend
-            .verify_phase(InstallPhase::PreflightPassed, &request, &state)
-        {
-            Ok(PhaseVerification::Valid) => {}
-            Ok(PhaseVerification::Drifted) => {
-                return Ok(InstallOutcome::Interrupted {
-                    phase: InstallPhase::Discovered,
-                    reason: InterruptionReason::PostconditionFailed(InstallPhase::PreflightPassed),
-                    guidance: None,
-                });
-            }
-            Err(failure) => return Ok(interrupted(InstallPhase::Discovered, failure)),
-        }
-        self.persist(&state, &[])?;
-        if let Err(failure) = self
-            .backend
-            .emit_status(status(InstallPhase::PreflightPassed))
-        {
-            return Ok(interrupted(InstallPhase::PreflightPassed, failure));
-        }
-
-        let acquired = match self.backend.acquire_application(&request) {
-            Ok(acquired) => acquired,
-            Err(failure) => return Ok(interrupted(InstallPhase::PreflightPassed, failure)),
-        };
-        if acquired != request.application {
-            return Err(InstallError::ArtifactIdentityMismatch {
-                phase: InstallPhase::ApplicationAcquired,
-            });
-        }
-        let state = InstallState {
-            phase: InstallPhase::ApplicationAcquired,
-            application: Some(acquired),
-            ..state
-        };
-        match self
-            .backend
-            .verify_phase(InstallPhase::ApplicationAcquired, &request, &state)
-        {
-            Ok(PhaseVerification::Valid) => {}
-            Ok(PhaseVerification::Drifted) => {
-                return Ok(InstallOutcome::Interrupted {
-                    phase: InstallPhase::PreflightPassed,
-                    reason: InterruptionReason::PostconditionFailed(
-                        InstallPhase::ApplicationAcquired,
-                    ),
-                    guidance: None,
-                });
-            }
-            Err(failure) => return Ok(interrupted(InstallPhase::PreflightPassed, failure)),
-        }
-        self.persist(&state, &[])?;
-        if let Err(failure) = self
-            .backend
-            .emit_status(status(InstallPhase::ApplicationAcquired))
-        {
-            return Ok(interrupted(InstallPhase::ApplicationAcquired, failure));
-        }
-
-        let prepared = match self.backend.prepare_driver(&request) {
-            Ok(prepared) => prepared,
-            Err(failure) => return Ok(interrupted(InstallPhase::ApplicationAcquired, failure)),
-        };
-        if prepared != request.driver {
-            return Err(InstallError::ArtifactIdentityMismatch {
-                phase: InstallPhase::DriverReady,
-            });
-        }
-        let state = InstallState {
-            phase: InstallPhase::DriverReady,
-            driver: Some(prepared),
-            ..state
-        };
-        match self
-            .backend
-            .verify_phase(InstallPhase::DriverReady, &request, &state)
-        {
-            Ok(PhaseVerification::Valid) => {}
-            Ok(PhaseVerification::Drifted) => {
-                return Ok(InstallOutcome::Interrupted {
-                    phase: InstallPhase::ApplicationAcquired,
-                    reason: InterruptionReason::PostconditionFailed(InstallPhase::DriverReady),
-                    guidance: None,
-                });
-            }
-            Err(failure) => return Ok(interrupted(InstallPhase::ApplicationAcquired, failure)),
-        }
-        self.persist(&state, &[])?;
-        if let Err(failure) = self.backend.emit_status(status(InstallPhase::DriverReady)) {
-            return Ok(interrupted(InstallPhase::DriverReady, failure));
-        }
-
-        if let Err(failure) = self.backend.stage_tryboot(&request) {
-            return Ok(interrupted(InstallPhase::DriverReady, failure));
-        }
-        let state = InstallState {
-            phase: InstallPhase::TrybootStaged,
-            ..state
-        };
-        match self
-            .backend
-            .verify_phase(InstallPhase::TrybootStaged, &request, &state)
-        {
-            Ok(PhaseVerification::Valid) => {}
-            Ok(PhaseVerification::Drifted) => {
-                return Ok(InstallOutcome::Interrupted {
-                    phase: InstallPhase::DriverReady,
-                    reason: InterruptionReason::PostconditionFailed(InstallPhase::TrybootStaged),
-                    guidance: None,
-                });
-            }
-            Err(failure) => return Ok(interrupted(InstallPhase::DriverReady, failure)),
-        }
-        self.persist(&state, &[])?;
-        if let Err(failure) = self
-            .backend
-            .emit_status(status(InstallPhase::TrybootStaged))
-        {
-            return Ok(interrupted(InstallPhase::TrybootStaged, failure));
-        }
-
-        if let Err(failure) = self.backend.boot_and_verify_tryboot(&request) {
-            return Ok(interrupted(InstallPhase::TrybootStaged, failure));
-        }
-        let state = InstallState {
-            phase: InstallPhase::TrybootVerified,
-            ..state
-        };
-        match self
-            .backend
-            .verify_phase(InstallPhase::TrybootVerified, &request, &state)
-        {
-            Ok(PhaseVerification::Valid) => {}
-            Ok(PhaseVerification::Drifted) => {
-                return Ok(InstallOutcome::Interrupted {
-                    phase: InstallPhase::TrybootStaged,
-                    reason: InterruptionReason::PostconditionFailed(InstallPhase::TrybootVerified),
-                    guidance: None,
-                });
-            }
-            Err(failure) => return Ok(interrupted(InstallPhase::TrybootStaged, failure)),
-        }
-        self.persist(&state, &[])?;
-        if let Err(failure) = self
-            .backend
-            .emit_status(status(InstallPhase::TrybootVerified))
-        {
-            return Ok(interrupted(InstallPhase::TrybootVerified, failure));
-        }
-
-        if let Err(failure) = self.backend.accept_driver(&request) {
-            return Ok(interrupted(InstallPhase::TrybootVerified, failure));
-        }
-        let state = InstallState {
-            phase: InstallPhase::DriverAccepted,
-            ..state
-        };
-        match self
-            .backend
-            .verify_phase(InstallPhase::DriverAccepted, &request, &state)
-        {
-            Ok(PhaseVerification::Valid) => {}
-            Ok(PhaseVerification::Drifted) => {
-                return Ok(InstallOutcome::Interrupted {
-                    phase: InstallPhase::TrybootVerified,
-                    reason: InterruptionReason::PostconditionFailed(InstallPhase::DriverAccepted),
-                    guidance: None,
-                });
-            }
-            Err(failure) => return Ok(interrupted(InstallPhase::TrybootVerified, failure)),
-        }
-        self.persist(&state, &[])?;
-        if let Err(failure) = self
-            .backend
-            .emit_status(status(InstallPhase::DriverAccepted))
-        {
-            return Ok(interrupted(InstallPhase::DriverAccepted, failure));
-        }
-
-        let installed = match self.backend.install_application(&request) {
-            Ok(installed) => installed,
-            Err(failure) => return Ok(interrupted(InstallPhase::DriverAccepted, failure)),
-        };
-        installed
-            .validate()
-            .map_err(|_| InstallError::InvalidTargetInstallResult)?;
-        if installed.revision != request.application.source_commit
-            || installed.sha256 != request.application.sha256
-        {
-            return Err(InstallError::ArtifactIdentityMismatch {
-                phase: InstallPhase::ApplicationInstalled,
-            });
-        }
-        let state = InstallState {
-            phase: InstallPhase::ApplicationInstalled,
-            ..state
-        };
-        match self
-            .backend
-            .verify_phase(InstallPhase::ApplicationInstalled, &request, &state)
-        {
-            Ok(PhaseVerification::Valid) => {}
-            Ok(PhaseVerification::Drifted) => {
-                return Ok(InstallOutcome::Interrupted {
-                    phase: InstallPhase::DriverAccepted,
-                    reason: InterruptionReason::PostconditionFailed(
-                        InstallPhase::ApplicationInstalled,
-                    ),
-                    guidance: None,
-                });
-            }
-            Err(failure) => return Ok(interrupted(InstallPhase::DriverAccepted, failure)),
-        }
-        self.persist(&state, &[])?;
-        if let Err(failure) = self
-            .backend
-            .emit_status(status(InstallPhase::ApplicationInstalled))
-        {
-            return Ok(interrupted(InstallPhase::ApplicationInstalled, failure));
-        }
-
-        if let Err(failure) = self
-            .backend
-            .change_hostname_and_reconnect(&state.target, &request.desired_hostname)
-        {
-            return Ok(interrupted(InstallPhase::ApplicationInstalled, failure));
-        }
-        let state = InstallState {
-            phase: InstallPhase::HostnameChanged,
-            ..state
-        };
-        match self
-            .backend
-            .verify_phase(InstallPhase::HostnameChanged, &request, &state)
-        {
-            Ok(PhaseVerification::Valid) => {}
-            Ok(PhaseVerification::Drifted) => {
-                return Ok(InstallOutcome::Interrupted {
-                    phase: InstallPhase::ApplicationInstalled,
-                    reason: InterruptionReason::PostconditionFailed(InstallPhase::HostnameChanged),
-                    guidance: None,
-                });
-            }
-            Err(failure) => return Ok(interrupted(InstallPhase::ApplicationInstalled, failure)),
-        }
-        self.persist(&state, &[])?;
-        if let Err(failure) = self
-            .backend
-            .emit_status(status(InstallPhase::HostnameChanged))
-        {
-            return Ok(interrupted(InstallPhase::HostnameChanged, failure));
-        }
-
-        if let Err(failure) = self.backend.reboot_final(&request) {
-            return Ok(interrupted(InstallPhase::HostnameChanged, failure));
-        }
-        let state = InstallState {
-            phase: InstallPhase::FinalRebooted,
-            ..state
-        };
-        match self
-            .backend
-            .verify_phase(InstallPhase::FinalRebooted, &request, &state)
-        {
-            Ok(PhaseVerification::Valid) => {}
-            Ok(PhaseVerification::Drifted) => {
-                return Ok(InstallOutcome::Interrupted {
-                    phase: InstallPhase::HostnameChanged,
-                    reason: InterruptionReason::PostconditionFailed(InstallPhase::FinalRebooted),
-                    guidance: None,
-                });
-            }
-            Err(failure) => return Ok(interrupted(InstallPhase::HostnameChanged, failure)),
-        }
-        self.persist(&state, &[])?;
-        if let Err(failure) = self
-            .backend
-            .emit_status(status(InstallPhase::FinalRebooted))
-        {
-            return Ok(interrupted(InstallPhase::FinalRebooted, failure));
-        }
-
-        if let Err(failure) = self.backend.verify_final_service(&request) {
-            return Ok(interrupted(InstallPhase::FinalRebooted, failure));
-        }
-        let state = InstallState {
-            phase: InstallPhase::FinalVerified,
-            ..state
-        };
-        match self
-            .backend
-            .verify_phase(InstallPhase::FinalVerified, &request, &state)
-        {
-            Ok(PhaseVerification::Valid) => {}
-            Ok(PhaseVerification::Drifted) => {
-                return Ok(InstallOutcome::Interrupted {
-                    phase: InstallPhase::FinalRebooted,
-                    reason: InterruptionReason::PostconditionFailed(InstallPhase::FinalVerified),
-                    guidance: None,
-                });
-            }
-            Err(failure) => return Ok(interrupted(InstallPhase::FinalRebooted, failure)),
-        }
-        self.persist(&state, &[])?;
-        if let Err(failure) = self
-            .backend
-            .emit_status(status(InstallPhase::FinalVerified))
-        {
-            return Ok(interrupted(InstallPhase::FinalVerified, failure));
-        }
-
-        if let Err(failure) = self.backend.finish(&request) {
-            return Ok(interrupted(InstallPhase::FinalVerified, failure));
-        }
-        let state = InstallState {
-            phase: InstallPhase::Complete,
-            ..state
-        };
-        match self
-            .backend
-            .verify_phase(InstallPhase::Complete, &request, &state)
-        {
-            Ok(PhaseVerification::Valid) => {}
-            Ok(PhaseVerification::Drifted) => {
-                return Ok(InstallOutcome::Interrupted {
-                    phase: InstallPhase::FinalVerified,
-                    reason: InterruptionReason::PostconditionFailed(InstallPhase::Complete),
-                    guidance: None,
-                });
-            }
-            Err(failure) => return Ok(interrupted(InstallPhase::FinalVerified, failure)),
-        }
-        self.persist(&state, &[])?;
-        if let Err(failure) = self.backend.emit_status(status(InstallPhase::Complete)) {
-            return Ok(interrupted(InstallPhase::Complete, failure));
-        }
-        Ok(InstallOutcome::Complete)
+        Ok(PerformedPhase {
+            state: next,
+            owned_files,
+        })
     }
 
     fn persist(
@@ -893,7 +553,7 @@ impl<'a, B: InstallBackend, S: StateStore> Installer<'a, B, S> {
                 .backend
                 .load_target_state()?
                 .ok_or(InstallError::StateDisagreement)?;
-            if !target_matches_mac_state(state, &saved) {
+            if !target_matches_mac_state(state, &saved) || saved.owned_files != owned_files {
                 return Err(InstallError::StateDisagreement);
             }
         }
@@ -905,6 +565,11 @@ impl<'a, B: InstallBackend, S: StateStore> Installer<'a, B, S> {
 enum ActionError {
     Backend(BackendFailure),
     Install(InstallError),
+}
+
+struct PerformedPhase {
+    state: InstallState,
+    owned_files: Option<Vec<crate::state::OwnedFile>>,
 }
 
 fn phase_index(phase: InstallPhase) -> usize {
@@ -1026,6 +691,7 @@ pub struct TargetInstallResult {
     pub reboot_required: bool,
     pub revision: String,
     pub sha256: String,
+    pub owned_files: Vec<crate::state::OwnedFile>,
 }
 
 #[derive(Deserialize)]
@@ -1037,6 +703,7 @@ struct RawTargetInstallResult {
     reboot_required: bool,
     revision: String,
     sha256: String,
+    owned_files: Vec<crate::state::OwnedFile>,
 }
 
 impl<'de> Deserialize<'de> for TargetInstallResult {
@@ -1052,6 +719,7 @@ impl<'de> Deserialize<'de> for TargetInstallResult {
             reboot_required: raw.reboot_required,
             revision: raw.revision,
             sha256: raw.sha256,
+            owned_files: raw.owned_files,
         };
         result
             .validate()
@@ -1080,6 +748,26 @@ impl TargetInstallResult {
         if self.schema_version != 1
             || !is_lower_hex(&self.revision, 40)
             || !is_lower_hex(&self.sha256, 64)
+            || self.owned_files.is_empty()
+            || self.owned_files.len() > 64
+        {
+            return Err("invalid target install result");
+        }
+        const EXACT_OWNED_PATHS: [&str; 4] = [
+            "/opt/planeradar/bin/planeradar",
+            "/opt/planeradar/REVISION",
+            "/opt/planeradar/SHA256",
+            "/etc/systemd/system/planeradar.service",
+        ];
+        if self
+            .owned_files
+            .iter()
+            .map(|file| file.target_path.as_str())
+            .ne(EXACT_OWNED_PATHS)
+            || self
+                .owned_files
+                .iter()
+                .any(|file| !is_lower_hex(&file.sha256, 64))
         {
             return Err("invalid target install result");
         }

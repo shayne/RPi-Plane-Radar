@@ -36,8 +36,8 @@ fn state(phase: InstallPhase) -> InstallState {
         schema_version: STATE_SCHEMA_VERSION,
         target: identity(),
         phase,
-        application: Some(artifact("0.1.0", 'a')),
-        driver: Some(artifact("0.1.0-rc.4", 'b')),
+        application: (phase >= InstallPhase::ApplicationAcquired).then(|| artifact("0.1.0", 'a')),
+        driver: (phase >= InstallPhase::DriverReady).then(|| artifact("0.1.0-rc.4", 'b')),
     }
 }
 
@@ -613,7 +613,7 @@ fn target_state_contract_round_trips_strictly_at_the_fixed_target_path() {
 
     assert_eq!(
         TARGET_STATE_PATH,
-        "/var/lib/planeradar/installer/state.json"
+        "/var/lib/planeradar-installer/state.json"
     );
     assert_eq!(
         TargetInstallState::from_json(&encoded).expect("parse target state"),
@@ -627,6 +627,67 @@ fn target_state_contract_round_trips_strictly_at_the_fixed_target_path() {
         ))
         .is_err()
     );
+}
+
+#[test]
+fn state_rejects_artifacts_that_do_not_match_the_persisted_phase() {
+    let discovered_with_application = serde_json::json!({
+        "schema_version": 1,
+        "target": identity(),
+        "phase": "discovered",
+        "application": artifact("0.1.0", 'a'),
+        "driver": null
+    });
+    let acquired_without_application = serde_json::json!({
+        "schema_version": 1,
+        "target": identity(),
+        "phase": "application_acquired",
+        "application": null,
+        "driver": null
+    });
+    let driver_ready_without_driver = serde_json::json!({
+        "schema_version": 1,
+        "target": identity(),
+        "phase": "driver_ready",
+        "application": artifact("0.1.0", 'a'),
+        "driver": null
+    });
+
+    for invalid in [
+        discovered_with_application,
+        acquired_without_application,
+        driver_ready_without_driver,
+    ] {
+        assert!(InstallState::from_json(&invalid.to_string()).is_err());
+    }
+}
+
+#[test]
+fn target_state_requires_exact_artifacts_and_owned_files_for_its_phase() {
+    let mut missing_application = target_state();
+    missing_application.last_verified_phase = InstallPhase::Complete;
+    missing_application.application = None;
+
+    let mut missing_driver = target_state();
+    missing_driver.last_verified_phase = InstallPhase::DriverReady;
+    missing_driver.driver = None;
+    missing_driver.owned_files.clear();
+
+    let mut missing_owned_files = target_state();
+    missing_owned_files.last_verified_phase = InstallPhase::ApplicationInstalled;
+    missing_owned_files.owned_files.clear();
+
+    let mut premature_owned_files = target_state();
+    premature_owned_files.last_verified_phase = InstallPhase::DriverAccepted;
+
+    for invalid in [
+        missing_application,
+        missing_driver,
+        missing_owned_files,
+        premature_owned_files,
+    ] {
+        assert!(invalid.to_json().is_err());
+    }
 }
 
 #[test]

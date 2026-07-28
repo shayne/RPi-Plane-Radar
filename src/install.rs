@@ -1,9 +1,12 @@
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, Read, Write};
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
-use std::path::{Path, PathBuf};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 
+use nix::fcntl::{OFlag, openat, renameat};
+use nix::sys::stat::{Mode, mkdirat};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -140,7 +143,7 @@ struct InstallerOwnedFile {
     sha256: String,
 }
 
-#[derive(Clone, Copy, Deserialize, Serialize)]
+#[derive(Clone, Copy, Deserialize, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum InstallerPhase {
     Discovered,
@@ -160,56 +163,141 @@ enum InstallerPhase {
 pub fn write_installer_state_json(path: &Path, contents: &[u8]) -> Result<(), InstallError> {
     let state = parse_installer_state(contents)?;
     let serialized = serde_json::to_vec(&state).map_err(|_| InstallError::InvalidInstallerState)?;
-    let parent = path
+    let parent_path = path
         .parent()
         .ok_or_else(|| InstallError::MissingParent(path.into()))?;
-    ensure_private_installer_directory(parent)?;
-    reject_unsafe_installer_state_path(path)?;
+    let parent = open_private_installer_directory(parent_path, true)?
+        .ok_or_else(|| InstallError::MissingParent(parent_path.into()))?;
+    let state_name = path
+        .file_name()
+        .ok_or_else(|| InstallError::UnsafeFileType(path.into()))?;
+    reject_unsafe_installer_state_at(&parent, state_name)?;
 
-    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
-    temporary
-        .as_file()
-        .set_permissions(fs::Permissions::from_mode(0o600))?;
-    temporary.write_all(&serialized)?;
-    temporary.flush()?;
-    temporary.as_file().sync_all()?;
-    temporary.persist(path)?;
-    File::open(parent)?.sync_all()?;
+    static TEMPORARY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    let temporary_name = format!(
+        ".state.json.{}.{}",
+        std::process::id(),
+        TEMPORARY_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    );
+    let temporary_fd = openat(
+        &parent,
+        temporary_name.as_str(),
+        OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+        Mode::from_bits_truncate(0o600),
+    )
+    .map_err(nix_io)?;
+    let mut temporary = File::from(temporary_fd);
+    temporary.set_permissions(fs::Permissions::from_mode(0o600))?;
+    let write_result = (|| {
+        temporary.write_all(&serialized)?;
+        temporary.flush()?;
+        temporary.sync_all()?;
+        renameat(&parent, temporary_name.as_str(), &parent, state_name).map_err(nix_io)?;
+        parent.sync_all()
+    })();
+    if write_result.is_err() {
+        let _ = nix::unistd::unlinkat(
+            &parent,
+            temporary_name.as_str(),
+            nix::unistd::UnlinkatFlags::NoRemoveDir,
+        );
+    }
+    write_result?;
+    parent.sync_all()?;
     Ok(())
 }
 
-fn ensure_private_installer_directory(path: &Path) -> Result<(), InstallError> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() => {
-            return Ok(());
-        }
-        Ok(_) => return Err(InstallError::UnsafeFileType(path.into())),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error.into()),
-    }
-    let parent = path
-        .parent()
-        .ok_or_else(|| InstallError::MissingParent(path.into()))?;
-    ensure_private_installer_directory(parent)?;
-    let mut builder = fs::DirBuilder::new();
-    builder.mode(0o700);
-    builder.create(path)?;
-    let metadata = fs::symlink_metadata(path)?;
-    if !metadata.file_type().is_dir()
-        || metadata.file_type().is_symlink()
-        || metadata.permissions().mode() & 0o777 != 0o700
-    {
+fn open_directory_at(parent: &File, name: &std::ffi::OsStr) -> io::Result<File> {
+    openat(
+        parent,
+        name,
+        OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    )
+    .map(File::from)
+    .map_err(nix_io)
+}
+
+fn open_private_installer_directory(
+    path: &Path,
+    create: bool,
+) -> Result<Option<File>, InstallError> {
+    if !path.is_absolute() {
         return Err(InstallError::UnsafeFileType(path.into()));
     }
-    File::open(parent)?.sync_all()?;
-    Ok(())
+    let mut current = {
+        let mut options = OpenOptions::new();
+        options
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW);
+        options.open("/")?
+    };
+    let components = path
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(name) => Some(name.to_owned()),
+            Component::RootDir => None,
+            _ => Some(std::ffi::OsString::new()),
+        })
+        .collect::<Vec<_>>();
+    if components.iter().any(|component| component.is_empty()) {
+        return Err(InstallError::UnsafeFileType(path.into()));
+    }
+    for (index, component) in components.iter().enumerate() {
+        let is_private_directory = index + 1 == components.len();
+        let parent_owner = current.metadata()?.uid();
+        match open_directory_at(&current, component) {
+            Ok(next) => current = next,
+            Err(error)
+                if create && is_private_directory && error.kind() == io::ErrorKind::NotFound =>
+            {
+                mkdirat(
+                    &current,
+                    component.as_os_str(),
+                    Mode::from_bits_truncate(0o700),
+                )
+                .map_err(nix_io)?;
+                current.sync_all()?;
+                current = open_directory_at(&current, component)?;
+            }
+            Err(error)
+                if !create && is_private_directory && error.kind() == io::ErrorKind::NotFound =>
+            {
+                return Ok(None);
+            }
+            Err(error) => return Err(error.into()),
+        }
+        if is_private_directory {
+            let metadata = current.metadata()?;
+            if !metadata.is_dir()
+                || metadata.permissions().mode() & 0o777 != 0o700
+                || metadata.uid() != parent_owner
+            {
+                return Err(InstallError::UnsafeFileType(path.into()));
+            }
+        }
+    }
+    Ok(Some(current))
 }
 
 pub fn read_installer_state_json(path: &Path) -> Result<String, InstallError> {
-    reject_unsafe_installer_state_path(path)?;
-    let mut options = OpenOptions::new();
-    options.read(true).custom_flags(libc::O_NOFOLLOW);
-    let mut file = options.open(path)?;
+    let parent_path = path
+        .parent()
+        .ok_or_else(|| InstallError::MissingParent(path.into()))?;
+    let parent = open_private_installer_directory(parent_path, false)?
+        .ok_or_else(|| InstallError::MissingParent(parent_path.into()))?;
+    let state_name = path
+        .file_name()
+        .ok_or_else(|| InstallError::UnsafeFileType(path.into()))?;
+    reject_unsafe_installer_state_at(&parent, state_name)?;
+    let state_fd = openat(
+        &parent,
+        state_name,
+        OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(nix_io)?;
+    let mut file = File::from(state_fd);
     if !file.metadata()?.is_file() {
         return Err(InstallError::UnsafeFileType(path.into()));
     }
@@ -222,10 +310,17 @@ pub fn read_installer_state_json(path: &Path) -> Result<String, InstallError> {
 }
 
 pub fn read_optional_installer_state_json(path: &Path) -> Result<String, InstallError> {
-    match fs::symlink_metadata(path) {
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok("null".into()),
-        Err(error) => Err(error.into()),
-        Ok(_) => read_installer_state_json(path),
+    let parent = path
+        .parent()
+        .ok_or_else(|| InstallError::MissingParent(path.into()))?;
+    if open_private_installer_directory(parent, false)?.is_none() {
+        return Ok("null".into());
+    }
+    match read_installer_state_json(path) {
+        Err(InstallError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+            Ok("null".into())
+        }
+        result => result,
     }
 }
 
@@ -254,6 +349,11 @@ fn parse_installer_state(contents: &[u8]) -> Result<InstallerStateDocument, Inst
             .owned_files
             .iter()
             .any(|file| !valid_installer_owned_file(file))
+        || (state.last_verified_phase >= InstallerPhase::ApplicationAcquired)
+            != state.application.is_some()
+        || (state.last_verified_phase >= InstallerPhase::DriverReady) != state.driver.is_some()
+        || (state.last_verified_phase >= InstallerPhase::ApplicationInstalled)
+            != !state.owned_files.is_empty()
     {
         return Err(InstallError::InvalidInstallerState);
     }
@@ -292,13 +392,30 @@ fn valid_installer_owned_file(file: &InstallerOwnedFile) -> bool {
         && is_lower_hex(&file.sha256, 64)
 }
 
-fn reject_unsafe_installer_state_path(path: &Path) -> Result<(), InstallError> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_file() => Ok(()),
-        Ok(_) => Err(InstallError::UnsafeFileType(path.into())),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error.into()),
+fn reject_unsafe_installer_state_at(
+    parent: &File,
+    name: &std::ffi::OsStr,
+) -> Result<(), InstallError> {
+    match openat(
+        parent,
+        name,
+        OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(file) => {
+            if File::from(file).metadata()?.is_file() {
+                Ok(())
+            } else {
+                Err(InstallError::UnsafeFileType(PathBuf::from(name)))
+            }
+        }
+        Err(nix::errno::Errno::ENOENT) => Ok(()),
+        Err(error) => Err(nix_io(error).into()),
     }
+}
+
+fn nix_io(error: nix::errno::Errno) -> io::Error {
+    io::Error::from_raw_os_error(error as i32)
 }
 
 #[derive(Clone, Debug)]
@@ -318,6 +435,13 @@ pub struct InstallResult {
     pub reboot_required: bool,
     pub revision: String,
     pub sha256: String,
+    pub owned_files: Vec<InstalledFile>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct InstalledFile {
+    pub target_path: String,
+    pub sha256: String,
 }
 
 #[derive(Serialize)]
@@ -328,6 +452,7 @@ struct MachineInstallResult<'a> {
     reboot_required: bool,
     revision: &'a str,
     sha256: &'a str,
+    owned_files: &'a [InstalledFile],
 }
 
 impl InstallResult {
@@ -342,6 +467,7 @@ impl InstallResult {
             reboot_required: self.reboot_required,
             revision: &self.revision,
             sha256: &self.sha256,
+            owned_files: &self.owned_files,
         })
         .map_err(InstallMachineOutputError::Serialize)
     }
@@ -454,12 +580,26 @@ impl<'a> Installer<'a> {
             self.commands.run("systemctl", &["reboot"])?;
         }
 
+        let owned_files = [
+            (INSTALL_BINARY, artifact.as_slice()),
+            (INSTALL_REVISION, revision.as_slice()),
+            (INSTALL_CHECKSUM, checksum.as_slice()),
+            (INSTALL_SERVICE, PLANERADAR_SERVICE.as_bytes()),
+        ]
+        .into_iter()
+        .map(|(path, contents)| InstalledFile {
+            target_path: format!("/{path}"),
+            sha256: format!("{:x}", Sha256::digest(contents)),
+        })
+        .collect();
+
         Ok(InstallResult {
             files_changed,
             boot_config_changed,
             reboot_required,
             revision: revision_identity,
             sha256: sha256_identity,
+            owned_files,
         })
     }
 
