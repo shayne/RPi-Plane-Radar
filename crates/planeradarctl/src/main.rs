@@ -257,6 +257,17 @@ fn select_candidate_index(
     match matching.as_slice() {
         [index] => return Ok(*index),
         [_, _, ..] => {
+            let first = &candidates[matching[0]];
+            if matching.iter().skip(1).all(|index| {
+                let candidate = &candidates[*index];
+                candidate.observed == first.observed && candidate.persisted == first.persisted
+            }) {
+                return Ok(matching
+                    .iter()
+                    .copied()
+                    .find(|index| candidates[*index].is_original)
+                    .unwrap_or(matching[0]));
+            }
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "multiple reachable targets match the persisted installation identity",
@@ -1226,6 +1237,95 @@ mod tests {
                 .expect("fresh original"),
             0
         );
+    }
+
+    #[test]
+    fn two_aliases_for_one_persisted_pi_select_the_original_deterministically() {
+        let application = ArtifactIdentity {
+            version: "1.2.3".into(),
+            source_commit: "1".repeat(40),
+            sha256: "2".repeat(64),
+        };
+        let driver = ArtifactIdentity {
+            version: "1.2.3".into(),
+            source_commit: "3".repeat(40),
+            sha256: "4".repeat(64),
+        };
+        let identity = TargetIdentity {
+            host_key_sha256: "SHA256:8R2K6pFDwIKY2fWb/4mMxwAA7PY8VYyLmWucTx7D99A".into(),
+            model: "Raspberry Pi Zero 2 W Rev 1.0".into(),
+            serial: "10000000abcdef01".into(),
+        };
+        let persisted = InstallState {
+            schema_version: 1,
+            target: identity.clone(),
+            phase: InstallPhase::HostnameChanged,
+            application: Some(application.clone()),
+            driver: Some(driver.clone()),
+        };
+        let candidates = [
+            InstallCandidateState {
+                is_original: true,
+                observed: identity.clone(),
+                persisted: Some(persisted.clone()),
+            },
+            InstallCandidateState {
+                is_original: false,
+                observed: identity,
+                persisted: Some(persisted),
+            },
+        ];
+
+        assert_eq!(
+            select_candidate_index(&candidates, &application, &driver)
+                .expect("two aliases for one Pi"),
+            0
+        );
+    }
+
+    #[test]
+    fn two_distinct_persisted_pis_with_matching_artifacts_remain_ambiguous() {
+        let application = ArtifactIdentity {
+            version: "1.2.3".into(),
+            source_commit: "1".repeat(40),
+            sha256: "2".repeat(64),
+        };
+        let driver = ArtifactIdentity {
+            version: "1.2.3".into(),
+            source_commit: "3".repeat(40),
+            sha256: "4".repeat(64),
+        };
+        let first = TargetIdentity {
+            host_key_sha256: "SHA256:8R2K6pFDwIKY2fWb/4mMxwAA7PY8VYyLmWucTx7D99A".into(),
+            model: "Raspberry Pi Zero 2 W Rev 1.0".into(),
+            serial: "10000000abcdef01".into(),
+        };
+        let second = TargetIdentity {
+            host_key_sha256: "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
+            model: "Raspberry Pi Zero 2 W Rev 1.0".into(),
+            serial: "10000000abcdef02".into(),
+        };
+        let state = |target: TargetIdentity| InstallState {
+            schema_version: 1,
+            target,
+            phase: InstallPhase::HostnameChanged,
+            application: Some(application.clone()),
+            driver: Some(driver.clone()),
+        };
+        let candidates = [
+            InstallCandidateState {
+                is_original: true,
+                observed: first.clone(),
+                persisted: Some(state(first)),
+            },
+            InstallCandidateState {
+                is_original: false,
+                observed: second.clone(),
+                persisted: Some(state(second)),
+            },
+        ];
+
+        assert!(select_candidate_index(&candidates, &application, &driver).is_err());
     }
 
     #[test]
