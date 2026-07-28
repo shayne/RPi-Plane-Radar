@@ -159,35 +159,43 @@ pub struct DriverLock {
 impl DriverLock {
     pub fn parse(contents: &str) -> Result<Self, DriverLockError> {
         let raw: RawDriverLock = toml::from_str(contents).map_err(DriverLockError::Toml)?;
-        if raw.repository != DRIVER_REPOSITORY {
-            return Err(if raw.repository.starts_with("https://") {
-                DriverLockError::WrongRepository {
-                    repository: raw.repository,
-                }
-            } else {
-                DriverLockError::NonHttpsRepository {
-                    repository: raw.repository,
-                }
-            });
-        }
         let version =
             Version::parse(&raw.version).map_err(|_| DriverLockError::InvalidVersion {
                 version: raw.version,
             })?;
-        if !is_lower_hex(&raw.commit, 40) {
-            return Err(DriverLockError::InvalidCommit { commit: raw.commit });
-        }
-        if !is_lower_hex(&raw.manifest_sha256, 64) {
-            return Err(DriverLockError::InvalidManifestSha256 {
-                digest: raw.manifest_sha256,
-            });
-        }
-        Ok(Self {
-            repository: DRIVER_REPOSITORY.to_owned(),
+        let lock = Self {
+            repository: raw.repository,
             version,
             commit: raw.commit,
             manifest_sha256: raw.manifest_sha256,
-        })
+        };
+        lock.validate()?;
+        Ok(lock)
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), DriverLockError> {
+        if self.repository != DRIVER_REPOSITORY {
+            return Err(if self.repository.starts_with("https://") {
+                DriverLockError::WrongRepository {
+                    repository: self.repository.clone(),
+                }
+            } else {
+                DriverLockError::NonHttpsRepository {
+                    repository: self.repository.clone(),
+                }
+            });
+        }
+        if !is_lower_hex(&self.commit, 40) {
+            return Err(DriverLockError::InvalidCommit {
+                commit: self.commit.clone(),
+            });
+        }
+        if !is_lower_hex(&self.manifest_sha256, 64) {
+            return Err(DriverLockError::InvalidManifestSha256 {
+                digest: self.manifest_sha256.clone(),
+            });
+        }
+        Ok(())
     }
 
     pub fn checked_in() -> Result<Self, DriverLockError> {

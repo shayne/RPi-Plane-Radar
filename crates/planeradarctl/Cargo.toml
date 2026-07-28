@@ -16,3 +16,6 @@ sha2 = "0.10"
 tempfile = "3.20"
 thiserror = "2.0"
 toml = "0.8"
+
+[dev-dependencies]
+jsonschema = { version = "0.37", default-features = false }
