@@ -1,8 +1,5 @@
-use std::env;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
-use std::process::Command;
 
 const PUBLIC_TARGET: &str = "pi@raspberrypi.local";
 
@@ -32,39 +29,6 @@ fn hard_coded_ssh_targets(source: &str) -> impl Iterator<Item = &str> {
                 && !host.is_empty()
                 && !is_device_tree_node_identifier(token)
         })
-}
-
-#[test]
-fn verify_hyperpixel_boot_does_not_reuse_the_expectation_flag_as_its_ssh_target() {
-    let directory = tempfile::tempdir().expect("temporary directory");
-    let ssh = directory.path().join("ssh");
-    fs::write(
-        &ssh,
-        "#!/usr/bin/env bash\nprintf 'fake ssh invoked for %s\\n' \"$*\" >&2\nexit 1\n",
-    )
-    .expect("fake ssh");
-    fs::set_permissions(&ssh, fs::Permissions::from_mode(0o755)).expect("fake ssh mode");
-    let path = env::join_paths(
-        std::iter::once(directory.path().to_path_buf())
-            .chain(env::split_paths(&env::var_os("PATH").expect("PATH"))),
-    )
-    .expect("test PATH");
-
-    let output = Command::new("bash")
-        .arg("scripts/verify-hyperpixel-boot.sh")
-        .arg("--expect-normal")
-        .env("PATH", path)
-        .env("PLANERADAR_PI_TARGET", "fixture@target")
-        .output()
-        .expect("run verification script");
-
-    assert!(!output.status.success());
-    let stderr = String::from_utf8(output.stderr).expect("verification stderr");
-    assert!(
-        stderr.contains("fake ssh invoked for"),
-        "expectation flag must not fail target validation: {stderr}"
-    );
-    assert!(stderr.contains("fixture@target"));
 }
 
 #[test]

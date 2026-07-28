@@ -18,6 +18,10 @@ pub enum Command {
     Screenshot(TargetOptions),
     Rollback(MutatingOptions),
     Uninstall(MutatingOptions),
+    Driver {
+        #[command(subcommand)]
+        command: DriverCommand,
+    },
 }
 
 impl Command {
@@ -27,7 +31,7 @@ impl Command {
             | Self::Upgrade(options)
             | Self::Rollback(options)
             | Self::Uninstall(options) => Some(options),
-            Self::Status(_) | Self::Doctor(_) | Self::Screenshot(_) => None,
+            Self::Status(_) | Self::Doctor(_) | Self::Screenshot(_) | Self::Driver { .. } => None,
         }
     }
 
@@ -37,6 +41,12 @@ impl Command {
             Self::Install(_) | Self::Upgrade(_) | Self::Rollback(_) | Self::Uninstall(_)
         )
     }
+}
+
+#[derive(Clone, Debug, Subcommand)]
+pub enum DriverCommand {
+    Sync,
+    Update { version: String },
 }
 
 #[derive(Clone, Debug, Args)]

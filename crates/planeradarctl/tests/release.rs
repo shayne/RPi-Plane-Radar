@@ -1401,7 +1401,7 @@ fn debug_and_errors_redact_manifest_bytes_command_output_and_local_paths() {
     assert!(!release_debug.contains(&secret_path.to_string_lossy().into_owned()));
     assert!(
         !format!("{:?}", release.manifest)
-            .contains("93f413aac135b44585703a03717d5aa2e9ae6b2b2d4b178d193d4758dfdedee7")
+            .contains("8170e79829fb5969fffa280c2b971f37bcb757af62a57997b4d5a90bf88d8b02")
     );
 
     let runner = RecordingCommandRunner::with_statuses(vec![1]);
