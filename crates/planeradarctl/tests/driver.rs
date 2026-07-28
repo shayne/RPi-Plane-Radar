@@ -1,7 +1,8 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     fs,
-    io::{self, Write},
+    io::{Read, Write},
+    os::unix::fs::{PermissionsExt, symlink},
     path::PathBuf,
     sync::{Arc, Mutex},
 };
@@ -9,7 +10,7 @@ use std::{
 use planeradarctl::{
     DriverLock,
     driver::{
-        DriverAction, DriverContext, DriverManager, DriverPlan, DriverReleaseSource,
+        DriverAction, DriverContext, DriverError, DriverManager, DriverPlan, DriverReleaseSource,
         DriverReleaseVerifier, DriverResolver, DriverTool, GhDriverReleaseSource,
         GhDriverReleaseVerifier, PrebuiltBundle, TargetProbe,
     },
@@ -22,9 +23,17 @@ use tar::{Builder, EntryType, Header};
 
 const MANIFEST_DIGEST: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const DRIVER_COMMIT: &str = "ca95ffeb30b3c361f16cfc228c7bf2b78abf2b4c";
+const DRIVER_TREE: &str = "1111111111111111111111111111111111111111";
+const TAG_OBJECT: &str = "e205b33925c9f0cfe7be5b47d30c5a013a3577ac";
+const EXPECTED_VERMAGIC: &str = "6.18.34+rpt-rpi-v8 SMP preempt mod_unload modversions aarch64";
 
 fn probe(kernel_release: &str) -> TargetProbe {
-    TargetProbe::new(kernel_release).expect("valid target probe")
+    let vermagic = if kernel_release == "6.18.34+rpt-rpi-v8" {
+        EXPECTED_VERMAGIC.to_owned()
+    } else {
+        format!("{kernel_release} SMP preempt mod_unload modversions aarch64")
+    };
+    TargetProbe::new(kernel_release, vermagic).expect("valid target probe")
 }
 
 fn resolver(bundle: PrebuiltBundle) -> DriverResolver {
@@ -41,6 +50,7 @@ fn prebuilt(
         PathBuf::from("/cache/prebuilt.tar.zst"),
         kernel_release,
         vermagic,
+        EXPECTED_VERMAGIC,
         internal_manifest_digest,
         MANIFEST_DIGEST,
     )
@@ -77,7 +87,55 @@ fn archive(entries: &[(&str, EntryType, &[u8], Option<&str>)]) -> Vec<u8> {
     encoder.finish().expect("finish zstd")
 }
 
+fn source_archive_with_extra_files(
+    entries: impl IntoIterator<Item = (String, Vec<u8>)>,
+) -> Vec<u8> {
+    let prefix = "hyperpixel2r-kms-0.1.0";
+    let identity = format!(
+        "schema_version\t1\nrepository\thttps://github.com/shayne/hyperpixel2r-kms\nsource_revision\t{DRIVER_COMMIT}\nsource_tree\t{DRIVER_TREE}\n"
+    );
+    let mut files = vec![
+        (
+            format!("{prefix}/scripts/verify-boot.sh"),
+            b"#!/usr/bin/env bash\n".to_vec(),
+        ),
+        (
+            format!("{prefix}/release/source-identity.txt"),
+            identity.into_bytes(),
+        ),
+    ];
+    files.extend(entries);
+    let encoder = zstd::Encoder::new(Vec::new(), 1).expect("zstd encoder");
+    let mut builder = Builder::new(encoder);
+    for (path, contents) in files {
+        let mut header = Header::new_gnu();
+        header.set_entry_type(EntryType::Regular);
+        header.set_mode(0o644);
+        header.set_uid(0);
+        header.set_gid(0);
+        header.set_mtime(1);
+        header.set_size(contents.len() as u64);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, path, contents.as_slice())
+            .expect("tar entry");
+    }
+    let encoder = builder.into_inner().expect("finish tar");
+    encoder.finish().expect("finish zstd")
+}
+
 fn source_archive() -> Vec<u8> {
+    source_archive_with_identity(
+        "https://github.com/shayne/hyperpixel2r-kms",
+        DRIVER_COMMIT,
+        DRIVER_TREE,
+    )
+}
+
+fn source_archive_with_identity(repository: &str, commit: &str, tree: &str) -> Vec<u8> {
+    let identity = format!(
+        "schema_version\t1\nrepository\t{repository}\nsource_revision\t{commit}\nsource_tree\t{tree}\n"
+    );
     archive(&[
         (
             "hyperpixel2r-kms-0.1.0/scripts/verify-boot.sh",
@@ -89,6 +147,12 @@ fn source_archive() -> Vec<u8> {
             "hyperpixel2r-kms-0.1.0/kernel/Kbuild",
             EntryType::Regular,
             b"obj-m += hyperpixel2r_kms.o\n",
+            None,
+        ),
+        (
+            "hyperpixel2r-kms-0.1.0/release/source-identity.txt",
+            EntryType::Regular,
+            identity.as_bytes(),
             None,
         ),
     ])
@@ -138,6 +202,7 @@ fn release_manifest(source: &[u8], prebuilt: Option<(&[u8], &str)>) -> Vec<u8> {
         }),
     ];
     if let Some((bytes, kernel_release)) = prebuilt {
+        let (bundle_manifest_sha256, vermagic) = prebuilt_contract(bytes);
         artifacts.push(serde_json::json!({
             "name": format!("hyperpixel2r-kms-{kernel_release}-aarch64.tar.zst"),
             "kind": "exact-kernel-bundle",
@@ -145,6 +210,8 @@ fn release_manifest(source: &[u8], prebuilt: Option<(&[u8], &str)>) -> Vec<u8> {
             "size": bytes.len(),
             "architecture": "aarch64",
             "kernel_release": kernel_release,
+            "vermagic": vermagic,
+            "bundle_manifest_sha256": bundle_manifest_sha256,
         }));
     }
     serde_json::to_vec(&serde_json::json!({
@@ -153,7 +220,7 @@ fn release_manifest(source: &[u8], prebuilt: Option<(&[u8], &str)>) -> Vec<u8> {
         "source": {
             "repository": "https://github.com/shayne/hyperpixel2r-kms",
             "commit": DRIVER_COMMIT,
-            "tree": "1111111111111111111111111111111111111111",
+            "tree": DRIVER_TREE,
             "date_epoch": 1,
         },
         "supported": {
@@ -173,6 +240,30 @@ fn release_manifest(source: &[u8], prebuilt: Option<(&[u8], &str)>) -> Vec<u8> {
         "artifacts": artifacts,
     }))
     .expect("manifest JSON")
+}
+
+fn prebuilt_contract(bytes: &[u8]) -> (String, String) {
+    let decoder = zstd::Decoder::new(bytes).expect("prebuilt decoder");
+    let mut archive = tar::Archive::new(decoder);
+    for entry in archive.entries().expect("prebuilt entries") {
+        let mut entry = entry.expect("prebuilt entry");
+        if entry
+            .path()
+            .expect("prebuilt path")
+            .ends_with("manifest.txt")
+        {
+            let mut manifest = Vec::new();
+            entry.read_to_end(&mut manifest).expect("prebuilt manifest");
+            let vermagic = std::str::from_utf8(&manifest)
+                .expect("manifest UTF-8")
+                .lines()
+                .find_map(|line| line.strip_prefix("module_vermagic\t"))
+                .expect("manifest vermagic")
+                .to_owned();
+            return (digest(&manifest), vermagic);
+        }
+    }
+    panic!("prebuilt manifest missing");
 }
 
 fn lock_for(manifest: &[u8]) -> DriverLock {
@@ -218,13 +309,13 @@ struct FakeReleaseVerifier {
 }
 
 impl DriverReleaseVerifier for FakeReleaseVerifier {
-    fn verify(&self, version: &Version, assets: &[PathBuf]) -> Result<(), io::Error> {
+    fn verify(&self, lock: &DriverLock, assets: &[PathBuf]) -> Result<(), DriverError> {
         self.calls
             .lock()
             .expect("verifier lock")
-            .push((version.clone(), assets.len()));
+            .push((lock.version.clone(), assets.len()));
         if self.reject {
-            Err(io::Error::other("fixture rejection"))
+            Err(DriverError::VerificationFailed)
         } else {
             Ok(())
         }
@@ -232,14 +323,204 @@ impl DriverReleaseVerifier for FakeReleaseVerifier {
 }
 
 #[test]
+fn sync_rejects_source_identity_repository_commit_and_tree_mismatches() {
+    for (repository, commit, tree) in [
+        (
+            "https://github.com/attacker/hyperpixel2r-kms",
+            DRIVER_COMMIT,
+            DRIVER_TREE,
+        ),
+        (
+            "https://github.com/shayne/hyperpixel2r-kms",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            DRIVER_TREE,
+        ),
+        (
+            "https://github.com/shayne/hyperpixel2r-kms",
+            DRIVER_COMMIT,
+            "cccccccccccccccccccccccccccccccccccccccc",
+        ),
+    ] {
+        let source = source_archive_with_identity(repository, commit, tree);
+        let manifest = release_manifest(&source, None);
+        let manager = DriverManager::new(
+            FakeReleaseSource::with_assets([
+                ("driver-manifest.json".into(), manifest.clone()),
+                ("hyperpixel2r-kms-source.tar.zst".into(), source),
+                ("SBOM.spdx.json".into(), b"sbom".to_vec()),
+            ]),
+            FakeReleaseVerifier::default(),
+            tempfile::tempdir()
+                .expect("temporary cache parent")
+                .keep()
+                .join("cache"),
+        );
+
+        assert!(
+            manager.sync(&lock_for(&manifest)).is_err(),
+            "mismatched extracted source identity was accepted: {repository} {commit} {tree}"
+        );
+    }
+}
+
+#[test]
+fn sync_rejects_materialized_script_and_mode_tampering() {
+    for tamper in ["script-bytes", "script-mode", "directory-mode"] {
+        let source = source_archive();
+        let manifest = release_manifest(&source, None);
+        let manager = DriverManager::new(
+            FakeReleaseSource::with_assets([
+                ("driver-manifest.json".into(), manifest.clone()),
+                ("hyperpixel2r-kms-source.tar.zst".into(), source),
+                ("SBOM.spdx.json".into(), b"sbom".to_vec()),
+            ]),
+            FakeReleaseVerifier::default(),
+            tempfile::tempdir()
+                .expect("temporary cache parent")
+                .keep()
+                .join("cache"),
+        );
+        let synced = manager.sync(&lock_for(&manifest)).expect("initial sync");
+        let script = synced.source_root().join("scripts/verify-boot.sh");
+        match tamper {
+            "script-bytes" => fs::write(&script, b"#!/bin/sh\nmalicious\n").expect("tamper script"),
+            "script-mode" => fs::set_permissions(&script, fs::Permissions::from_mode(0o777))
+                .expect("tamper script mode"),
+            "directory-mode" => fs::set_permissions(
+                synced.source_root().join("scripts"),
+                fs::Permissions::from_mode(0o777),
+            )
+            .expect("tamper directory mode"),
+            _ => unreachable!(),
+        }
+
+        assert!(
+            manager.sync(&lock_for(&manifest)).is_err(),
+            "materialized cache accepted {tamper} tampering"
+        );
+    }
+}
+
+#[test]
+fn sync_rejects_a_symlinked_cache_root_ancestor() {
+    let temporary = tempfile::tempdir().expect("temporary cache parent");
+    let outside = temporary.path().join("outside");
+    fs::create_dir(&outside).expect("outside cache directory");
+    let cache_link = temporary.path().join(".cache");
+    symlink(&outside, &cache_link).expect("symlinked cache ancestor");
+    let source = source_archive();
+    let manifest = release_manifest(&source, None);
+    let manager = DriverManager::new(
+        FakeReleaseSource::with_assets([
+            ("driver-manifest.json".into(), manifest.clone()),
+            ("hyperpixel2r-kms-source.tar.zst".into(), source),
+            ("SBOM.spdx.json".into(), b"sbom".to_vec()),
+        ]),
+        FakeReleaseVerifier::default(),
+        cache_link.join("driver"),
+    );
+
+    assert!(manager.sync(&lock_for(&manifest)).is_err());
+    assert!(
+        fs::read_dir(&outside)
+            .expect("outside cache remains readable")
+            .next()
+            .is_none(),
+        "sync wrote through a symlinked cache ancestor"
+    );
+}
+
+fn manager_for_source_archive(
+    source: Vec<u8>,
+) -> (
+    DriverManager<FakeReleaseSource, FakeReleaseVerifier>,
+    DriverLock,
+) {
+    let manifest = release_manifest(&source, None);
+    let lock = lock_for(&manifest);
+    let manager = DriverManager::new(
+        FakeReleaseSource::with_assets([
+            ("driver-manifest.json".into(), manifest),
+            ("hyperpixel2r-kms-source.tar.zst".into(), source),
+            ("SBOM.spdx.json".into(), b"sbom".to_vec()),
+        ]),
+        FakeReleaseVerifier::default(),
+        tempfile::tempdir()
+            .expect("temporary cache parent")
+            .keep()
+            .join("cache"),
+    );
+    (manager, lock)
+}
+
+#[test]
+fn sync_rejects_an_archive_entry_over_the_uncompressed_limit() {
+    let source = source_archive_with_extra_files([(
+        "hyperpixel2r-kms-0.1.0/oversized.bin".into(),
+        vec![b'a'; 8 * 1024 * 1024 + 1],
+    )]);
+    let (manager, lock) = manager_for_source_archive(source);
+
+    assert!(
+        manager.sync(&lock).is_err(),
+        "oversized uncompressed archive entry was accepted"
+    );
+}
+
+#[test]
+fn sync_rejects_an_archive_over_the_total_uncompressed_limit() {
+    let source = source_archive_with_extra_files((0..3).map(|index| {
+        (
+            format!("hyperpixel2r-kms-0.1.0/large-{index}.bin"),
+            vec![b'a'; 6 * 1024 * 1024],
+        )
+    }));
+    let (manager, lock) = manager_for_source_archive(source);
+
+    assert!(
+        manager.sync(&lock).is_err(),
+        "archive exceeding the total uncompressed limit was accepted"
+    );
+}
+
+#[test]
+fn sync_rejects_an_archive_over_the_entry_count_limit() {
+    let source = source_archive_with_extra_files((0..1025).map(|index| {
+        (
+            format!("hyperpixel2r-kms-0.1.0/many/{index:04}.txt"),
+            b"x".to_vec(),
+        )
+    }));
+    let (manager, lock) = manager_for_source_archive(source);
+
+    assert!(
+        manager.sync(&lock).is_err(),
+        "archive exceeding the entry-count limit was accepted"
+    );
+}
+
+#[test]
+fn sync_rejects_an_archive_path_over_the_depth_limit() {
+    let deep = std::iter::repeat_n("deep", 33)
+        .collect::<Vec<_>>()
+        .join("/");
+    let source = source_archive_with_extra_files([(
+        format!("hyperpixel2r-kms-0.1.0/{deep}/leaf"),
+        b"x".to_vec(),
+    )]);
+    let (manager, lock) = manager_for_source_archive(source);
+
+    assert!(
+        manager.sync(&lock).is_err(),
+        "archive path exceeding the depth limit was accepted"
+    );
+}
+
+#[test]
 fn exact_kernel_selects_prebuilt_and_new_kernel_falls_back_to_cross_build() {
     let resolver = resolver(
-        prebuilt(
-            "6.18.34+rpt-rpi-v8",
-            "6.18.34+rpt-rpi-v8 SMP preempt mod_unload aarch64",
-            MANIFEST_DIGEST,
-        )
-        .expect("verified prebuilt"),
+        prebuilt("6.18.34+rpt-rpi-v8", EXPECTED_VERMAGIC, MANIFEST_DIGEST)
+            .expect("verified prebuilt"),
     );
 
     assert!(matches!(
@@ -254,16 +535,23 @@ fn exact_kernel_selects_prebuilt_and_new_kernel_falls_back_to_cross_build() {
             .expect("resolve new kernel"),
         DriverPlan::CrossBuild { .. }
     ));
+    let suffix_drift_probe = TargetProbe::new(
+        "6.18.34+rpt-rpi-v8",
+        "6.18.34+rpt-rpi-v8 SMP preempt mod_unload aarch64",
+    )
+    .expect("valid drifted target probe");
+    assert!(matches!(
+        resolver
+            .resolve(&suffix_drift_probe)
+            .expect("resolve vermagic drift"),
+        DriverPlan::CrossBuild { .. }
+    ));
 }
 
 #[test]
 fn prebuilt_identity_rejects_kernel_vermagic_and_internal_manifest_digest_drift() {
     for (kernel_release, vermagic, internal_digest) in [
-        (
-            "6.18.35+rpt-rpi-v8",
-            "6.18.34+rpt-rpi-v8 SMP preempt mod_unload aarch64",
-            MANIFEST_DIGEST,
-        ),
+        ("6.18.35+rpt-rpi-v8", EXPECTED_VERMAGIC, MANIFEST_DIGEST),
         (
             "6.18.34+rpt-rpi-v8",
             "6.18.35+rpt-rpi-v8 SMP preempt mod_unload aarch64",
@@ -271,7 +559,7 @@ fn prebuilt_identity_rejects_kernel_vermagic_and_internal_manifest_digest_drift(
         ),
         (
             "6.18.34+rpt-rpi-v8",
-            "6.18.34+rpt-rpi-v8 SMP preempt mod_unload aarch64",
+            EXPECTED_VERMAGIC,
             "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
         ),
     ] {
@@ -285,11 +573,7 @@ fn prebuilt_identity_rejects_kernel_vermagic_and_internal_manifest_digest_drift(
 #[test]
 fn sync_verifies_the_locked_release_and_materializes_safe_source_and_prebuilt_archives() {
     let source = source_archive();
-    let prebuilt = prebuilt_archive(
-        "6.18.34+rpt-rpi-v8",
-        "6.18.34+rpt-rpi-v8 SMP preempt mod_unload aarch64",
-        None,
-    );
+    let prebuilt = prebuilt_archive("6.18.34+rpt-rpi-v8", EXPECTED_VERMAGIC, None);
     let manifest = release_manifest(&source, Some((&prebuilt, "6.18.34+rpt-rpi-v8")));
     let release_source = FakeReleaseSource::with_assets([
         ("driver-manifest.json".into(), manifest.clone()),
@@ -327,6 +611,109 @@ fn sync_verifies_the_locked_release_and_materializes_safe_source_and_prebuilt_ar
     assert_eq!(
         verifier.calls.lock().expect("verifier calls").as_slice(),
         &[(Version::parse("0.1.0-rc.11").expect("version"), 4)]
+    );
+}
+
+#[test]
+fn resolved_driver_plan_drives_the_exact_prebuilt_and_crossbuild_command_sequences() {
+    let source = source_archive();
+    let prebuilt = prebuilt_archive("6.18.34+rpt-rpi-v8", EXPECTED_VERMAGIC, None);
+    let manifest = release_manifest(&source, Some((&prebuilt, "6.18.34+rpt-rpi-v8")));
+    let manager = DriverManager::new(
+        FakeReleaseSource::with_assets([
+            ("driver-manifest.json".into(), manifest.clone()),
+            ("hyperpixel2r-kms-source.tar.zst".into(), source),
+            ("SBOM.spdx.json".into(), b"sbom".to_vec()),
+            (
+                "hyperpixel2r-kms-6.18.34+rpt-rpi-v8-aarch64.tar.zst".into(),
+                prebuilt,
+            ),
+        ]),
+        FakeReleaseVerifier::default(),
+        tempfile::tempdir()
+            .expect("temporary cache parent")
+            .keep()
+            .join("cache"),
+    );
+    let synced = manager.sync(&lock_for(&manifest)).expect("sync driver");
+
+    let prebuilt_runner = RecordingRunner::default();
+    let prebuilt_tool = synced
+        .tool(
+            prebuilt_runner.clone(),
+            &probe("6.18.34+rpt-rpi-v8"),
+            DriverContext {
+                target: "shayne@planeradar.local".into(),
+                kernel_release: "6.18.34+rpt-rpi-v8".into(),
+                kernel_export: PathBuf::from("/cache/kernel"),
+                artifacts: PathBuf::from("/cache/artifacts"),
+                replace_overlay: "planeradar-hyperpixel2r-eefaf3ae40fd".into(),
+            },
+        )
+        .expect("prebuilt tool");
+    prebuilt_tool
+        .prepare_and_stage()
+        .expect("prepare prebuilt plan");
+    let prebuilt_calls = prebuilt_runner
+        .invocations
+        .lock()
+        .expect("prebuilt invocation lock");
+    assert_eq!(prebuilt_calls.len(), 1);
+    assert!(
+        prebuilt_calls[0].arguments()[0].ends_with("/scripts/stage-tryboot.sh"),
+        "prebuilt plan did not stage directly"
+    );
+    assert!(
+        prebuilt_calls[0]
+            .arguments()
+            .windows(2)
+            .any(|pair| pair[0] == "--artifact-dir" && pair[1].contains("/prebuilt/")),
+        "prebuilt plan did not stage the verified extracted bundle"
+    );
+    drop(prebuilt_calls);
+
+    let crossbuild_runner = RecordingRunner::default();
+    let new_kernel = "6.18.35+rpt-rpi-v8";
+    let crossbuild_tool = synced
+        .tool(
+            crossbuild_runner.clone(),
+            &probe(new_kernel),
+            DriverContext {
+                target: "shayne@planeradar.local".into(),
+                kernel_release: new_kernel.into(),
+                kernel_export: PathBuf::from("/cache/kernel"),
+                artifacts: PathBuf::from("/cache/artifacts"),
+                replace_overlay: "planeradar-hyperpixel2r-eefaf3ae40fd".into(),
+            },
+        )
+        .expect("crossbuild tool");
+    crossbuild_tool
+        .prepare_and_stage()
+        .expect("prepare crossbuild plan");
+    let crossbuild_calls = crossbuild_runner
+        .invocations
+        .lock()
+        .expect("crossbuild invocation lock");
+    assert_eq!(
+        crossbuild_calls
+            .iter()
+            .map(|invocation| invocation.arguments()[0]
+                .rsplit('/')
+                .next()
+                .expect("script"))
+            .collect::<Vec<_>>(),
+        [
+            "export-target-kbuild.sh",
+            "build-driver.sh",
+            "stage-tryboot.sh"
+        ]
+    );
+    assert!(
+        crossbuild_calls[1]
+            .arguments()
+            .windows(2)
+            .any(|pair| pair == ["--source-revision", DRIVER_COMMIT]),
+        "crossbuild did not bind the locked source revision"
     );
 }
 
@@ -398,6 +785,73 @@ fn sync_rejects_prebuilt_internal_kernel_vermagic_and_module_digest_drift() {
         assert!(
             manager.sync(&lock_for(&manifest)).is_err(),
             "drifted prebuilt archive was accepted"
+        );
+    }
+}
+
+#[test]
+fn sync_rejects_prebuilt_vermagic_suffix_and_bundle_manifest_digest_drift() {
+    for mutation in [
+        "vermagic-suffix",
+        "bundle-manifest-digest",
+        "missing-contract",
+    ] {
+        let source = source_archive();
+        let prebuilt = prebuilt_archive(
+            "6.18.34+rpt-rpi-v8",
+            "6.18.34+rpt-rpi-v8 SMP preempt mod_unload modversions aarch64",
+            None,
+        );
+        let mut manifest: serde_json::Value = serde_json::from_slice(&release_manifest(
+            &source,
+            Some((&prebuilt, "6.18.34+rpt-rpi-v8")),
+        ))
+        .expect("release manifest");
+        let exact = manifest["artifacts"]
+            .as_array_mut()
+            .expect("artifact array")
+            .iter_mut()
+            .find(|artifact| artifact["kind"] == "exact-kernel-bundle")
+            .expect("exact artifact");
+        match mutation {
+            "vermagic-suffix" => {
+                exact["vermagic"] =
+                    serde_json::json!("6.18.34+rpt-rpi-v8 SMP preempt mod_unload aarch64");
+            }
+            "bundle-manifest-digest" => {
+                exact["bundle_manifest_sha256"] = serde_json::json!(
+                    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                );
+            }
+            "missing-contract" => {
+                exact
+                    .as_object_mut()
+                    .expect("exact artifact object")
+                    .remove("bundle_manifest_sha256");
+            }
+            _ => unreachable!(),
+        }
+        let manifest = serde_json::to_vec(&manifest).expect("mutated manifest");
+        let manager = DriverManager::new(
+            FakeReleaseSource::with_assets([
+                ("driver-manifest.json".into(), manifest.clone()),
+                ("hyperpixel2r-kms-source.tar.zst".into(), source),
+                ("SBOM.spdx.json".into(), b"sbom".to_vec()),
+                (
+                    "hyperpixel2r-kms-6.18.34+rpt-rpi-v8-aarch64.tar.zst".into(),
+                    prebuilt,
+                ),
+            ]),
+            FakeReleaseVerifier::default(),
+            tempfile::tempdir()
+                .expect("temporary parent")
+                .keep()
+                .join("cache"),
+        );
+
+        assert!(
+            manager.sync(&lock_for(&manifest)).is_err(),
+            "prebuilt accepted {mutation} drift"
         );
     }
 }
@@ -488,12 +942,24 @@ fn github_release_source_is_fixed_to_the_external_repository_and_exact_tag() {
 }
 
 #[test]
-fn github_verifier_checks_the_release_and_attestation_for_every_downloaded_asset() {
-    let runner = RecordingRunner::default();
+fn github_verifier_binds_the_dereferenced_tag_commit_and_release_workflow_to_every_asset() {
+    let runner = SequencedRunner::new([
+        Ok(CommandOutput::success(
+            format!("tag\t{TAG_OBJECT}\n").into_bytes(),
+            Vec::new(),
+        )),
+        Ok(CommandOutput::success(
+            format!("commit\t{DRIVER_COMMIT}\n").into_bytes(),
+            Vec::new(),
+        )),
+        Ok(CommandOutput::success(Vec::new(), Vec::new())),
+        Ok(CommandOutput::success(Vec::new(), Vec::new())),
+    ]);
     let verifier = GhDriverReleaseVerifier::new(runner.clone());
+    let manifest = release_manifest(&source_archive(), None);
     verifier
         .verify(
-            &Version::parse("0.1.0-rc.11").expect("version"),
+            &lock_for(&manifest),
             &[
                 PathBuf::from("/cache/driver-manifest.json"),
                 PathBuf::from("/cache/source.tar.zst"),
@@ -502,8 +968,26 @@ fn github_verifier_checks_the_release_and_attestation_for_every_downloaded_asset
         .expect("verify driver release");
 
     let invocations = runner.invocations.lock().expect("verification invocations");
-    assert_eq!(invocations.len(), 2);
-    for (invocation, asset) in invocations
+    assert_eq!(invocations.len(), 4);
+    assert_eq!(
+        invocations[0].arguments(),
+        [
+            "api",
+            "repos/shayne/hyperpixel2r-kms/git/ref/tags/v0.1.0-rc.11",
+            "--jq",
+            r#".object.type + "\t" + .object.sha"#,
+        ]
+    );
+    assert_eq!(
+        invocations[1].arguments(),
+        [
+            "api",
+            &format!("repos/shayne/hyperpixel2r-kms/git/tags/{TAG_OBJECT}"),
+            "--jq",
+            r#".object.type + "\t" + .object.sha"#,
+        ]
+    );
+    for (invocation, asset) in invocations[2..]
         .iter()
         .zip(["/cache/driver-manifest.json", "/cache/source.tar.zst"])
     {
@@ -516,14 +1000,218 @@ fn github_verifier_checks_the_release_and_attestation_for_every_downloaded_asset
                 asset,
                 "-R",
                 "shayne/hyperpixel2r-kms",
+                "--signer-workflow",
+                "github.com/shayne/hyperpixel2r-kms/.github/workflows/release.yml",
+                "--source-digest",
+                DRIVER_COMMIT,
             ]
         );
     }
 }
 
+#[test]
+fn github_verifier_rejects_a_tag_dereferencing_to_another_commit() {
+    let runner = SequencedRunner::new([
+        Ok(CommandOutput::success(
+            format!("tag\t{TAG_OBJECT}\n").into_bytes(),
+            Vec::new(),
+        )),
+        Ok(CommandOutput::success(
+            b"commit\tbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n".to_vec(),
+            Vec::new(),
+        )),
+    ]);
+    let verifier = GhDriverReleaseVerifier::new(runner);
+    let manifest = release_manifest(&source_archive(), None);
+
+    assert!(
+        verifier
+            .verify(
+                &lock_for(&manifest),
+                &[
+                    PathBuf::from("/cache/driver-manifest.json"),
+                    PathBuf::from("/cache/source.tar.zst"),
+                ],
+            )
+            .is_err(),
+        "release tag pointing at another commit was accepted"
+    );
+}
+
+#[test]
+fn github_verifier_rejects_a_disallowed_attestation_signer() {
+    let runner = SequencedRunner::new([
+        Ok(CommandOutput::success(
+            format!("tag\t{TAG_OBJECT}\n").into_bytes(),
+            Vec::new(),
+        )),
+        Ok(CommandOutput::success(
+            format!("commit\t{DRIVER_COMMIT}\n").into_bytes(),
+            Vec::new(),
+        )),
+        Ok(CommandOutput::new(
+            1,
+            Vec::new(),
+            b"attestation signer workflow does not match\n".to_vec(),
+        )),
+    ]);
+    let verifier = GhDriverReleaseVerifier::new(runner);
+    let manifest = release_manifest(&source_archive(), None);
+
+    assert!(
+        verifier
+            .verify(
+                &lock_for(&manifest),
+                &[PathBuf::from("/cache/driver-manifest.json")],
+            )
+            .is_err(),
+        "attestation from a disallowed signer was accepted"
+    );
+}
+
+#[test]
+fn release_verification_preserves_bounded_nonzero_and_spawn_diagnostics() {
+    let manifest = release_manifest(&source_archive(), None);
+    let lock = lock_for(&manifest);
+    let mut stderr = vec![b'x'; 8 * 1024];
+    stderr.extend_from_slice(b"\x00unsafe-control");
+    let nonzero = GhDriverReleaseVerifier::new(SequencedRunner::new([
+        Ok(CommandOutput::success(
+            format!("tag\t{TAG_OBJECT}\n").into_bytes(),
+            Vec::new(),
+        )),
+        Ok(CommandOutput::success(
+            format!("commit\t{DRIVER_COMMIT}\n").into_bytes(),
+            Vec::new(),
+        )),
+        Ok(CommandOutput::new(23, Vec::new(), stderr)),
+    ]));
+    let error = nonzero
+        .verify(&lock, &[PathBuf::from("/cache/driver-manifest.json")])
+        .expect_err("nonzero attestation verification");
+    match error {
+        DriverError::ReleaseCommandFailed {
+            program,
+            status,
+            stderr,
+        } => {
+            assert_eq!(program, "gh");
+            assert_eq!(status, 23);
+            assert!(!stderr.is_empty());
+            assert!(stderr.len() <= 4096);
+            assert!(!stderr.contains('\0'));
+        }
+        other => panic!("wrong nonzero diagnostic: {other:?}"),
+    }
+
+    let spawn = GhDriverReleaseVerifier::new(SequencedRunner::new([Err(RunnerError::TimedOut)]));
+    let error = spawn
+        .verify(&lock, &[PathBuf::from("/cache/driver-manifest.json")])
+        .expect_err("spawn failure");
+    assert!(matches!(
+        error,
+        DriverError::ReleaseCommandSpawn {
+            ref program,
+            source: RunnerError::TimedOut,
+        } if program == "gh"
+    ));
+}
+
+#[test]
+fn lifecycle_tools_preserve_bounded_nonzero_and_spawn_diagnostics() {
+    let context = DriverContext {
+        target: "shayne@planeradar.local".into(),
+        kernel_release: "6.18.34+rpt-rpi-v8".into(),
+        kernel_export: PathBuf::from("/cache/kernel"),
+        artifacts: PathBuf::from("/cache/artifacts"),
+        replace_overlay: "planeradar-hyperpixel2r-eefaf3ae40fd".into(),
+    };
+    let nonzero = DriverTool::new(
+        SequencedRunner::new([Ok(CommandOutput::new(19, Vec::new(), vec![b'e'; 8 * 1024]))]),
+        PathBuf::from("/cache/source"),
+        DriverPlan::CrossBuild {
+            source: PathBuf::from("/cache/source"),
+        },
+        context.clone(),
+        "0.1.0".into(),
+        DRIVER_COMMIT.into(),
+    )
+    .expect("nonzero tool");
+    let error = nonzero
+        .run(DriverAction::StageTryboot)
+        .expect_err("nonzero lifecycle command");
+    match error {
+        DriverError::ToolCommandFailed {
+            action,
+            program,
+            status,
+            stderr,
+        } => {
+            assert_eq!(action, DriverAction::StageTryboot);
+            assert_eq!(program, "bash");
+            assert_eq!(status, 19);
+            assert!(!stderr.is_empty());
+            assert!(stderr.len() <= 4096);
+        }
+        other => panic!("wrong lifecycle nonzero diagnostic: {other:?}"),
+    }
+
+    let spawn = DriverTool::new(
+        SequencedRunner::new([Err(RunnerError::Failed)]),
+        PathBuf::from("/cache/source"),
+        DriverPlan::CrossBuild {
+            source: PathBuf::from("/cache/source"),
+        },
+        context,
+        "0.1.0".into(),
+        DRIVER_COMMIT.into(),
+    )
+    .expect("spawn tool");
+    let error = spawn
+        .run(DriverAction::RollbackBoot)
+        .expect_err("lifecycle spawn failure");
+    assert!(matches!(
+        error,
+        DriverError::ToolCommandSpawn {
+            action: DriverAction::RollbackBoot,
+            ref program,
+            source: RunnerError::Failed,
+        } if program == "bash"
+    ));
+}
+
 #[derive(Clone, Default)]
 struct RecordingRunner {
     invocations: Arc<Mutex<Vec<Invocation>>>,
+}
+
+#[derive(Clone)]
+struct SequencedRunner {
+    invocations: Arc<Mutex<Vec<Invocation>>>,
+    results: Arc<Mutex<VecDeque<Result<CommandOutput, RunnerError>>>>,
+}
+
+impl SequencedRunner {
+    fn new(results: impl IntoIterator<Item = Result<CommandOutput, RunnerError>>) -> Self {
+        Self {
+            invocations: Arc::new(Mutex::new(Vec::new())),
+            results: Arc::new(Mutex::new(results.into_iter().collect())),
+        }
+    }
+}
+
+impl CommandRunner for SequencedRunner {
+    fn run(&self, invocation: Invocation) -> Result<CommandOutput, RunnerError> {
+        self.invocations
+            .lock()
+            .expect("sequenced invocation lock")
+            .push(invocation);
+        self.results
+            .lock()
+            .expect("sequenced results lock")
+            .pop_front()
+            .expect("sequenced runner exhausted")
+    }
 }
 
 impl CommandRunner for RecordingRunner {
@@ -553,6 +1241,9 @@ fn typed_actions_invoke_only_the_exact_external_driver_scripts_and_parse_verific
     let tool = DriverTool::new(
         runner.clone(),
         PathBuf::from("/cache/source"),
+        DriverPlan::CrossBuild {
+            source: PathBuf::from("/cache/source"),
+        },
         DriverContext {
             target: "shayne@planeradar.local".into(),
             kernel_release: "6.18.34+rpt-rpi-v8".into(),
@@ -560,6 +1251,8 @@ fn typed_actions_invoke_only_the_exact_external_driver_scripts_and_parse_verific
             artifacts: PathBuf::from("/cache/artifacts"),
             replace_overlay: "planeradar-hyperpixel2r-eefaf3ae40fd".into(),
         },
+        "0.1.0".into(),
+        DRIVER_COMMIT.into(),
     )
     .expect("valid driver tool");
 
@@ -631,6 +1324,204 @@ fn typed_actions_invoke_only_the_exact_external_driver_scripts_and_parse_verific
             .any(|pair| pair == ["--kernel-target", "/cache/kernel"]),
         "stage did not consume the exported kernel target path"
     );
+    assert_eq!(
+        invocations[3].arguments(),
+        [
+            "/cache/source/scripts/verify-boot.sh",
+            "--target",
+            "shayne@planeradar.local",
+            "--expect-tryboot",
+            "--expect-driver-version",
+            "0.1.0",
+            "--expect-overlay-file",
+            "hyperpixel2r-kms-ca95ffeb30b3.dtbo",
+            "--json",
+        ]
+    );
+}
+
+#[test]
+fn verify_boot_rejects_json_for_a_different_locked_driver_version() {
+    let runner = SequencedRunner::new([Ok(CommandOutput::success(
+        br#"{"schema_version":1,"driver_version":"0.1.1","kernel_release":"6.18.34+rpt-rpi-v8","module":"hyperpixel2r_kms","drm_mode":"480x480","touch":true,"sdl_driver":"KMSDRM","renderer":"opengles2","accepted":true}"#.to_vec(),
+        Vec::new(),
+    ))]);
+    let tool = DriverTool::new(
+        runner.clone(),
+        PathBuf::from("/cache/source"),
+        DriverPlan::CrossBuild {
+            source: PathBuf::from("/cache/source"),
+        },
+        DriverContext {
+            target: "shayne@planeradar.local".into(),
+            kernel_release: "6.18.34+rpt-rpi-v8".into(),
+            kernel_export: PathBuf::from("/cache/kernel"),
+            artifacts: PathBuf::from("/cache/artifacts"),
+            replace_overlay: "planeradar-hyperpixel2r-eefaf3ae40fd".into(),
+        },
+        "0.1.0".into(),
+        DRIVER_COMMIT.into(),
+    )
+    .expect("valid locked tool");
+
+    assert!(matches!(
+        tool.run(DriverAction::VerifyBoot),
+        Err(DriverError::InvalidVerification)
+    ));
+    assert_eq!(
+        runner.invocations.lock().expect("invocation lock")[0].arguments(),
+        [
+            "/cache/source/scripts/verify-boot.sh",
+            "--target",
+            "shayne@planeradar.local",
+            "--expect-tryboot",
+            "--expect-driver-version",
+            "0.1.0",
+            "--expect-overlay-file",
+            "hyperpixel2r-kms-ca95ffeb30b3.dtbo",
+            "--json",
+        ]
+    );
+}
+
+#[test]
+fn normal_boot_verification_keeps_the_same_locked_candidate_identity() {
+    let runner = RecordingRunner::default();
+    let tool = DriverTool::new(
+        runner.clone(),
+        PathBuf::from("/cache/source"),
+        DriverPlan::CrossBuild {
+            source: PathBuf::from("/cache/source"),
+        },
+        DriverContext {
+            target: "shayne@planeradar.local".into(),
+            kernel_release: "6.18.34+rpt-rpi-v8".into(),
+            kernel_export: PathBuf::from("/cache/kernel"),
+            artifacts: PathBuf::from("/cache/artifacts"),
+            replace_overlay: "planeradar-hyperpixel2r-eefaf3ae40fd".into(),
+        },
+        "0.1.0".into(),
+        DRIVER_COMMIT.into(),
+    )
+    .expect("valid locked tool");
+
+    let verification = tool.verify_normal_boot().expect("strict normal boot");
+    assert!(verification.accepted);
+    assert_eq!(
+        runner.invocations.lock().expect("invocation lock")[0].arguments(),
+        [
+            "/cache/source/scripts/verify-boot.sh",
+            "--target",
+            "shayne@planeradar.local",
+            "--expect-normal",
+            "--expect-driver-version",
+            "0.1.0",
+            "--expect-overlay-file",
+            "hyperpixel2r-kms-ca95ffeb30b3.dtbo",
+            "--json",
+        ]
+    );
+}
+
+#[test]
+fn legacy_cleanup_uses_the_locked_overlay_through_the_existing_uninstall_action() {
+    let runner = RecordingRunner::default();
+    let tool = DriverTool::new(
+        runner.clone(),
+        PathBuf::from("/cache/source"),
+        DriverPlan::CrossBuild {
+            source: PathBuf::from("/cache/source"),
+        },
+        DriverContext {
+            target: "shayne@planeradar.local".into(),
+            kernel_release: "6.18.34+rpt-rpi-v8".into(),
+            kernel_export: PathBuf::from("/cache/kernel"),
+            artifacts: PathBuf::from("/cache/artifacts"),
+            replace_overlay: "planeradar-hyperpixel2r-eefaf3ae40fd".into(),
+        },
+        "0.1.0".into(),
+        DRIVER_COMMIT.into(),
+    )
+    .expect("valid locked tool");
+
+    tool.cleanup_legacy_planeradar()
+        .expect("exact legacy cleanup");
+
+    assert_eq!(
+        runner.invocations.lock().expect("invocation lock")[0].arguments(),
+        [
+            "/cache/source/scripts/uninstall.sh",
+            "--target",
+            "shayne@planeradar.local",
+            "--cleanup-legacy-planeradar",
+            "--expect-overlay-file",
+            "hyperpixel2r-kms-ca95ffeb30b3.dtbo",
+        ]
+    );
+}
+
+#[test]
+#[ignore = "runs the explicitly selected live driver lifecycle phase"]
+fn locked_release_runs_the_selected_live_phase_through_the_typed_adapter() {
+    let target =
+        std::env::var("PLANERADAR_DRIVER_LIVE_TARGET").expect("live target environment variable");
+    let workspace = PathBuf::from(
+        std::env::var_os("PLANERADAR_DRIVER_LIVE_WORKSPACE")
+            .expect("live workspace environment variable"),
+    );
+    let replace_overlay = std::env::var("PLANERADAR_DRIVER_REPLACE_OVERLAY")
+        .expect("currently accepted overlay environment variable");
+    let phase =
+        std::env::var("PLANERADAR_DRIVER_LIVE_PHASE").expect("live lifecycle phase variable");
+    assert!(workspace.is_absolute());
+    let manager = DriverManager::new(
+        GhDriverReleaseSource::system(),
+        GhDriverReleaseVerifier::system(),
+        workspace.join("cache"),
+    );
+    let synced = manager
+        .sync(&DriverLock::checked_in().expect("checked-in driver lock"))
+        .expect("sync locked driver release");
+    let tool = synced
+        .tool(
+            SystemCommandRunner,
+            &TargetProbe::new("6.18.34+rpt-rpi-v8", EXPECTED_VERMAGIC).expect("live target probe"),
+            DriverContext {
+                target,
+                kernel_release: "6.18.34+rpt-rpi-v8".into(),
+                kernel_export: workspace.join("kernel-target"),
+                artifacts: workspace.join("artifacts"),
+                replace_overlay,
+            },
+        )
+        .expect("live locked driver tool");
+
+    match phase.as_str() {
+        "prepare-and-stage" => tool
+            .prepare_and_stage()
+            .expect("prepare and stage live driver"),
+        "accept-tryboot" => {
+            let verification = tool
+                .run(DriverAction::VerifyBoot)
+                .expect("strict tryboot verification")
+                .expect("verification JSON");
+            assert!(verification.accepted);
+            tool.run(DriverAction::CommitBoot)
+                .expect("commit accepted tryboot");
+        }
+        "accept-normal-cleanup" => {
+            assert!(
+                tool.verify_normal_boot()
+                    .expect("strict normal boot")
+                    .accepted
+            );
+            tool.cleanup_legacy_planeradar()
+                .expect("exact legacy cleanup");
+            tool.cleanup_legacy_planeradar()
+                .expect("idempotent exact legacy cleanup");
+        }
+        _ => panic!("unsupported live driver phase: {phase}"),
+    }
 }
 
 #[test]
@@ -653,18 +1544,19 @@ fn locked_release_builds_the_live_kernel_from_separate_cache_paths() {
         .expect("sync locked driver release");
     let kernel_export = workspace.join("kernel-target");
     let artifacts = workspace.join("artifacts");
-    let tool = DriverTool::new(
-        SystemCommandRunner,
-        synced.source_root().to_owned(),
-        DriverContext {
-            target,
-            kernel_release: "6.18.34+rpt-rpi-v8".into(),
-            kernel_export: kernel_export.clone(),
-            artifacts: artifacts.clone(),
-            replace_overlay: "planeradar-hyperpixel2r-eefaf3ae40fd".into(),
-        },
-    )
-    .expect("live driver tool");
+    let tool = synced
+        .tool(
+            SystemCommandRunner,
+            &TargetProbe::new("6.18.34+rpt-rpi-v8", EXPECTED_VERMAGIC).expect("live target probe"),
+            DriverContext {
+                target,
+                kernel_release: "6.18.34+rpt-rpi-v8".into(),
+                kernel_export: kernel_export.clone(),
+                artifacts: artifacts.clone(),
+                replace_overlay: "planeradar-hyperpixel2r-eefaf3ae40fd".into(),
+            },
+        )
+        .expect("live driver tool");
 
     tool.run(DriverAction::ExportKernel)
         .expect("export live kernel");
@@ -703,18 +1595,19 @@ fn locked_release_stages_the_live_tryboot_through_the_typed_adapter() {
     let synced = manager
         .sync(&DriverLock::checked_in().expect("checked-in driver lock"))
         .expect("sync locked driver release");
-    let tool = DriverTool::new(
-        SystemCommandRunner,
-        synced.source_root().to_owned(),
-        DriverContext {
-            target,
-            kernel_release: "6.18.34+rpt-rpi-v8".into(),
-            kernel_export: workspace.join("kernel-target"),
-            artifacts: workspace.join("artifacts"),
-            replace_overlay: "planeradar-hyperpixel2r-eefaf3ae40fd".into(),
-        },
-    )
-    .expect("live driver tool");
+    let tool = synced
+        .tool(
+            SystemCommandRunner,
+            &TargetProbe::new("6.18.34+rpt-rpi-v8", EXPECTED_VERMAGIC).expect("live target probe"),
+            DriverContext {
+                target,
+                kernel_release: "6.18.34+rpt-rpi-v8".into(),
+                kernel_export: workspace.join("kernel-target"),
+                artifacts: workspace.join("artifacts"),
+                replace_overlay: "planeradar-hyperpixel2r-eefaf3ae40fd".into(),
+            },
+        )
+        .expect("live driver tool");
 
     tool.run(DriverAction::StageTryboot)
         .expect("stage locked driver into one-shot tryboot");

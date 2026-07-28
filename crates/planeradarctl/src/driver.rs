@@ -18,7 +18,7 @@ use thiserror::Error;
 use crate::{
     config::{DRIVER_REPOSITORY, DriverLock},
     release::{ReleaseSourceError, StreamingCommandRunner, SystemStreamingCommandRunner},
-    transport::{CommandRunner, Invocation, SystemCommandRunner},
+    transport::{CommandOutput, CommandRunner, Invocation, RunnerError, SystemCommandRunner},
 };
 
 const DRIVER_MANIFEST_NAME: &str = "driver-manifest.json";
@@ -26,22 +26,39 @@ const DRIVER_SOURCE_NAME: &str = "hyperpixel2r-kms-source.tar.zst";
 const DRIVER_SBOM_NAME: &str = "SBOM.spdx.json";
 const MAX_DRIVER_MANIFEST_BYTES: usize = 64 * 1024;
 const MAX_DRIVER_ARTIFACT_BYTES: u64 = 1024 * 1024 * 1024;
+const MAX_ARCHIVE_ENTRY_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_ARCHIVE_TOTAL_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_ARCHIVE_ENTRIES: usize = 1024;
+const MAX_ARCHIVE_PATH_DEPTH: usize = 32;
 const DRIVER_GITHUB_REPOSITORY: &str = "shayne/hyperpixel2r-kms";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TargetProbe {
     kernel_release: String,
+    vermagic: String,
 }
 
 impl TargetProbe {
-    pub fn new(kernel_release: impl Into<String>) -> Result<Self, DriverError> {
+    pub fn new(
+        kernel_release: impl Into<String>,
+        vermagic: impl Into<String>,
+    ) -> Result<Self, DriverError> {
         let kernel_release = kernel_release.into();
+        let vermagic = vermagic.into();
         validate_kernel_release(&kernel_release)?;
-        Ok(Self { kernel_release })
+        validate_vermagic(&vermagic, &kernel_release)?;
+        Ok(Self {
+            kernel_release,
+            vermagic,
+        })
     }
 
     pub fn kernel_release(&self) -> &str {
         &self.kernel_release
+    }
+
+    pub fn vermagic(&self) -> &str {
+        &self.vermagic
     }
 }
 
@@ -49,6 +66,7 @@ impl TargetProbe {
 pub struct PrebuiltBundle {
     path: PathBuf,
     kernel_release: String,
+    vermagic: String,
 }
 
 impl fmt::Debug for PrebuiltBundle {
@@ -57,6 +75,7 @@ impl fmt::Debug for PrebuiltBundle {
             .debug_struct("PrebuiltBundle")
             .field("path", &"<redacted>")
             .field("kernel_release", &self.kernel_release)
+            .field("vermagic", &self.vermagic)
             .finish()
     }
 }
@@ -65,25 +84,26 @@ impl PrebuiltBundle {
     pub fn verified(
         path: PathBuf,
         kernel_release: impl Into<String>,
-        vermagic: &str,
-        internal_manifest_digest: &str,
-        expected_manifest_digest: &str,
+        actual_vermagic: &str,
+        expected_vermagic: &str,
+        actual_bundle_manifest_digest: &str,
+        expected_bundle_manifest_digest: &str,
     ) -> Result<Self, DriverError> {
         let kernel_release = kernel_release.into();
         validate_kernel_release(&kernel_release)?;
-        let vermagic_release = vermagic
-            .split_whitespace()
-            .next()
-            .ok_or(DriverError::InvalidPrebuiltIdentity)?;
-        if vermagic_release != kernel_release
-            || internal_manifest_digest != expected_manifest_digest
-            || !is_lower_hex(expected_manifest_digest, 64)
+        validate_vermagic(actual_vermagic, &kernel_release)?;
+        validate_vermagic(expected_vermagic, &kernel_release)?;
+        if actual_vermagic != expected_vermagic
+            || actual_bundle_manifest_digest != expected_bundle_manifest_digest
+            || !is_lower_hex(actual_bundle_manifest_digest, 64)
+            || !is_lower_hex(expected_bundle_manifest_digest, 64)
         {
             return Err(DriverError::InvalidPrebuiltIdentity);
         }
         Ok(Self {
             path,
             kernel_release,
+            vermagic: actual_vermagic.to_owned(),
         })
     }
 }
@@ -117,11 +137,9 @@ impl DriverResolver {
     }
 
     pub fn resolve(&self, probe: &TargetProbe) -> Result<DriverPlan, DriverError> {
-        if let Some(bundle) = self
-            .prebuilt
-            .iter()
-            .find(|bundle| bundle.kernel_release == probe.kernel_release)
-        {
+        if let Some(bundle) = self.prebuilt.iter().find(|bundle| {
+            bundle.kernel_release == probe.kernel_release && bundle.vermagic == probe.vermagic
+        }) {
             return Ok(DriverPlan::Prebuilt {
                 archive: bundle.path.clone(),
             });
@@ -142,7 +160,7 @@ pub trait DriverReleaseSource {
 }
 
 pub trait DriverReleaseVerifier {
-    fn verify(&self, version: &Version, assets: &[PathBuf]) -> Result<(), io::Error>;
+    fn verify(&self, lock: &DriverLock, assets: &[PathBuf]) -> Result<(), DriverError>;
 }
 
 pub struct GhDriverReleaseSource<R = SystemStreamingCommandRunner> {
@@ -208,10 +226,40 @@ impl<R> GhDriverReleaseVerifier<R> {
 }
 
 impl<R: CommandRunner> DriverReleaseVerifier for GhDriverReleaseVerifier<R> {
-    fn verify(&self, _version: &Version, assets: &[PathBuf]) -> Result<(), io::Error> {
+    fn verify(&self, lock: &DriverLock, assets: &[PathBuf]) -> Result<(), DriverError> {
+        lock.validate().map_err(|_| DriverError::InvalidLock)?;
+        let tag = format!("v{}", lock.version);
+        let reference = require_success(
+            &self.runner,
+            Invocation::new(
+                "gh",
+                vec![
+                    "api".into(),
+                    format!("repos/{DRIVER_GITHUB_REPOSITORY}/git/ref/tags/{tag}"),
+                    "--jq".into(),
+                    r#".object.type + "\t" + .object.sha"#.into(),
+                ],
+            ),
+        )?;
+        let tag_object = parse_git_object(reference.stdout(), "tag")?;
+        let dereferenced = require_success(
+            &self.runner,
+            Invocation::new(
+                "gh",
+                vec![
+                    "api".into(),
+                    format!("repos/{DRIVER_GITHUB_REPOSITORY}/git/tags/{tag_object}"),
+                    "--jq".into(),
+                    r#".object.type + "\t" + .object.sha"#.into(),
+                ],
+            ),
+        )?;
+        if parse_git_object(dereferenced.stdout(), "commit")? != lock.commit {
+            return Err(DriverError::InvalidReleaseTag);
+        }
         for asset in assets {
             if !asset.is_absolute() {
-                return Err(io::Error::other("driver asset path is not absolute"));
+                return Err(DriverError::InvalidPath);
             }
             require_success(
                 &self.runner,
@@ -223,6 +271,13 @@ impl<R: CommandRunner> DriverReleaseVerifier for GhDriverReleaseVerifier<R> {
                         asset.clone().into_os_string(),
                         "-R".into(),
                         DRIVER_GITHUB_REPOSITORY.into(),
+                        "--signer-workflow".into(),
+                        format!(
+                            "github.com/{DRIVER_GITHUB_REPOSITORY}/.github/workflows/release.yml"
+                        )
+                        .into(),
+                        "--source-digest".into(),
+                        lock.commit.clone().into(),
                     ],
                 ),
             )?;
@@ -231,16 +286,39 @@ impl<R: CommandRunner> DriverReleaseVerifier for GhDriverReleaseVerifier<R> {
     }
 }
 
-fn require_success<R: CommandRunner>(runner: &R, invocation: Invocation) -> Result<(), io::Error> {
+fn require_success<R: CommandRunner>(
+    runner: &R,
+    invocation: Invocation,
+) -> Result<CommandOutput, DriverError> {
+    let program = invocation.program().to_owned();
     let output = runner
         .run(invocation)
-        .map_err(|_| io::Error::other("driver release verification command failed"))?;
+        .map_err(|source| DriverError::ReleaseCommandSpawn {
+            program: program.clone(),
+            source,
+        })?;
     if output.status() != 0 {
-        return Err(io::Error::other(
-            "driver release verification command failed",
-        ));
+        return Err(DriverError::ReleaseCommandFailed {
+            program,
+            status: output.status(),
+            stderr: bounded_diagnostic(output.stderr()),
+        });
     }
-    Ok(())
+    Ok(output)
+}
+
+fn parse_git_object(bytes: &[u8], expected_type: &str) -> Result<String, DriverError> {
+    let value = std::str::from_utf8(bytes)
+        .map_err(|_| DriverError::InvalidReleaseTag)?
+        .strip_suffix('\n')
+        .ok_or(DriverError::InvalidReleaseTag)?;
+    let (object_type, sha) = value
+        .split_once('\t')
+        .ok_or(DriverError::InvalidReleaseTag)?;
+    if object_type != expected_type || !is_lower_hex(sha, 40) {
+        return Err(DriverError::InvalidReleaseTag);
+    }
+    Ok(sha.to_owned())
 }
 
 pub struct DriverManager<S, V> {
@@ -309,9 +387,7 @@ impl<S: DriverReleaseSource, V: DriverReleaseVerifier> DriverManager<S, V> {
             assets.push(path.clone());
             downloaded.insert(artifact.name().to_owned(), path);
         }
-        self.verifier
-            .verify(version, &assets)
-            .map_err(|_| DriverError::VerificationFailed)?;
+        self.verifier.verify(&lock, &assets)?;
         for artifact in &manifest.artifacts {
             let path = downloaded
                 .get(artifact.name())
@@ -369,6 +445,7 @@ impl<S: DriverReleaseSource, V: DriverReleaseVerifier> DriverManager<S, V> {
     }
 
     fn materialize(&self, acquired: AcquiredDriver) -> Result<SyncedDriver, DriverError> {
+        let driver_version = acquired.manifest.driver_version.clone();
         let source_artifact = acquired
             .manifest
             .artifacts
@@ -386,6 +463,7 @@ impl<S: DriverReleaseSource, V: DriverReleaseVerifier> DriverManager<S, V> {
                 .join("sources")
                 .join(source_artifact.sha256()),
         )?;
+        validate_source_identity(&source_root, &acquired.manifest.source, &acquired.lock)?;
 
         let mut prebuilt = Vec::new();
         for artifact in acquired
@@ -394,7 +472,13 @@ impl<S: DriverReleaseSource, V: DriverReleaseVerifier> DriverManager<S, V> {
             .iter()
             .filter(|artifact| matches!(artifact, DriverArtifact::Prebuilt { .. }))
         {
-            let DriverArtifact::Prebuilt { kernel_release, .. } = artifact else {
+            let DriverArtifact::Prebuilt {
+                kernel_release,
+                vermagic,
+                bundle_manifest_sha256,
+                ..
+            } = artifact
+            else {
                 unreachable!()
             };
             let archive = acquired
@@ -405,18 +489,26 @@ impl<S: DriverReleaseSource, V: DriverReleaseVerifier> DriverManager<S, V> {
                 archive,
                 &self.cache_root.join("prebuilt").join(artifact.sha256()),
             )?;
-            let identity = validate_prebuilt(&extracted, kernel_release, &acquired.lock.commit)?;
+            let identity = validate_prebuilt(
+                &extracted,
+                kernel_release,
+                &acquired.lock.commit,
+                vermagic,
+                bundle_manifest_sha256,
+            )?;
             prebuilt.push(PrebuiltBundle::verified(
                 extracted,
                 identity.kernel_release,
                 &identity.vermagic,
-                &acquired.lock.manifest_sha256,
-                &acquired.lock.manifest_sha256,
+                vermagic,
+                &identity.bundle_manifest_sha256,
+                bundle_manifest_sha256,
             )?);
         }
         let resolver = DriverResolver::new(source_root.clone(), prebuilt)?;
         Ok(SyncedDriver {
             lock: acquired.lock,
+            driver_version,
             source_root,
             resolver,
         })
@@ -425,6 +517,7 @@ impl<S: DriverReleaseSource, V: DriverReleaseVerifier> DriverManager<S, V> {
 
 pub struct SyncedDriver {
     lock: DriverLock,
+    driver_version: String,
     source_root: PathBuf,
     resolver: DriverResolver,
 }
@@ -440,6 +533,25 @@ impl SyncedDriver {
 
     pub fn resolver(&self) -> &DriverResolver {
         &self.resolver
+    }
+
+    pub fn tool<R>(
+        &self,
+        runner: R,
+        probe: &TargetProbe,
+        context: DriverContext,
+    ) -> Result<DriverTool<R>, DriverError> {
+        if context.kernel_release != probe.kernel_release {
+            return Err(DriverError::InvalidContext);
+        }
+        DriverTool::new(
+            runner,
+            self.source_root.clone(),
+            self.resolver.resolve(probe)?,
+            context,
+            self.driver_version.clone(),
+            self.lock.commit.clone(),
+        )
     }
 }
 
@@ -521,11 +633,15 @@ impl DriverManifest {
                     name,
                     architecture,
                     kernel_release,
+                    vermagic,
+                    bundle_manifest_sha256,
                     ..
                 } => {
                     validate_kernel_release(kernel_release)?;
                     if architecture != "aarch64"
                         || name != &format!("hyperpixel2r-kms-{kernel_release}-aarch64.tar.zst")
+                        || validate_vermagic(vermagic, kernel_release).is_err()
+                        || !is_lower_hex(bundle_manifest_sha256, 64)
                         || !kernels.insert(kernel_release)
                     {
                         return Err(DriverError::InvalidManifest);
@@ -547,6 +663,41 @@ struct DriverSourceIdentity {
     commit: String,
     tree: String,
     date_epoch: u64,
+}
+
+fn validate_source_identity(
+    source_root: &Path,
+    expected: &DriverSourceIdentity,
+    lock: &DriverLock,
+) -> Result<(), DriverError> {
+    let identity_path = source_root.join("release/source-identity.txt");
+    let metadata = identity_path.symlink_metadata().map_err(DriverError::Io)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(DriverError::InvalidManifest);
+    }
+    #[cfg(unix)]
+    if metadata.nlink() != 1 || metadata.mode() & 0o777 != 0o644 {
+        return Err(DriverError::InvalidManifest);
+    }
+    let contents = fs::read_to_string(identity_path).map_err(DriverError::Io)?;
+    let mut fields = BTreeMap::new();
+    for line in contents.lines() {
+        let (key, value) = line.split_once('\t').ok_or(DriverError::InvalidManifest)?;
+        if key.is_empty() || value.is_empty() || fields.insert(key, value).is_some() {
+            return Err(DriverError::InvalidManifest);
+        }
+    }
+    if fields.len() != 4
+        || fields.get("schema_version") != Some(&"1")
+        || fields.get("repository") != Some(&expected.repository.as_str())
+        || fields.get("source_revision") != Some(&expected.commit.as_str())
+        || fields.get("source_tree") != Some(&expected.tree.as_str())
+        || expected.repository != lock.repository
+        || expected.commit != lock.commit
+    {
+        return Err(DriverError::InvalidManifest);
+    }
+    Ok(())
 }
 
 #[derive(Debug, Deserialize)]
@@ -590,6 +741,8 @@ enum DriverArtifact {
         size: u64,
         architecture: String,
         kernel_release: String,
+        vermagic: String,
+        bundle_manifest_sha256: String,
     },
 }
 
@@ -757,8 +910,16 @@ fn ensure_directory(path: &Path) -> Result<(), DriverError> {
         return Ok(());
     }
     let parent = path.parent().ok_or(DriverError::InvalidPath)?;
-    if parent != path && !parent.exists() {
-        ensure_directory(parent)?;
+    if parent != path {
+        match parent.symlink_metadata() {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                    return Err(DriverError::UnsafeCache);
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => ensure_directory(parent)?,
+            Err(error) => return Err(DriverError::Io(error)),
+        }
     }
     #[cfg(unix)]
     fs::DirBuilder::new()
@@ -816,9 +977,6 @@ fn validate_regular_digest(
 }
 
 fn extract_archive(archive: &Path, destination: &Path) -> Result<PathBuf, DriverError> {
-    if destination.exists() || destination.symlink_metadata().is_ok() {
-        return validate_materialized(destination);
-    }
     let parent = destination.parent().ok_or(DriverError::InvalidPath)?;
     ensure_directory(parent)?;
     let temporary = tempfile::Builder::new()
@@ -828,14 +986,35 @@ fn extract_archive(archive: &Path, destination: &Path) -> Result<PathBuf, Driver
     let decoder = zstd::Decoder::new(File::open(archive).map_err(DriverError::Io)?)
         .map_err(DriverError::Io)?;
     let mut tar = tar::Archive::new(decoder);
+    let mut entry_count = 0_usize;
+    let mut total_bytes = 0_u64;
     for entry in tar.entries().map_err(DriverError::Io)? {
         let mut entry = entry.map_err(DriverError::Io)?;
+        entry_count = entry_count
+            .checked_add(1)
+            .ok_or(DriverError::UnsafeArchive)?;
+        if entry_count > MAX_ARCHIVE_ENTRIES {
+            return Err(DriverError::UnsafeArchive);
+        }
+        let entry_bytes = entry
+            .header()
+            .size()
+            .map_err(|_| DriverError::UnsafeArchive)?;
+        if entry_bytes > MAX_ARCHIVE_ENTRY_BYTES {
+            return Err(DriverError::UnsafeArchive);
+        }
+        total_bytes = total_bytes
+            .checked_add(entry_bytes)
+            .ok_or(DriverError::UnsafeArchive)?;
+        if total_bytes > MAX_ARCHIVE_TOTAL_BYTES {
+            return Err(DriverError::UnsafeArchive);
+        }
         let entry_type = entry.header().entry_type();
         if !entry_type.is_file() && !entry_type.is_dir() {
             return Err(DriverError::UnsafeArchive);
         }
         let relative = entry.path().map_err(|_| DriverError::UnsafeArchive)?;
-        if !safe_relative(&relative) {
+        if !safe_relative(&relative) || relative.components().count() > MAX_ARCHIVE_PATH_DEPTH {
             return Err(DriverError::UnsafeArchive);
         }
         let output = temporary.path().join(&relative);
@@ -855,9 +1034,20 @@ fn extract_archive(archive: &Path, destination: &Path) -> Result<PathBuf, Driver
         #[cfg(unix)]
         options.mode(final_mode);
         let mut file = options.open(&output).map_err(DriverError::Io)?;
-        io::copy(&mut entry, &mut file).map_err(DriverError::Io)?;
+        let copied = io::copy(&mut entry, &mut file).map_err(DriverError::Io)?;
+        if copied != entry_bytes {
+            return Err(DriverError::UnsafeArchive);
+        }
         file.flush().map_err(DriverError::Io)?;
         file.sync_all().map_err(DriverError::Io)?;
+    }
+    let fresh_root = validate_materialized(temporary.path())?;
+    if destination.exists() || destination.symlink_metadata().is_ok() {
+        let existing_root = validate_materialized(destination)?;
+        if materialized_manifest(&existing_root)? != materialized_manifest(&fresh_root)? {
+            return Err(DriverError::UnsafeCache);
+        }
+        return Ok(existing_root);
     }
     let temporary_path = temporary.keep();
     fs::rename(&temporary_path, destination).map_err(DriverError::Io)?;
@@ -929,22 +1119,112 @@ fn validate_tree(path: &Path) -> Result<(), DriverError> {
     Ok(())
 }
 
+#[derive(Debug, Eq, PartialEq)]
+enum MaterializedEntry {
+    Directory {
+        mode: u32,
+        uid: u32,
+        gid: u32,
+    },
+    File {
+        mode: u32,
+        uid: u32,
+        gid: u32,
+        size: u64,
+        sha256: String,
+    },
+}
+
+fn materialized_manifest(root: &Path) -> Result<BTreeMap<PathBuf, MaterializedEntry>, DriverError> {
+    let mut manifest = BTreeMap::new();
+    collect_materialized_manifest(root, root, &mut manifest)?;
+    Ok(manifest)
+}
+
+fn collect_materialized_manifest(
+    root: &Path,
+    directory: &Path,
+    manifest: &mut BTreeMap<PathBuf, MaterializedEntry>,
+) -> Result<(), DriverError> {
+    for entry in fs::read_dir(directory).map_err(DriverError::Io)? {
+        let entry = entry.map_err(DriverError::Io)?;
+        let path = entry.path();
+        let relative = path
+            .strip_prefix(root)
+            .map_err(|_| DriverError::UnsafeCache)?
+            .to_owned();
+        let metadata = path.symlink_metadata().map_err(DriverError::Io)?;
+        if metadata.file_type().is_symlink() {
+            return Err(DriverError::UnsafeCache);
+        }
+        #[cfg(unix)]
+        let (mode, uid, gid) = (metadata.mode() & 0o777, metadata.uid(), metadata.gid());
+        #[cfg(not(unix))]
+        let (mode, uid, gid) = (0, 0, 0);
+        if metadata.is_dir() {
+            manifest.insert(relative, MaterializedEntry::Directory { mode, uid, gid });
+            collect_materialized_manifest(root, &path, manifest)?;
+        } else if metadata.is_file() {
+            #[cfg(unix)]
+            if metadata.nlink() != 1 {
+                return Err(DriverError::UnsafeCache);
+            }
+            let mut file = File::open(&path).map_err(DriverError::Io)?;
+            let mut hasher = Sha256::new();
+            let mut buffer = [0_u8; 64 * 1024];
+            loop {
+                let count = file.read(&mut buffer).map_err(DriverError::Io)?;
+                if count == 0 {
+                    break;
+                }
+                hasher.update(&buffer[..count]);
+            }
+            manifest.insert(
+                relative,
+                MaterializedEntry::File {
+                    mode,
+                    uid,
+                    gid,
+                    size: metadata.len(),
+                    sha256: format!("{:x}", hasher.finalize()),
+                },
+            );
+        } else {
+            return Err(DriverError::UnsafeCache);
+        }
+    }
+    Ok(())
+}
+
 struct PrebuiltIdentity {
     kernel_release: String,
     vermagic: String,
+    bundle_manifest_sha256: String,
 }
 
 fn validate_prebuilt(
     root: &Path,
     expected_kernel: &str,
     expected_commit: &str,
+    expected_vermagic: &str,
+    expected_bundle_manifest_sha256: &str,
 ) -> Result<PrebuiltIdentity, DriverError> {
     let manifest_path = root.join("manifest.txt");
     let manifest_metadata = manifest_path.symlink_metadata().map_err(DriverError::Io)?;
     if manifest_metadata.file_type().is_symlink() || !manifest_metadata.is_file() {
         return Err(DriverError::InvalidPrebuiltIdentity);
     }
-    let contents = fs::read_to_string(&manifest_path).map_err(DriverError::Io)?;
+    #[cfg(unix)]
+    if manifest_metadata.nlink() != 1 {
+        return Err(DriverError::InvalidPrebuiltIdentity);
+    }
+    let manifest_bytes = fs::read(&manifest_path).map_err(DriverError::Io)?;
+    let bundle_manifest_sha256 = sha256_bytes(&manifest_bytes);
+    if bundle_manifest_sha256 != expected_bundle_manifest_sha256 {
+        return Err(DriverError::InvalidPrebuiltIdentity);
+    }
+    let contents =
+        std::str::from_utf8(&manifest_bytes).map_err(|_| DriverError::InvalidPrebuiltIdentity)?;
     let mut fields = BTreeMap::new();
     for line in contents.lines() {
         let (key, value) = line
@@ -973,7 +1253,8 @@ fn validate_prebuilt(
         || *source_revision != expected_commit
         || !safe_name(module_file)
         || !is_lower_hex(module_sha256, 64)
-        || vermagic.split_whitespace().next() != Some(expected_kernel)
+        || *vermagic != expected_vermagic
+        || validate_vermagic(vermagic, expected_kernel).is_err()
     {
         return Err(DriverError::InvalidPrebuiltIdentity);
     }
@@ -983,6 +1264,7 @@ fn validate_prebuilt(
     Ok(PrebuiltIdentity {
         kernel_release: (*kernel_release).to_owned(),
         vermagic: (*vermagic).to_owned(),
+        bundle_manifest_sha256,
     })
 }
 
@@ -1055,30 +1337,111 @@ pub struct DriverContext {
 pub struct DriverTool<R> {
     runner: R,
     source: PathBuf,
+    plan: DriverPlan,
     context: DriverContext,
+    driver_version: String,
+    source_revision: String,
+    expected_overlay_file: String,
 }
 
 impl<R> DriverTool<R> {
-    pub fn new(runner: R, source: PathBuf, context: DriverContext) -> Result<Self, DriverError> {
+    pub fn new(
+        runner: R,
+        source: PathBuf,
+        plan: DriverPlan,
+        context: DriverContext,
+        driver_version: String,
+        source_revision: String,
+    ) -> Result<Self, DriverError> {
         if !source.is_absolute()
             || !context.kernel_export.is_absolute()
             || !context.artifacts.is_absolute()
             || context.target.is_empty()
             || context.target.contains(['\0', '\r', '\n'])
             || context.replace_overlay.is_empty()
+            || Version::parse(&driver_version).ok().is_none_or(|version| {
+                !version.pre.is_empty() || version.to_string() != driver_version
+            })
+            || !is_lower_hex(&source_revision, 40)
         {
             return Err(DriverError::InvalidContext);
         }
+        match &plan {
+            DriverPlan::Prebuilt { archive } => {
+                if !archive.is_absolute() {
+                    return Err(DriverError::InvalidContext);
+                }
+            }
+            DriverPlan::CrossBuild { source: planned } => {
+                if planned != &source {
+                    return Err(DriverError::InvalidContext);
+                }
+            }
+        }
         validate_kernel_release(&context.kernel_release)?;
+        let expected_overlay_file = format!("hyperpixel2r-kms-{}.dtbo", &source_revision[..12]);
         Ok(Self {
             runner,
             source,
+            plan,
             context,
+            driver_version,
+            source_revision,
+            expected_overlay_file,
         })
     }
 }
 
 impl<R: CommandRunner> DriverTool<R> {
+    pub fn prepare_and_stage(&self) -> Result<(), DriverError> {
+        match self.plan {
+            DriverPlan::Prebuilt { .. } => {
+                self.run(DriverAction::StageTryboot)?;
+            }
+            DriverPlan::CrossBuild { .. } => {
+                self.run(DriverAction::ExportKernel)?;
+                self.run(DriverAction::Build)?;
+                self.run(DriverAction::StageTryboot)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn cleanup_legacy_planeradar(&self) -> Result<(), DriverError> {
+        let arguments = vec![
+            self.source
+                .join("scripts/uninstall.sh")
+                .to_string_lossy()
+                .into_owned(),
+            "--target".into(),
+            self.context.target.clone(),
+            "--cleanup-legacy-planeradar".into(),
+            "--expect-overlay-file".into(),
+            self.expected_overlay_file.clone(),
+        ];
+        self.execute(DriverAction::Uninstall, arguments)?;
+        Ok(())
+    }
+
+    pub fn verify_normal_boot(&self) -> Result<DriverVerification, DriverError> {
+        let arguments = vec![
+            self.source
+                .join("scripts/verify-boot.sh")
+                .to_string_lossy()
+                .into_owned(),
+            "--target".into(),
+            self.context.target.clone(),
+            "--expect-normal".into(),
+            "--expect-driver-version".into(),
+            self.driver_version.clone(),
+            "--expect-overlay-file".into(),
+            self.expected_overlay_file.clone(),
+            "--json".into(),
+        ];
+        let output = self.execute(DriverAction::VerifyBoot, arguments)?;
+        self.parse_verification(output.stdout())
+    }
+
     pub fn run(&self, action: DriverAction) -> Result<Option<DriverVerification>, DriverError> {
         let script = match action {
             DriverAction::ExportKernel => "export-target-kbuild.sh",
@@ -1108,6 +1471,8 @@ impl<R: CommandRunner> DriverTool<R> {
                     self.context.kernel_release.clone(),
                     "--kernel-target".into(),
                     self.context.kernel_export.to_string_lossy().into_owned(),
+                    "--source-revision".into(),
+                    self.source_revision.clone(),
                     "--output".into(),
                     self.context.artifacts.to_string_lossy().into_owned(),
                 ]);
@@ -1115,11 +1480,15 @@ impl<R: CommandRunner> DriverTool<R> {
             DriverAction::StageTryboot => {
                 arguments.extend([
                     "--artifact-dir".into(),
-                    self.context
-                        .artifacts
-                        .join(&self.context.kernel_release)
-                        .to_string_lossy()
-                        .into_owned(),
+                    match &self.plan {
+                        DriverPlan::Prebuilt { archive } => archive.to_string_lossy().into_owned(),
+                        DriverPlan::CrossBuild { .. } => self
+                            .context
+                            .artifacts
+                            .join(&self.context.kernel_release)
+                            .to_string_lossy()
+                            .into_owned(),
+                    },
                     "--kernel-target".into(),
                     self.context.kernel_export.to_string_lossy().into_owned(),
                     "--replace-overlay".into(),
@@ -1127,24 +1496,53 @@ impl<R: CommandRunner> DriverTool<R> {
                 ]);
             }
             DriverAction::VerifyBoot => {
-                arguments.extend(["--expect-tryboot".into(), "--json".into()]);
+                arguments.extend([
+                    "--expect-tryboot".into(),
+                    "--expect-driver-version".into(),
+                    self.driver_version.clone(),
+                    "--expect-overlay-file".into(),
+                    self.expected_overlay_file.clone(),
+                    "--json".into(),
+                ]);
             }
             DriverAction::CommitBoot | DriverAction::RollbackBoot | DriverAction::Uninstall => {}
         }
-        let output = self
-            .runner
-            .run(Invocation::new("bash", arguments))
-            .map_err(|_| DriverError::ToolFailed)?;
-        if output.status() != 0 {
-            return Err(DriverError::ToolFailed);
-        }
+        let output = self.execute(action, arguments)?;
         if action != DriverAction::VerifyBoot {
             return Ok(None);
         }
-        let verification: DriverVerification = serde_json::from_slice(output.stdout())
-            .map_err(|_| DriverError::InvalidVerification)?;
-        verification.validate(&self.context.kernel_release)?;
-        Ok(Some(verification))
+        Ok(Some(self.parse_verification(output.stdout())?))
+    }
+
+    fn parse_verification(&self, output: &[u8]) -> Result<DriverVerification, DriverError> {
+        let verification: DriverVerification =
+            serde_json::from_slice(output).map_err(|_| DriverError::InvalidVerification)?;
+        verification.validate(&self.context.kernel_release, &self.driver_version)?;
+        Ok(verification)
+    }
+
+    fn execute(
+        &self,
+        action: DriverAction,
+        arguments: Vec<String>,
+    ) -> Result<CommandOutput, DriverError> {
+        let output = self
+            .runner
+            .run(Invocation::new("bash", arguments))
+            .map_err(|source| DriverError::ToolCommandSpawn {
+                action,
+                program: "bash".into(),
+                source,
+            })?;
+        if output.status() != 0 {
+            return Err(DriverError::ToolCommandFailed {
+                action,
+                program: "bash".into(),
+                status: output.status(),
+                stderr: bounded_diagnostic(output.stderr()),
+            });
+        }
+        Ok(output)
     }
 }
 
@@ -1163,8 +1561,13 @@ pub struct DriverVerification {
 }
 
 impl DriverVerification {
-    fn validate(&self, expected_kernel: &str) -> Result<(), DriverError> {
+    fn validate(
+        &self,
+        expected_kernel: &str,
+        expected_driver_version: &str,
+    ) -> Result<(), DriverError> {
         if self.schema_version != 1
+            || self.driver_version != expected_driver_version
             || self.kernel_release != expected_kernel
             || self.module != "hyperpixel2r_kms"
             || self.drm_mode != "480x480"
@@ -1191,11 +1594,42 @@ fn validate_kernel_release(value: &str) -> Result<(), DriverError> {
     Ok(())
 }
 
+fn validate_vermagic(value: &str, expected_kernel_release: &str) -> Result<(), DriverError> {
+    if value.len() > 512
+        || value
+            .strip_prefix(expected_kernel_release)
+            .is_none_or(|suffix| !suffix.starts_with(' '))
+        || value
+            .bytes()
+            .any(|byte| !byte.is_ascii_graphic() && byte != b' ')
+    {
+        return Err(DriverError::InvalidPrebuiltIdentity);
+    }
+    Ok(())
+}
+
 fn is_lower_hex(value: &str, length: usize) -> bool {
     value.len() == length
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn bounded_diagnostic(bytes: &[u8]) -> String {
+    const MAX_DIAGNOSTIC_BYTES: usize = 4096;
+    let mut diagnostic = String::new();
+    for character in String::from_utf8_lossy(bytes).chars() {
+        let character = if character == '\n' || character == '\t' || !character.is_control() {
+            character
+        } else {
+            '\u{fffd}'
+        };
+        if diagnostic.len() + character.len_utf8() > MAX_DIAGNOSTIC_BYTES {
+            break;
+        }
+        diagnostic.push(character);
+    }
+    diagnostic
 }
 
 #[derive(Debug, Error)]
@@ -1210,8 +1644,20 @@ pub enum DriverError {
     DuplicatePrebuilt,
     #[error("driver tool context is invalid")]
     InvalidContext,
-    #[error("driver tool failed")]
-    ToolFailed,
+    #[error("driver {action:?} command {program} could not be started")]
+    ToolCommandSpawn {
+        action: DriverAction,
+        program: String,
+        #[source]
+        source: RunnerError,
+    },
+    #[error("driver {action:?} command {program} exited {status}: {stderr}")]
+    ToolCommandFailed {
+        action: DriverAction,
+        program: String,
+        status: i32,
+        stderr: String,
+    },
     #[error("driver verification output is invalid")]
     InvalidVerification,
     #[error("driver lock is invalid")]
@@ -1222,6 +1668,20 @@ pub enum DriverError {
     DownloadFailed,
     #[error("driver release verification failed")]
     VerificationFailed,
+    #[error("driver release tag identity is invalid")]
+    InvalidReleaseTag,
+    #[error("driver release verification command {program} could not be started")]
+    ReleaseCommandSpawn {
+        program: String,
+        #[source]
+        source: RunnerError,
+    },
+    #[error("driver release verification command {program} exited {status}: {stderr}")]
+    ReleaseCommandFailed {
+        program: String,
+        status: i32,
+        stderr: String,
+    },
     #[error("driver release artifact does not match its manifest")]
     ArtifactMismatch,
     #[error("driver release cache is unsafe")]
