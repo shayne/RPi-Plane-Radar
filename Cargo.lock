@@ -877,8 +877,11 @@ name = "planeradarctl"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "libc",
  "semver",
  "serde",
+ "serde_json",
+ "sha2",
  "tempfile",
  "thiserror",
  "toml",
