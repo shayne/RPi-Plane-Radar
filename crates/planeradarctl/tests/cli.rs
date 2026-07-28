@@ -134,13 +134,13 @@ fn maintainer_driver_commands_parse_exact_sync_and_update_forms() {
         }
     ));
 
-    let update = Cli::try_parse_from(["planeradarctl", "driver", "update", "0.1.0-rc.11"])
+    let update = Cli::try_parse_from(["planeradarctl", "driver", "update", "0.1.0-rc.14"])
         .expect("driver update");
     assert!(matches!(
         update.command,
         Command::Driver {
             command: DriverCommand::Update { version }
-        } if version == "0.1.0-rc.11"
+        } if version == "0.1.0-rc.14"
     ));
 }
 
@@ -152,60 +152,58 @@ fn driver_lock_matches_the_published_release_candidate() {
         lock.repository,
         "https://github.com/shayne/hyperpixel2r-kms"
     );
-    assert_eq!(lock.version.to_string(), "0.1.0-rc.11");
-    assert_eq!(lock.commit, "ca95ffeb30b3c361f16cfc228c7bf2b78abf2b4c");
+    assert_eq!(lock.version.to_string(), "0.1.0-rc.14");
+    assert_eq!(lock.commit, "f6213007a8e780309e34b220351fc229e3c7d554");
     assert_eq!(
         lock.manifest_sha256,
-        "8170e79829fb5969fffa280c2b971f37bcb757af62a57997b4d5a90bf88d8b02"
+        "5f0cd1deba54c740e58b8aee588b3a4b43143e58bc2ad342c9f81cba2cb402e1"
     );
 }
 
 #[test]
 fn driver_lock_rejects_invalid_or_ambiguous_identity_fields() {
+    let lock = DriverLock::parse(LOCK).expect("parse current driver lock");
+    let version = lock.version.to_string();
+    let replace_current = |current: &str, replacement: &str| {
+        let mutated = LOCK.replace(current, replacement);
+        assert_ne!(mutated, LOCK, "invalid-lock mutation must change the lock");
+        mutated
+    };
     let cases = [
         (
             "shortened commit",
-            LOCK.replace(
-                "ca95ffeb30b3c361f16cfc228c7bf2b78abf2b4c",
-                "36da3bbad4569a252b75905dc4ff6278aaf99e",
-            ),
+            replace_current(&lock.commit, &lock.commit[..39]),
         ),
         (
             "uppercase commit",
-            LOCK.replace(
-                "ca95ffeb30b3c361f16cfc228c7bf2b78abf2b4c",
-                "36DA3BBAD4569A252B75905DC4FF6278AAF99EAC",
-            ),
+            replace_current(&lock.commit, &lock.commit.to_uppercase()),
         ),
         (
             "non https repository",
-            LOCK.replace(
+            replace_current(
                 "https://github.com/shayne/hyperpixel2r-kms",
                 "http://github.com/shayne/hyperpixel2r-kms",
             ),
         ),
         (
             "wrong repository",
-            LOCK.replace(
+            replace_current(
                 "https://github.com/shayne/hyperpixel2r-kms",
                 "https://github.com/example/driver",
             ),
         ),
         (
             "non semantic version",
-            LOCK.replace("0.1.0-rc.11", "v0.1.0-rc.11"),
+            replace_current(&version, &format!("v{version}")),
         ),
         (
             "uppercase manifest digest",
-            LOCK.replace(
-                "8170e79829fb5969fffa280c2b971f37bcb757af62a57997b4d5a90bf88d8b02",
-                "CB75D7C8CA6B3DBBE7926A7AFD642FF2FDBC0E42C198AD2F99471BFD817CECD1",
-            ),
+            replace_current(&lock.manifest_sha256, &lock.manifest_sha256.to_uppercase()),
         ),
         ("unknown field", format!("{LOCK}unexpected = \"value\"\n")),
         (
             "duplicate field",
-            format!("{LOCK}version = \"0.1.0-rc.11\"\n"),
+            format!("{LOCK}version = \"{version}\"\n"),
         ),
         ("trailing non toml", format!("{LOCK}this is not TOML")),
     ];

@@ -899,6 +899,7 @@ fn ensure_directory(path: &Path) -> Result<(), DriverError> {
     if path.as_os_str().is_empty() || !path.is_absolute() {
         return Err(DriverError::InvalidPath);
     }
+    validate_existing_directory_ancestors(path)?;
     if let Ok(metadata) = path.symlink_metadata() {
         if metadata.file_type().is_symlink() || !metadata.is_dir() {
             return Err(DriverError::UnsafeCache);
@@ -929,6 +930,49 @@ fn ensure_directory(path: &Path) -> Result<(), DriverError> {
     #[cfg(not(unix))]
     fs::create_dir(path).map_err(DriverError::Io)?;
     Ok(())
+}
+
+fn validate_existing_directory_ancestors(path: &Path) -> Result<(), DriverError> {
+    for ancestor in path
+        .ancestors()
+        .filter(|ancestor| !ancestor.as_os_str().is_empty())
+    {
+        match ancestor.symlink_metadata() {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() {
+                    if !trusted_system_directory_alias(ancestor, &metadata)? {
+                        return Err(DriverError::UnsafeCache);
+                    }
+                } else if !metadata.is_dir() {
+                    return Err(DriverError::UnsafeCache);
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(DriverError::Io(error)),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn trusted_system_directory_alias(
+    path: &Path,
+    metadata: &fs::Metadata,
+) -> Result<bool, DriverError> {
+    let parent = path.parent().ok_or(DriverError::UnsafeCache)?;
+    let parent_metadata = parent.symlink_metadata().map_err(DriverError::Io)?;
+    Ok(metadata.uid() == 0
+        && parent_metadata.is_dir()
+        && parent_metadata.uid() == 0
+        && parent_metadata.mode() & 0o022 == 0)
+}
+
+#[cfg(not(unix))]
+fn trusted_system_directory_alias(
+    _path: &Path,
+    _metadata: &fs::Metadata,
+) -> Result<bool, DriverError> {
+    Ok(false)
 }
 
 fn set_private_file(file: &File) -> Result<(), DriverError> {
@@ -1137,6 +1181,18 @@ enum MaterializedEntry {
 
 fn materialized_manifest(root: &Path) -> Result<BTreeMap<PathBuf, MaterializedEntry>, DriverError> {
     let mut manifest = BTreeMap::new();
+    let metadata = root.symlink_metadata().map_err(DriverError::Io)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(DriverError::UnsafeCache);
+    }
+    #[cfg(unix)]
+    let (mode, uid, gid) = (metadata.mode() & 0o777, metadata.uid(), metadata.gid());
+    #[cfg(not(unix))]
+    let (mode, uid, gid) = (0, 0, 0);
+    manifest.insert(
+        PathBuf::from("."),
+        MaterializedEntry::Directory { mode, uid, gid },
+    );
     collect_materialized_manifest(root, root, &mut manifest)?;
     Ok(manifest)
 }
@@ -1396,6 +1452,7 @@ impl<R: CommandRunner> DriverTool<R> {
     pub fn prepare_and_stage(&self) -> Result<(), DriverError> {
         match self.plan {
             DriverPlan::Prebuilt { .. } => {
+                self.run(DriverAction::ExportKernel)?;
                 self.run(DriverAction::StageTryboot)?;
             }
             DriverPlan::CrossBuild { .. } => {
