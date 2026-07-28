@@ -23,7 +23,7 @@ whose release identity still matches the lock.
 To intentionally move the lock to another published version:
 
 ```sh
-mise run driver:update -- 0.1.0-rc.13
+mise run driver:update -- 0.1.0-rc.14
 mise run driver:sync
 ```
 
@@ -47,10 +47,12 @@ procedures.
 
 ## Accepted Raspberry Pi Zero 2 W installation
 
-The accepted external source is release `v0.1.0-rc.13`, commit
-`d965cd55b5a605a838ae2205fe2ec33880f58f5b`, locked by manifest SHA-256
-`697697e8cdbd967844f53329d39dc929a7552ae6a054fe42d23f2911abb55cfb`.
-It targets kernel `6.18.34+rpt-rpi-v8` with:
+The accepted external lifecycle source is release `v0.1.0-rc.14`, commit
+`f6213007a8e780309e34b220351fc229e3c7d554`, locked by manifest SHA-256
+`5f0cd1deba54c740e58b8aee588b3a4b43143e58bc2ad342c9f81cba2cb402e1`.
+The running driver remains the already accepted RC13-built image because RC14
+changes only migration cleanup behavior and was deliberately verified without
+staging or rebooting the Pi. It targets kernel `6.18.34+rpt-rpi-v8` with:
 
 - module `hyperpixel2r_kms`, vermagic
   `6.18.34+rpt-rpi-v8 SMP preempt mod_unload modversions aarch64`;
@@ -61,8 +63,10 @@ It targets kernel `6.18.34+rpt-rpi-v8` with:
   `11-0015 generic ft5x06 (00)`; and
 - SDL `KMSDRM` with renderer `opengles2`.
 
-Strict verification passed in both the one-shot tryboot and the committed
-normal boot. The final normal boot ID was
+Strict verification passed in both the original one-shot tryboot and committed
+normal boot. The RC14 verifier then reaccepted that unchanged normal boot, and
+the RC14 cleanup proved the legacy state already absent. The normal boot ID
+remains
 `a1d7d580-c332-4f37-ba00-1814b2322394`, with `tryboot=0`, no active
 transaction, no failed units, and no throttling.
 
@@ -76,4 +80,5 @@ The exact guarded migration removed the inactive
 legacy overlays, then a second run proved the already-absent path. Its
 root-owned audit is retained under
 `/var/lib/hyperpixel2r-kms/migrations/planeradar-hyperpixel2r-v1/`;
-only the external `hyperpixel2r-kms` overlay is active.
+RC14 independently repeated the already-absent proof without changing the
+accepted installation. Only the external `hyperpixel2r-kms` overlay is active.

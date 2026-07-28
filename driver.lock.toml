@@ -1,4 +1,4 @@
 repository = "https://github.com/shayne/hyperpixel2r-kms"
-version = "0.1.0-rc.13"
-commit = "d965cd55b5a605a838ae2205fe2ec33880f58f5b"
-manifest_sha256 = "697697e8cdbd967844f53329d39dc929a7552ae6a054fe42d23f2911abb55cfb"
+version = "0.1.0-rc.14"
+commit = "f6213007a8e780309e34b220351fc229e3c7d554"
+manifest_sha256 = "5f0cd1deba54c740e58b8aee588b3a4b43143e58bc2ad342c9f81cba2cb402e1"

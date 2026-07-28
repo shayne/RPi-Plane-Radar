@@ -60,6 +60,11 @@ fn digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
+fn write_executable(path: &std::path::Path, contents: &[u8]) {
+    fs::write(path, contents).expect("write executable fixture");
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755)).expect("make fixture executable");
+}
+
 fn archive(entries: &[(&str, EntryType, &[u8], Option<&str>)]) -> Vec<u8> {
     let encoder = zstd::Encoder::new(Vec::new(), 1).expect("zstd encoder");
     let mut builder = Builder::new(encoder);
@@ -365,7 +370,12 @@ fn sync_rejects_source_identity_repository_commit_and_tree_mismatches() {
 
 #[test]
 fn sync_rejects_materialized_script_and_mode_tampering() {
-    for tamper in ["script-bytes", "script-mode", "directory-mode"] {
+    for tamper in [
+        "script-bytes",
+        "script-mode",
+        "directory-mode",
+        "materialized-root-mode",
+    ] {
         let source = source_archive();
         let manifest = release_manifest(&source, None);
         let manager = DriverManager::new(
@@ -391,6 +401,10 @@ fn sync_rejects_materialized_script_and_mode_tampering() {
                 fs::Permissions::from_mode(0o777),
             )
             .expect("tamper directory mode"),
+            "materialized-root-mode" => {
+                fs::set_permissions(synced.source_root(), fs::Permissions::from_mode(0o777))
+                    .expect("tamper materialized root mode")
+            }
             _ => unreachable!(),
         }
 
@@ -427,6 +441,43 @@ fn sync_rejects_a_symlinked_cache_root_ancestor() {
             .next()
             .is_none(),
         "sync wrote through a symlinked cache ancestor"
+    );
+}
+
+#[test]
+fn sync_rejects_a_populated_cache_behind_a_symlinked_ancestor() {
+    let temporary = tempfile::tempdir().expect("temporary cache parent");
+    let outside = temporary.path().join("outside");
+    fs::create_dir(&outside).expect("outside cache directory");
+    let source = source_archive();
+    let manifest = release_manifest(&source, None);
+    let assets = || {
+        FakeReleaseSource::with_assets([
+            ("driver-manifest.json".into(), manifest.clone()),
+            ("hyperpixel2r-kms-source.tar.zst".into(), source.clone()),
+            ("SBOM.spdx.json".into(), b"sbom".to_vec()),
+        ])
+    };
+    let outside_manager = DriverManager::new(
+        assets(),
+        FakeReleaseVerifier::default(),
+        outside.join("driver"),
+    );
+    outside_manager
+        .sync(&lock_for(&manifest))
+        .expect("populate outside cache");
+
+    let cache_link = temporary.path().join(".cache");
+    symlink(&outside, &cache_link).expect("symlink populated cache ancestor");
+    let linked_manager = DriverManager::new(
+        assets(),
+        FakeReleaseVerifier::default(),
+        cache_link.join("driver"),
+    );
+
+    assert!(
+        linked_manager.sync(&lock_for(&manifest)).is_err(),
+        "populated cache behind a symlinked ancestor was accepted"
     );
 }
 
@@ -658,13 +709,18 @@ fn resolved_driver_plan_drives_the_exact_prebuilt_and_crossbuild_command_sequenc
         .invocations
         .lock()
         .expect("prebuilt invocation lock");
-    assert_eq!(prebuilt_calls.len(), 1);
-    assert!(
-        prebuilt_calls[0].arguments()[0].ends_with("/scripts/stage-tryboot.sh"),
-        "prebuilt plan did not stage directly"
+    assert_eq!(
+        prebuilt_calls
+            .iter()
+            .map(|invocation| invocation.arguments()[0]
+                .rsplit('/')
+                .next()
+                .expect("script"))
+            .collect::<Vec<_>>(),
+        ["export-target-kbuild.sh", "stage-tryboot.sh"]
     );
     assert!(
-        prebuilt_calls[0]
+        prebuilt_calls[1]
             .arguments()
             .windows(2)
             .any(|pair| pair[0] == "--artifact-dir" && pair[1].contains("/prebuilt/")),
@@ -714,6 +770,97 @@ fn resolved_driver_plan_drives_the_exact_prebuilt_and_crossbuild_command_sequenc
             .windows(2)
             .any(|pair| pair == ["--source-revision", DRIVER_COMMIT]),
         "crossbuild did not bind the locked source revision"
+    );
+}
+
+#[test]
+fn prebuilt_preparation_executes_target_export_before_the_real_stage_boundary() {
+    let temporary = tempfile::tempdir().expect("temporary production contract");
+    let source = temporary.path().join("source");
+    let scripts = source.join("scripts");
+    let prebuilt = temporary.path().join("prebuilt");
+    let kernel_target = temporary.path().join("kernel-target");
+    let artifacts = temporary.path().join("artifacts");
+    fs::create_dir_all(&scripts).expect("source scripts");
+    fs::create_dir(&prebuilt).expect("verified prebuilt directory");
+    write_executable(
+        &scripts.join("export-target-kbuild.sh"),
+        br#"#!/usr/bin/env bash
+set -euo pipefail
+output=''
+while test "$#" -gt 0; do
+  case "$1" in
+    --target) shift 2 ;;
+    --output) output="$2"; shift 2 ;;
+    *) exit 64 ;;
+  esac
+done
+test -n "$output"
+mkdir -p "$output/6.18.34+rpt-rpi-v8"
+printf 'schema_version\t1\nkernel_release\t6.18.34+rpt-rpi-v8\n' \
+  > "$output/6.18.34+rpt-rpi-v8/target.txt"
+"#,
+    );
+    write_executable(
+        &scripts.join("stage-tryboot.sh"),
+        br#"#!/usr/bin/env bash
+set -euo pipefail
+kernel_target=''
+artifact_dir=''
+while test "$#" -gt 0; do
+  case "$1" in
+    --target|--replace-overlay) shift 2 ;;
+    --kernel-target) kernel_target="$2"; shift 2 ;;
+    --artifact-dir) artifact_dir="$2"; shift 2 ;;
+    *) exit 64 ;;
+  esac
+done
+test -d "$artifact_dir"
+test -f "$kernel_target/6.18.34+rpt-rpi-v8/target.txt"
+printf 'staged\n' > "$kernel_target/stage-complete"
+"#,
+    );
+    write_executable(
+        &scripts.join("build-driver.sh"),
+        br#"#!/usr/bin/env bash
+set -euo pipefail
+output=''
+while test "$#" -gt 0; do
+  case "$1" in
+    --output) output="$2"; shift 2 ;;
+    *) shift 2 ;;
+  esac
+done
+mkdir -p "$output"
+printf 'unexpected build\n' > "$output/build-was-run"
+"#,
+    );
+    let tool = DriverTool::new(
+        SystemCommandRunner,
+        source,
+        DriverPlan::Prebuilt { archive: prebuilt },
+        DriverContext {
+            target: "pi@fixture".into(),
+            kernel_release: "6.18.34+rpt-rpi-v8".into(),
+            kernel_export: kernel_target.clone(),
+            artifacts: artifacts.clone(),
+            replace_overlay: "hyperpixel2r-kms-aaaaaaaaaaaa.dtbo".into(),
+        },
+        "0.1.0".into(),
+        DRIVER_COMMIT.into(),
+    )
+    .expect("production prebuilt tool");
+
+    tool.prepare_and_stage()
+        .expect("fresh-target prebuilt preparation");
+
+    assert_eq!(
+        fs::read_to_string(kernel_target.join("stage-complete")).expect("stage marker"),
+        "staged\n"
+    );
+    assert!(
+        !artifacts.join("build-was-run").exists(),
+        "prebuilt preparation invoked Build"
     );
 }
 
