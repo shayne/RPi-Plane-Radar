@@ -1,6 +1,6 @@
-use std::borrow::Cow;
 use std::net::Ipv4Addr;
 use std::str::FromStr;
+use std::{borrow::Cow, fmt};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -26,7 +26,7 @@ impl TargetIdentity {
 }
 
 /// A Linux login name that passed the conservative public control-tool grammar.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, Hash, PartialEq)]
 pub struct SshUsername(String);
 
 impl SshUsername {
@@ -35,11 +35,23 @@ impl SshUsername {
     }
 }
 
+impl fmt::Debug for SshUsername {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SshUsername(<redacted>)")
+    }
+}
+
 /// A host component accepted by [`SshTarget`].
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, Hash, PartialEq)]
 pub enum SshHost {
     Hostname(String),
     Ipv4(Ipv4Addr),
+}
+
+impl fmt::Debug for SshHost {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SshHost(<redacted>)")
+    }
 }
 
 impl SshHost {
@@ -56,10 +68,16 @@ impl SshHost {
 /// The username and host are retained as separate typed values.  Consumers use
 /// [`Self::ssh_arguments`] to append destination arguments to `Command`, never
 /// to construct a local shell command.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, Hash, PartialEq)]
 pub struct SshTarget {
     username: SshUsername,
     host: SshHost,
+}
+
+impl fmt::Debug for SshTarget {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SshTarget(<redacted>)")
+    }
 }
 
 impl SshTarget {
