@@ -23,7 +23,7 @@ whose release identity still matches the lock.
 To intentionally move the lock to another published version:
 
 ```sh
-mise run driver:update -- 0.1.0-rc.11
+mise run driver:update -- 0.1.0-rc.13
 mise run driver:sync
 ```
 
@@ -36,8 +36,9 @@ Application workflows call the typed driver adapter. Its only permitted
 actions are `ExportKernel`, `Build`, `StageTryboot`, `VerifyBoot`,
 `CommitBoot`, `RollbackBoot`, and `Uninstall`; each maps to the corresponding
 tool shipped in the verified driver release. The adapter supplies the Pi
-target, exact target kernel release, build/output directories, expected app
-revision, and strict verification mode as separate arguments.
+target, exact target kernel release, build/output directories, locked driver
+source revision, expected driver version and overlay, and strict verification
+mode as separate arguments.
 
 Do not invoke app-local HyperPixel scripts: they were removed when ownership
 moved to the external release. Use the external driver's runbook for the
@@ -46,15 +47,15 @@ procedures.
 
 ## Accepted Raspberry Pi Zero 2 W installation
 
-The accepted external source is release `v0.1.0-rc.11`, commit
-`ca95ffeb30b3c361f16cfc228c7bf2b78abf2b4c`, locked by manifest SHA-256
-`8170e79829fb5969fffa280c2b971f37bcb757af62a57997b4d5a90bf88d8b02`.
+The accepted external source is release `v0.1.0-rc.13`, commit
+`d965cd55b5a605a838ae2205fe2ec33880f58f5b`, locked by manifest SHA-256
+`697697e8cdbd967844f53329d39dc929a7552ae6a054fe42d23f2911abb55cfb`.
 It targets kernel `6.18.34+rpt-rpi-v8` with:
 
 - module `hyperpixel2r_kms`, vermagic
   `6.18.34+rpt-rpi-v8 SMP preempt mod_unload modversions aarch64`;
 - dependencies `drm,i2c-algo-bit` and soft dependency `pre: edt_ft5x06`;
-- overlay `hyperpixel2r-kms-ca95ffeb30b3.dtbo`;
+- overlay `hyperpixel2r-kms-d965cd55b5a6.dtbo`;
 - compatible string `shayne,hyperpixel2r-kms`;
 - connected `card0-DPI-1` at 480×480 and touch device
   `11-0015 generic ft5x06 (00)`; and
@@ -62,7 +63,7 @@ It targets kernel `6.18.34+rpt-rpi-v8` with:
 
 Strict verification passed in both the one-shot tryboot and the committed
 normal boot. The final normal boot ID was
-`ce77a87b-b5b3-4bac-81ce-7eebc68ef388`, with `tryboot=0`, no active
+`a1d7d580-c332-4f37-ba00-1814b2322394`, with `tryboot=0`, no active
 transaction, no failed units, and no throttling.
 
 The recovery baseline remains
@@ -70,6 +71,9 @@ The recovery baseline remains
 `d237a211ad67b941f2c36e08917984143d256793f1aaf348cf7ee4249df7dbeb`.
 Do not replace or edit that file.
 
-The Pi still contains inactive legacy DKMS registration and versioned overlay
-files for diagnosis. They are not selected by normal boot; only the external
-`hyperpixel2r-kms` overlay is active.
+The exact guarded migration removed the inactive
+`planeradar-hyperpixel2r/0.1.0` DKMS source and the eight contract-listed
+legacy overlays, then a second run proved the already-absent path. Its
+root-owned audit is retained under
+`/var/lib/hyperpixel2r-kms/migrations/planeradar-hyperpixel2r-v1/`;
+only the external `hyperpixel2r-kms` overlay is active.
