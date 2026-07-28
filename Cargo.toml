@@ -7,6 +7,10 @@ build = "build.rs"
 default-run = "planeradar"
 license = "MIT"
 
+[workspace]
+members = [".", "crates/planeradarctl"]
+resolver = "3"
+
 [dependencies]
 clap = { version = "4.5", features = ["derive", "env"] }
 csv = "1.3"

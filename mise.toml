@@ -55,6 +55,27 @@ run = "./scripts/rollback-hyperpixel-boot.sh"
 [tasks.verify]
 depends = ["fmt", "lint", "test", "deny"]
 
+[tasks.install]
+run = 'cargo run --locked -p planeradarctl -- install "$@"'
+
+[tasks.upgrade]
+run = 'cargo run --locked -p planeradarctl -- upgrade "$@"'
+
+[tasks.status]
+run = 'cargo run --locked -p planeradarctl -- status "$@"'
+
+[tasks.doctor]
+run = 'cargo run --locked -p planeradarctl -- doctor "$@"'
+
+[tasks.screenshot]
+run = 'cargo run --locked -p planeradarctl -- screenshot "$@"'
+
+[tasks.rollback]
+run = 'cargo run --locked -p planeradarctl -- rollback "$@"'
+
+[tasks.uninstall]
+run = 'cargo run --locked -p planeradarctl -- uninstall "$@"'
+
 [tasks.refresh-airports]
 run = '''
 set -euo pipefail
