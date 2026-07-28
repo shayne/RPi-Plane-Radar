@@ -201,7 +201,7 @@ impl Invocation {
     /// Adds a wall-clock execution limit for the production runner. The
     /// timeout is separate from OpenSSH's connection timeout so a remote
     /// command cannot consume more than a reboot phase's remaining budget.
-    fn with_timeout(mut self, timeout: Duration) -> Self {
+    pub(crate) fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = Some(timeout);
         self
     }
@@ -491,6 +491,14 @@ impl RemoteCommand {
             return Err(TransportError::InteractiveSudoMustStartWithSudo);
         }
         Ok(command)
+    }
+
+    pub fn arguments(&self) -> &[String] {
+        &self.arguments
+    }
+
+    pub fn is_interactive_sudo(&self) -> bool {
+        self.interactive_sudo
     }
 
     fn new<I, S>(arguments: I, interactive_sudo: bool) -> Result<Self, TransportError>
