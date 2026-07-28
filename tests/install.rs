@@ -19,6 +19,13 @@ const EXPECTED_PACKAGES: &[&str] = &[
     "libgl1-mesa-dri",
     "ca-certificates",
     "avahi-daemon",
+    "dkms",
+    "kmod",
+    "device-tree-compiler",
+    "linux-headers-rpi-v8",
+    "build-essential",
+    "evtest",
+    "pngcheck",
 ];
 
 #[derive(Default)]
@@ -72,7 +79,13 @@ impl Fixture {
     fn new(boot_source: &str) -> Self {
         let directory = tempfile::tempdir().expect("temporary directory");
         let root = directory.path().join("root");
-        for relative in ["etc", "proc/device-tree", "boot/firmware"] {
+        for relative in [
+            "etc",
+            "proc/device-tree",
+            "proc/sys/kernel",
+            "boot/firmware",
+            "lib/modules",
+        ] {
             fs::create_dir_all(root.join(relative)).expect("fixture directory");
         }
         fs::write(
@@ -87,6 +100,16 @@ impl Fixture {
             b"Raspberry Pi Zero 2 W Rev 1.0\0",
         )
         .expect("model fixture");
+        fs::write(
+            root.join("proc/sys/kernel/osrelease"),
+            "6.18.34+rpt-rpi-v8\n",
+        )
+        .expect("running kernel fixture");
+        let running_header =
+            root.join("lib/modules/6.18.34+rpt-rpi-v8/build/include/config/kernel.release");
+        fs::create_dir_all(running_header.parent().expect("header parent"))
+            .expect("running header directory");
+        fs::write(&running_header, "6.18.34+rpt-rpi-v8\n").expect("running header fixture");
         let boot_config = root.join("boot/firmware/config.txt");
         fs::write(&boot_config, boot_source).expect("boot fixture");
 
@@ -122,6 +145,42 @@ impl Fixture {
             revision_file: self.revision.clone(),
             reboot,
         }
+    }
+
+    fn set_kernel_state(&self, running: &str, installed_pairs: &[(&str, &str)]) {
+        fs::write(
+            self.root.join("proc/sys/kernel/osrelease"),
+            format!("{running}\n"),
+        )
+        .expect("running kernel fixture");
+        let modules = self.root.join("lib/modules");
+        fs::remove_dir_all(&modules).expect("remove module fixtures");
+        fs::create_dir(&modules).expect("module fixture root");
+        for (kernel, headers) in installed_pairs {
+            let release = modules
+                .join(kernel)
+                .join("build/include/config/kernel.release");
+            fs::create_dir_all(release.parent().expect("header parent"))
+                .expect("header fixture directory");
+            fs::write(release, format!("{headers}\n")).expect("header release fixture");
+        }
+    }
+
+    fn select_boot_kernel(&self, release: &str, bytes: &[u8]) {
+        fs::write(
+            self.root.join("boot").join(format!("vmlinuz-{release}")),
+            bytes,
+        )
+        .expect("selected vmlinuz fixture");
+        fs::write(self.root.join("boot/firmware/kernel8.img"), bytes).expect("kernel8 fixture");
+    }
+
+    fn add_boot_kernel(&self, release: &str, bytes: &[u8]) {
+        fs::write(
+            self.root.join("boot").join(format!("vmlinuz-{release}")),
+            bytes,
+        )
+        .expect("additional vmlinuz fixture");
     }
 }
 
@@ -216,8 +275,21 @@ fn installer_verifies_then_installs_once_and_is_idempotent() {
             "libgl1-mesa-dri".into(),
             "ca-certificates".into(),
             "avahi-daemon".into(),
+            "dkms".into(),
+            "kmod".into(),
+            "device-tree-compiler".into(),
+            "linux-headers-rpi-v8".into(),
+            "build-essential".into(),
+            "evtest".into(),
+            "pngcheck".into(),
         ],
     )));
+    assert!(!first_commands.iter().any(|(program, args)| {
+        program == "apt-get"
+            && args
+                .iter()
+                .any(|argument| matches!(argument.as_str(), "full-upgrade" | "dist-upgrade"))
+    }));
     assert!(first_commands.iter().any(|(program, args)| {
         program == "useradd" && args.last().map(String::as_str) == Some("planeradar")
     }));
@@ -336,6 +408,154 @@ fn reboot_runs_only_when_requested_and_boot_configuration_changed() {
             .commands()
             .contains(&("systemctl".into(), vec!["reboot".into()],))
     );
+}
+
+#[test]
+fn matching_running_kernel_headers_do_not_add_a_reboot() {
+    let fixture = Fixture::new("[all]\ndtoverlay=planeradar-hyperpixel2r-eefaf3ae40fd\n");
+    let runner = RecordingRunner::for_root(&fixture.root);
+    let result = Installer::new(&runner)
+        .install(&fixture.options(true))
+        .expect("install with matching headers");
+
+    assert!(!result.boot_config_changed);
+    assert!(!result.reboot_required);
+    assert!(
+        !runner
+            .commands()
+            .iter()
+            .any(|(program, args)| program == "systemctl" && args.as_slice() == ["reboot"])
+    );
+}
+
+#[test]
+fn alternate_installed_kernel_header_pair_requests_reboot_only_when_explicit() {
+    for reboot in [false, true] {
+        let fixture = Fixture::new("[all]\ndtoverlay=planeradar-hyperpixel2r-eefaf3ae40fd\n");
+        fixture.set_kernel_state(
+            "6.18.34+rpt-rpi-v8",
+            &[("6.18.35+rpt-rpi-v8", "6.18.35+rpt-rpi-v8")],
+        );
+        fixture.select_boot_kernel("6.18.35+rpt-rpi-v8", b"selected kernel image");
+        let runner = RecordingRunner::for_root(&fixture.root);
+        let result = Installer::new(&runner)
+            .install(&fixture.options(reboot))
+            .expect("install with pending kernel");
+
+        assert!(!result.boot_config_changed);
+        assert!(result.reboot_required);
+        assert_eq!(
+            runner
+                .commands()
+                .iter()
+                .filter(|(program, args)| {
+                    program == "systemctl" && args.as_slice() == ["reboot"]
+                })
+                .count(),
+            usize::from(reboot)
+        );
+    }
+}
+
+#[test]
+fn alternate_headers_without_selected_boot_image_do_not_request_reboot() {
+    let fixture = Fixture::new("[all]\ndtoverlay=planeradar-hyperpixel2r-eefaf3ae40fd\n");
+    fixture.set_kernel_state(
+        "6.18.34+rpt-rpi-v8",
+        &[("6.18.35+rpt-rpi-v8", "6.18.35+rpt-rpi-v8")],
+    );
+    let runner = RecordingRunner::for_root(&fixture.root);
+
+    let result = Installer::new(&runner)
+        .install(&fixture.options(true))
+        .expect("install with stale alternate headers");
+
+    assert!(!result.reboot_required);
+    assert!(
+        !runner
+            .commands()
+            .iter()
+            .any(|(program, args)| program == "systemctl" && args.as_slice() == ["reboot"])
+    );
+}
+
+#[test]
+fn mismatched_symlinked_ambiguous_or_overridden_boot_images_do_not_request_reboot() {
+    for case in ["mismatch", "symlink", "ambiguous", "override"] {
+        let boot = if case == "override" {
+            "[all]\ndtoverlay=planeradar-hyperpixel2r-eefaf3ae40fd\nkernel=custom.img\n"
+        } else {
+            "[all]\ndtoverlay=planeradar-hyperpixel2r-eefaf3ae40fd\n"
+        };
+        let fixture = Fixture::new(boot);
+        fixture.set_kernel_state(
+            "6.18.34+rpt-rpi-v8",
+            &[("6.18.35+rpt-rpi-v8", "6.18.35+rpt-rpi-v8")],
+        );
+        fixture.add_boot_kernel("6.18.35+rpt-rpi-v8", b"selected kernel image");
+        match case {
+            "mismatch" => {
+                fs::write(
+                    fixture.root.join("boot/firmware/kernel8.img"),
+                    b"different kernel image",
+                )
+                .expect("mismatched kernel8 fixture");
+            }
+            "symlink" => {
+                symlink(
+                    "../vmlinuz-6.18.35+rpt-rpi-v8",
+                    fixture.root.join("boot/firmware/kernel8.img"),
+                )
+                .expect("symlinked kernel8 fixture");
+            }
+            "ambiguous" => {
+                fs::write(
+                    fixture.root.join("boot/firmware/kernel8.img"),
+                    b"selected kernel image",
+                )
+                .expect("kernel8 fixture");
+                fixture.add_boot_kernel("6.18.36+rpt-rpi-v8", b"selected kernel image");
+            }
+            "override" => {
+                fs::write(
+                    fixture.root.join("boot/firmware/kernel8.img"),
+                    b"selected kernel image",
+                )
+                .expect("kernel8 fixture");
+            }
+            _ => unreachable!(),
+        }
+        let runner = RecordingRunner::for_root(&fixture.root);
+
+        let result = Installer::new(&runner)
+            .install(&fixture.options(true))
+            .unwrap_or_else(|error| panic!("{case} fixture install: {error}"));
+
+        assert!(!result.reboot_required, "{case}");
+        assert!(
+            !runner
+                .commands()
+                .iter()
+                .any(|(program, args)| program == "systemctl" && args.as_slice() == ["reboot"])
+        );
+    }
+}
+
+#[test]
+fn direct_installer_rejects_debian_12_before_commands() {
+    let fixture = Fixture::new("[all]\n");
+    fs::write(
+        fixture.root.join("etc/os-release"),
+        "ID=debian\nVERSION_ID=\"12\"\n",
+    )
+    .expect("bookworm fixture");
+    let runner = RecordingRunner::for_root(&fixture.root);
+    let error = Installer::new(&runner)
+        .install(&fixture.options(false))
+        .expect_err("Bookworm is unsupported");
+
+    assert!(matches!(error, InstallError::UnsupportedOperatingSystem(_)));
+    assert!(runner.commands().is_empty());
 }
 
 #[test]

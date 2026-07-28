@@ -1,6 +1,6 @@
 use std::fs::{self, File, OpenOptions, TryLockError};
-use std::io::{self, Write};
-use std::os::unix::fs::PermissionsExt;
+use std::io::{self, Read, Write};
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -25,6 +25,13 @@ const RUNTIME_PACKAGES: &[&str] = &[
     "libgl1-mesa-dri",
     "ca-certificates",
     "avahi-daemon",
+    "dkms",
+    "kmod",
+    "device-tree-compiler",
+    "linux-headers-rpi-v8",
+    "build-essential",
+    "evtest",
+    "pngcheck",
 ];
 
 const SUPPORTED_DISPLAY_PARAMETERS: &[&str] = &[
@@ -154,6 +161,7 @@ impl<'a> Installer<'a> {
         let mut install_args = vec!["install", "--yes", "--no-install-recommends"];
         install_args.extend_from_slice(RUNTIME_PACKAGES);
         self.commands.run("apt-get", &install_args)?;
+        let kernel_reboot_required = installed_kernel_reboot_required(&root)?;
         self.ensure_service_account(&root)?;
 
         let mut files_changed = false;
@@ -203,14 +211,15 @@ impl<'a> Installer<'a> {
                 .run("systemctl", &["start", "planeradar.service"])?;
         }
 
-        if boot_config_changed && options.reboot {
+        let reboot_required = boot_config_changed || kernel_reboot_required;
+        if reboot_required && options.reboot {
             self.commands.run("systemctl", &["reboot"])?;
         }
 
         Ok(InstallResult {
             files_changed,
             boot_config_changed,
-            reboot_required: boot_config_changed,
+            reboot_required,
         })
     }
 
@@ -272,7 +281,7 @@ fn validate_installation(options: &InstallOptions) -> Result<ValidatedInstallati
         .iter()
         .find_map(|(key, value)| (key == "VERSION_ID").then_some(value.as_str()))
         .unwrap_or_default();
-    if !matches!(id, "debian" | "raspbian") || !matches!(version, "12" | "13") {
+    if !matches!(id, "debian" | "raspbian") || version != "13" {
         return Err(InstallError::UnsupportedOperatingSystem(format!(
             "{id} {version}"
         )));
@@ -335,6 +344,142 @@ fn validate_installation(options: &InstallOptions) -> Result<ValidatedInstallati
         checksum,
         revision,
     })
+}
+
+fn installed_kernel_reboot_required(root: &Path) -> Result<bool, InstallError> {
+    let running_path = install_path(root, "proc/sys/kernel/osrelease");
+    let running = match fs::read_to_string(&running_path) {
+        Ok(value) => value.trim().to_owned(),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    if !valid_kernel_release(&running) {
+        return Ok(false);
+    }
+    if header_release(root, &running).as_deref() == Some(running.as_str()) {
+        return Ok(false);
+    }
+
+    let modules = install_path(root, "lib/modules");
+    let entries = match fs::read_dir(&modules) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    let mut safe_alternates = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        let Some(release) = entry.file_name().to_str().map(str::to_owned) else {
+            return Ok(false);
+        };
+        if release == running || !valid_kernel_release(&release) {
+            continue;
+        }
+        if header_release(root, &release).as_deref() == Some(release.as_str()) {
+            safe_alternates.push(release);
+        }
+    }
+    Ok(safe_alternates.len() == 1 && boot_selects_kernel(root, &safe_alternates[0]))
+}
+
+fn boot_selects_kernel(root: &Path, release: &str) -> bool {
+    let kernel8 = install_path(root, "boot/firmware/kernel8.img");
+    let Some(kernel8_sha) = owned_regular_sha256(root, &kernel8) else {
+        return false;
+    };
+    let boot_config = install_path(root, "boot/firmware/config.txt");
+    let Ok(config) = read_owned_regular(root, &boot_config) else {
+        return false;
+    };
+    if config.lines().any(|line| {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            return false;
+        }
+        line.split_once('=')
+            .is_some_and(|(key, value)| key.trim() == "kernel" && value.trim() != "kernel8.img")
+    }) {
+        return false;
+    }
+
+    let boot = install_path(root, "boot");
+    let Ok(entries) = fs::read_dir(boot) else {
+        return false;
+    };
+    let mut selected = Vec::new();
+    for entry in entries {
+        let Ok(entry) = entry else {
+            return false;
+        };
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            return false;
+        };
+        let Some(candidate) = name.strip_prefix("vmlinuz-") else {
+            continue;
+        };
+        if !valid_kernel_release(candidate) {
+            continue;
+        }
+        if owned_regular_sha256(root, &entry.path()).as_ref() == Some(&kernel8_sha) {
+            selected.push(candidate.to_owned());
+        }
+    }
+    selected.as_slice() == [release]
+}
+
+fn read_owned_regular(root: &Path, path: &Path) -> io::Result<String> {
+    let metadata = fs::symlink_metadata(path)?;
+    let root_metadata = fs::symlink_metadata(root)?;
+    if !metadata.file_type().is_file()
+        || metadata.uid() != root_metadata.uid()
+        || metadata.gid() != root_metadata.gid()
+    {
+        return Err(io::Error::other("file ownership or type is unsafe"));
+    }
+    fs::read_to_string(path)
+}
+
+fn owned_regular_sha256(root: &Path, path: &Path) -> Option<[u8; 32]> {
+    let metadata = fs::symlink_metadata(path).ok()?;
+    let root_metadata = fs::symlink_metadata(root).ok()?;
+    if !metadata.file_type().is_file()
+        || metadata.uid() != root_metadata.uid()
+        || metadata.gid() != root_metadata.gid()
+    {
+        return None;
+    }
+    let mut file = File::open(path).ok()?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer).ok()?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Some(hasher.finalize().into())
+}
+
+fn header_release(root: &Path, kernel_release: &str) -> Option<String> {
+    let path = install_path(root, "lib/modules")
+        .join(kernel_release)
+        .join("build/include/config/kernel.release");
+    let canonical = fs::canonicalize(&path).ok()?;
+    if !canonical.starts_with(root) || !fs::metadata(&canonical).ok()?.is_file() {
+        return None;
+    }
+    let release = fs::read_to_string(canonical).ok()?;
+    let release = release.trim();
+    valid_kernel_release(release).then(|| release.to_owned())
+}
+
+fn valid_kernel_release(release: &str) -> bool {
+    !release.is_empty()
+        && release.len() <= 128
+        && release
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'+' | b'-' | b'_'))
 }
 
 fn parse_os_release(input: &str) -> Vec<(String, String)> {
