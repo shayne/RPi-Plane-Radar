@@ -1,9 +1,36 @@
 use std::net::IpAddr;
 
+use thiserror::Error;
+
+#[derive(Debug, Error)]
+pub enum HostnameError {
+    #[error("hostname must be a single ASCII hostname label")]
+    Invalid,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InterfaceAddress {
     pub name: String,
     pub address: IpAddr,
+}
+
+pub fn local_url(hostname: &str) -> Result<String, HostnameError> {
+    let valid = !hostname.is_empty()
+        && hostname.len() <= 63
+        && hostname
+            .bytes()
+            .next()
+            .is_some_and(|byte| byte.is_ascii_alphanumeric())
+        && hostname
+            .bytes()
+            .last()
+            .is_some_and(|byte| byte.is_ascii_alphanumeric())
+        && hostname
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-');
+    valid
+        .then(|| format!("http://{hostname}.local"))
+        .ok_or(HostnameError::Invalid)
 }
 
 pub fn discover_ip_url(

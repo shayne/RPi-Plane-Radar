@@ -1,6 +1,6 @@
 use std::net::{IpAddr, Ipv4Addr};
 
-use planeradar::network::{InterfaceAddress, discover_ip_url};
+use planeradar::network::{InterfaceAddress, discover_ip_url, local_url};
 
 fn address(name: &str, octets: [u8; 4]) -> InterfaceAddress {
     InterfaceAddress {
@@ -49,4 +49,24 @@ fn selects_lowest_metric_up_default_route_and_ignores_malformed_rows() {
         .into_iter(),
     );
     assert_eq!(url.as_deref(), Some("http://10.0.0.8"));
+}
+
+#[test]
+fn builds_local_url_from_a_valid_hostname() {
+    assert_eq!(local_url("planeradar").unwrap(), "http://planeradar.local");
+    assert_eq!(local_url("hangar-2").unwrap(), "http://hangar-2.local");
+}
+
+#[test]
+fn rejects_hostname_text_that_could_change_the_authority() {
+    for value in [
+        "",
+        ".local",
+        "radar.local",
+        "radar/evil",
+        "radar:80",
+        "-radar",
+    ] {
+        assert!(local_url(value).is_err(), "{value}");
+    }
 }

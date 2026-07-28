@@ -11,7 +11,7 @@ use crate::display::{DisplayHandler, DisplayUpdate, InputEvent};
 use crate::model::{Airport, AppState, RadarSettings, RadarSnapshot};
 use crate::range::range_preset;
 use crate::render::radar::{BackgroundKey, RadarRenderer};
-use crate::render::setup::{CANONICAL_LOCAL_URL, SetupRenderer};
+use crate::render::setup::SetupRenderer;
 use crate::render::{Frame, RenderError};
 use crate::runtime::{RuntimeError, RuntimeHandle, RuntimeSnapshot};
 use crate::touch::{Gesture, GestureRecognizer};
@@ -200,19 +200,19 @@ impl PlaneRadarApp {
     fn render_frame(&mut self, now: Duration) -> Result<Frame, AppError> {
         match self.state() {
             AppState::SetupRequired => Ok(self.setup.render(
-                CANONICAL_LOCAL_URL,
+                &self.snapshot.local_url,
                 self.snapshot.ip_url.as_deref(),
                 false,
                 SETUP_MESSAGE,
             )?),
             AppState::WaitingForNetwork => Ok(self.setup.render(
-                CANONICAL_LOCAL_URL,
+                &self.snapshot.local_url,
                 self.snapshot.ip_url.as_deref(),
                 true,
                 WAITING_MESSAGE,
             )?),
             AppState::Settings => Ok(self.setup.render(
-                CANONICAL_LOCAL_URL,
+                &self.snapshot.local_url,
                 self.snapshot.ip_url.as_deref(),
                 true,
                 SETTINGS_MESSAGE,

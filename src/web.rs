@@ -65,6 +65,7 @@ struct ServerState {
     settings: Arc<dyn SettingsService>,
     geocoder: Arc<Mutex<Box<dyn GeocodeService>>>,
     health: Arc<dyn HealthSource>,
+    local_url: String,
     allowed_hosts: Arc<dyn Fn() -> HashSet<String> + Send + Sync>,
     sessions: Mutex<SessionStore>,
     in_flight_requests: AtomicUsize,
@@ -76,6 +77,7 @@ impl SettingsServer {
         settings: Arc<dyn SettingsService>,
         geocoder: Arc<Mutex<Box<dyn GeocodeService>>>,
         health: Arc<dyn HealthSource>,
+        local_url: String,
         allowed_hosts: Arc<dyn Fn() -> HashSet<String> + Send + Sync>,
     ) -> Result<Self, WebError> {
         let server = Server::http(address).map_err(|error| WebError::Bind(error.to_string()))?;
@@ -85,6 +87,7 @@ impl SettingsServer {
                 settings,
                 geocoder,
                 health,
+                local_url,
                 allowed_hosts,
                 sessions: Mutex::new(SessionStore::default()),
                 in_flight_requests: AtomicUsize::new(0),
@@ -145,7 +148,13 @@ impl ServerState {
 
     fn page(&self) -> Result<Outgoing, WebError> {
         let (session_id, csrf_token) = self.sessions.lock().map_err(|_| WebError::State)?.create();
-        let body = render_page(&self.settings.current(), &csrf_token, &[], None);
+        let body = render_page(
+            &self.settings.current(),
+            &self.local_url,
+            &csrf_token,
+            &[],
+            None,
+        );
         Ok(Outgoing::html(200, body)
             .with_header(
                 "Set-Cookie",
@@ -222,6 +231,7 @@ impl ServerState {
             Err(_) => {
                 let body = render_page(
                     &self.settings.current(),
+                    &self.local_url,
                     csrf_token,
                     &[],
                     Some("Search unavailable; enter coordinates manually"),
@@ -229,7 +239,13 @@ impl ServerState {
                 return Ok(Outgoing::html(200, body).with_header("Cache-Control", "no-store"));
             }
         };
-        let body = render_page(&self.settings.current(), csrf_token, &results, None);
+        let body = render_page(
+            &self.settings.current(),
+            &self.local_url,
+            csrf_token,
+            &results,
+            None,
+        );
         Ok(Outgoing::html(200, body).with_header("Cache-Control", "no-store"))
     }
 
@@ -593,6 +609,7 @@ fn header_values<'a>(request: &'a Request, name: &'static str) -> Vec<&'a str> {
 
 fn render_page(
     settings: &RadarSettings,
+    local_url: &str,
     csrf_token: &str,
     results: &[GeocodeResult],
     message: Option<&str>,
@@ -609,6 +626,7 @@ fn render_page(
         })
         .unwrap_or_else(|| (String::new(), String::new(), ""));
     let csrf = escape_html(csrf_token);
+    let local_url = escape_html(local_url);
     let label = escape_html(label);
     let kilometres_selected = if settings.units == Units::Kilometres {
         " selected"
@@ -688,7 +706,7 @@ p, button {{ overflow-wrap: anywhere; }}
 <body>
 <main>
 <h1>Plane Radar settings</h1>
-<p>Open this page at <a href="http://planeradar.local">http://planeradar.local</a>.</p>
+<p>Open this page at <a href="{local_url}">{local_url}</a>.</p>
 {message}
 <section>
 <h2>Search for a place</h2>
