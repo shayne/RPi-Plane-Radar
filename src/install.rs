@@ -1050,7 +1050,7 @@ fn backup_path(path: &Path) -> PathBuf {
 }
 
 fn open_lock_file(path: &Path) -> Result<File, InstallError> {
-    let lock_path = lock_path(path);
+    let lock_path = lock_path(path)?;
     if let Ok(metadata) = fs::symlink_metadata(&lock_path)
         && !metadata.file_type().is_file()
     {
@@ -1064,11 +1064,24 @@ fn open_lock_file(path: &Path) -> Result<File, InstallError> {
         .open(lock_path)?)
 }
 
-fn lock_path(path: &Path) -> PathBuf {
-    let mut name = path
+fn lock_path(path: &Path) -> Result<PathBuf, InstallError> {
+    let name = path
         .file_name()
-        .expect("boot configuration path has a file name")
-        .to_os_string();
+        .ok_or_else(|| InstallError::MissingParent(path.to_owned()))?;
+    let mut name = name.to_os_string();
     name.push(".planeradar-lock");
-    path.with_file_name(name)
+    Ok(path.with_file_name(name))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lock_path_rejects_a_path_without_a_file_name() {
+        assert!(matches!(
+            lock_path(Path::new("/")),
+            Err(InstallError::MissingParent(path)) if path == Path::new("/")
+        ));
+    }
 }
