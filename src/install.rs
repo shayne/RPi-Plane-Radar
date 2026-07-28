@@ -452,7 +452,6 @@ struct MachineInstallResult<'a> {
     reboot_required: bool,
     revision: &'a str,
     sha256: &'a str,
-    owned_files: &'a [InstalledFile],
 }
 
 impl InstallResult {
@@ -467,10 +466,42 @@ impl InstallResult {
             reboot_required: self.reboot_required,
             revision: &self.revision,
             sha256: &self.sha256,
-            owned_files: &self.owned_files,
         })
         .map_err(InstallMachineOutputError::Serialize)
     }
+}
+
+#[derive(Serialize)]
+struct MachineInstallOwnership {
+    schema_version: u32,
+    owned_files: Vec<InstalledFile>,
+}
+
+pub fn installer_ownership_json(root: &Path) -> Result<String, InstallError> {
+    let owned_files = [
+        INSTALL_BINARY,
+        INSTALL_REVISION,
+        INSTALL_CHECKSUM,
+        INSTALL_SERVICE,
+    ]
+    .into_iter()
+    .map(|relative| {
+        let path = install_path(root, relative);
+        let metadata = fs::symlink_metadata(&path)?;
+        if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+            return Err(InstallError::UnsafeFileType(path));
+        }
+        Ok(InstalledFile {
+            target_path: format!("/{relative}"),
+            sha256: format!("{:x}", Sha256::digest(fs::read(&path)?)),
+        })
+    })
+    .collect::<Result<Vec<_>, InstallError>>()?;
+    serde_json::to_string(&MachineInstallOwnership {
+        schema_version: 1,
+        owned_files,
+    })
+    .map_err(|error| InstallError::Io(io::Error::other(error)))
 }
 
 #[derive(Debug, Error)]

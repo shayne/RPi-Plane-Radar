@@ -7,8 +7,8 @@ use std::rc::Rc;
 
 use planeradarctl::install::{
     BackendFailure, InstallBackend, InstallOutcome, InstallRequest, InstallStatusEvent, Installer,
-    InterruptionReason, PhaseVerification, TRYBOOT_TIMEOUT_GUIDANCE, TargetInstallResult,
-    extract_application_payload,
+    InterruptionReason, PhaseVerification, TRYBOOT_TIMEOUT_GUIDANCE, TargetApplicationInstall,
+    TargetInstallOwnership, TargetInstallResult, extract_application_payload,
 };
 use planeradarctl::state::{
     ArtifactIdentity, InstallPhase, InstallState, OwnedFile, STATE_SCHEMA_VERSION, StateError,
@@ -144,16 +144,21 @@ impl InstallBackend for ScriptedBackend {
     fn install_application(
         &self,
         request: &InstallRequest,
-    ) -> Result<TargetInstallResult, BackendFailure> {
+    ) -> Result<TargetApplicationInstall, BackendFailure> {
         self.record_action(InstallPhase::ApplicationInstalled)?;
-        Ok(TargetInstallResult {
-            schema_version: 1,
-            files_changed: true,
-            boot_config_changed: false,
-            reboot_required: false,
-            revision: request.application.source_commit.clone(),
-            sha256: request.application.sha256.clone(),
-            owned_files: expected_owned_files(&request.application),
+        Ok(TargetApplicationInstall {
+            result: TargetInstallResult {
+                schema_version: 1,
+                files_changed: true,
+                boot_config_changed: false,
+                reboot_required: false,
+                revision: request.application.source_commit.clone(),
+                sha256: request.application.sha256.clone(),
+            },
+            ownership: TargetInstallOwnership {
+                schema_version: 1,
+                owned_files: expected_owned_files(&request.application),
+            },
         })
     }
 
@@ -661,13 +666,7 @@ fn target_install_json_is_strict_complete_and_contains_no_local_data() {
         "boot_config_changed": false,
         "reboot_required": false,
         "revision": "0123456789abcdef0123456789abcdef01234567",
-        "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-        "owned_files": [
-            {"target_path": "/opt/planeradar/bin/planeradar", "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},
-            {"target_path": "/opt/planeradar/REVISION", "sha256": "7777777777777777777777777777777777777777777777777777777777777777"},
-            {"target_path": "/opt/planeradar/SHA256", "sha256": "8888888888888888888888888888888888888888888888888888888888888888"},
-            {"target_path": "/etc/systemd/system/planeradar.service", "sha256": "9999999999999999999999999999999999999999999999999999999999999999"}
-        ]
+        "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
     }"#;
 
     let parsed = TargetInstallResult::from_json(json).expect("valid result");
@@ -681,7 +680,6 @@ fn target_install_json_is_strict_complete_and_contains_no_local_data() {
         parsed.sha256,
         "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
     );
-    assert_eq!(parsed.owned_files.len(), 4);
     let encoded = parsed.to_json().expect("serialize");
     assert!(!encoded.contains("/Users/"));
     assert!(!encoded.contains("password"));
@@ -698,6 +696,7 @@ fn target_install_json_rejects_hostile_partial_and_ambiguous_output() {
         r#"{"schema_version":1,"files_changed":true,"boot_config_changed":false,"reboot_required":false,"revision":"short","sha256":"2222222222222222222222222222222222222222222222222222222222222222"}"#,
         r#"{"schema_version":1,"files_changed":true,"boot_config_changed":false,"reboot_required":false,"revision":"1111111111111111111111111111111111111111","sha256":"UPPER22222222222222222222222222222222222222222222222222222222222"}"#,
         r#"{"schema_version":1,"files_changed":true,"boot_config_changed":false,"reboot_required":false,"revision":"1111111111111111111111111111111111111111","sha256":"2222222222222222222222222222222222222222222222222222222222222222","path":"/Users/shayne/secret"}"#,
+        r#"{"schema_version":1,"files_changed":true,"boot_config_changed":false,"reboot_required":false,"revision":"1111111111111111111111111111111111111111","sha256":"2222222222222222222222222222222222222222222222222222222222222222","owned_files":[]}"#,
         r#"{"schema_version":1,"schema_version":1,"files_changed":true,"boot_config_changed":false,"reboot_required":false,"revision":"1111111111111111111111111111111111111111","sha256":"2222222222222222222222222222222222222222222222222222222222222222"}"#,
         &format!("{valid}\n{{}}"),
         &format!("diagnostic\n{valid}"),
@@ -710,6 +709,24 @@ fn target_install_json_rejects_hostile_partial_and_ambiguous_output() {
             "{hostile:?}"
         );
     }
+}
+
+#[test]
+fn target_install_ownership_json_is_a_separate_strict_internal_contract() {
+    let json = br#"{
+        "schema_version": 1,
+        "owned_files": [
+            {"target_path": "/opt/planeradar/bin/planeradar", "sha256": "6666666666666666666666666666666666666666666666666666666666666666"},
+            {"target_path": "/opt/planeradar/REVISION", "sha256": "7777777777777777777777777777777777777777777777777777777777777777"},
+            {"target_path": "/opt/planeradar/SHA256", "sha256": "8888888888888888888888888888888888888888888888888888888888888888"},
+            {"target_path": "/etc/systemd/system/planeradar.service", "sha256": "9999999999999999999999999999999999999999999999999999999999999999"}
+        ]
+    }"#;
+    let parsed = TargetInstallOwnership::from_json(json).expect("valid ownership");
+    assert_eq!(parsed.owned_files.len(), 4);
+    assert!(
+        TargetInstallOwnership::from_json(br#"{"schema_version":1,"owned_files":[]}"#).is_err()
+    );
 }
 
 #[test]

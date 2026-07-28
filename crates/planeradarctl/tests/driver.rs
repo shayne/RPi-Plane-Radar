@@ -865,6 +865,55 @@ printf 'unexpected build\n' > "$output/build-was-run"
 }
 
 #[test]
+fn driver_postconditions_come_from_exact_verified_local_artifact_bytes() {
+    let temporary = tempfile::tempdir().expect("temporary driver");
+    let source = temporary.path().join("source");
+    let artifact = temporary.path().join("artifact");
+    fs::create_dir_all(&source).expect("source");
+    fs::create_dir_all(&artifact).expect("artifact");
+    let module = b"module bytes";
+    let overlay = b"overlay bytes";
+    let applied = b"applied dtb bytes";
+    fs::write(artifact.join("hyperpixel2r_kms.ko"), module).expect("module");
+    fs::write(artifact.join("hyperpixel2r-kms-ca95ffeb30b3.dtbo"), overlay).expect("overlay");
+    fs::write(artifact.join("hyperpixel2r-kms-applied.dtb"), applied).expect("applied");
+    let manifest = format!(
+        "schema_version\t1\ndriver_version\t0.1.0\nsource_revision\t{DRIVER_COMMIT}\nsource_tree\t{DRIVER_TREE}\nkernel_release\t6.18.34+rpt-rpi-v8\narchitecture\taarch64\nbase_dtb_sha256\t{}\nmodule_file\thyperpixel2r_kms.ko\nmodule_sha256\t{}\nmodule_vermagic\t{EXPECTED_VERMAGIC}\noverlay_file\thyperpixel2r-kms-ca95ffeb30b3.dtbo\noverlay_sha256\t{}\napplied_dtb_file\thyperpixel2r-kms-applied.dtb\napplied_dtb_sha256\t{}\n",
+        "a".repeat(64),
+        digest(module),
+        digest(overlay),
+        digest(applied),
+    );
+    fs::write(artifact.join("manifest.txt"), &manifest).expect("manifest");
+    let tool = DriverTool::new(
+        SystemCommandRunner,
+        source,
+        DriverPlan::Prebuilt {
+            archive: artifact.clone(),
+        },
+        DriverContext {
+            target: "pi@fixture".into(),
+            kernel_release: "6.18.34+rpt-rpi-v8".into(),
+            kernel_export: temporary.path().join("kernel"),
+            artifacts: temporary.path().join("artifacts"),
+            replace_overlay: "vc4-kms-dpi-hyperpixel2r".into(),
+        },
+        "0.1.0".into(),
+        DRIVER_COMMIT.into(),
+    )
+    .expect("tool");
+
+    let expected = tool.postconditions().expect("postconditions");
+    assert_eq!(expected.manifest_sha256, digest(manifest.as_bytes()));
+    assert_eq!(expected.module_sha256, digest(module));
+    assert_eq!(expected.overlay_sha256, digest(overlay));
+    assert_eq!(expected.applied_dtb_sha256, digest(applied));
+
+    fs::write(artifact.join("hyperpixel2r_kms.ko"), b"tampered").expect("tamper");
+    assert!(tool.postconditions().is_err());
+}
+
+#[test]
 fn sync_rejects_unsafe_source_entries_without_materializing_them() {
     for (label, entry_type, link_name) in [
         ("symlink", EntryType::Symlink, Some("/outside")),

@@ -13,13 +13,13 @@ use planeradarctl::{
     cli::{Cli, Command, DriverCommand},
     config::{Environment, InstallConfig},
     driver::{
-        DriverAction, DriverContext, DriverManager, DriverTool, GhDriverReleaseSource,
-        GhDriverReleaseVerifier, TargetProbe as DriverTargetProbe,
+        DriverAction, DriverContext, DriverManager, DriverPostconditions, DriverTool,
+        GhDriverReleaseSource, GhDriverReleaseVerifier, TargetProbe as DriverTargetProbe,
     },
     install::{
         ApplicationPayload, BackendFailure, InstallBackend, InstallOutcome, InstallRequest,
-        InstallStatusEvent, Installer, PhaseVerification, TargetInstallResult,
-        extract_application_payload,
+        InstallStatusEvent, Installer, PhaseVerification, TargetApplicationInstall,
+        TargetInstallOwnership, TargetInstallResult, extract_application_payload,
     },
     preflight::{HostPreflight, SystemUnixClock, TargetPreflight},
     release::{GhReleaseSource, MANIFEST_NAME, ReleaseClient, ReleaseInput, Verifier},
@@ -180,28 +180,108 @@ fn select_install_target(
     application: &ArtifactIdentity,
     driver: &ArtifactIdentity,
 ) -> Result<(SshTarget, TargetIdentity, LocalStateStore), Box<dyn std::error::Error>> {
-    if let Ok(probe) = transport.probe(&original) {
-        let store = LocalStateStore::from_environment(home, probe.identity.clone())?;
-        return Ok((original, probe.identity, store));
-    }
     let desired = format!("{}@{desired_hostname}.local", original.username().as_str())
         .parse::<SshTarget>()?;
-    let observed = transport.probe(&desired)?.identity;
-    let store = LocalStateStore::from_environment(home, observed.clone())?;
-    let persisted = store.load()?.ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::NotFound,
-            "original target is unavailable and the desired hostname has no persisted identity",
-        )
-    })?;
-    if !resume_state_matches(&persisted, &observed, application, driver) {
+    let mut candidates = Vec::new();
+    for (is_original, target) in [(true, original), (false, desired)] {
+        if candidates
+            .iter()
+            .any(|candidate: &InstallCandidate| candidate.target == target)
+        {
+            continue;
+        }
+        if let Ok(probe) = transport.probe(&target) {
+            let store = LocalStateStore::from_environment(home, probe.identity.clone())?;
+            let persisted = store.load()?;
+            candidates.push(InstallCandidate {
+                target,
+                observed: probe.identity,
+                store,
+                persisted,
+                is_original,
+            });
+        }
+    }
+    if candidates.is_empty() {
         return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "desired hostname does not match the persisted installation identity",
+            io::ErrorKind::NotFound,
+            "neither the original target nor the desired hostname is reachable",
         )
         .into());
     }
-    Ok((desired, observed, store))
+    let candidate_states = candidates
+        .iter()
+        .map(|candidate| InstallCandidateState {
+            is_original: candidate.is_original,
+            observed: candidate.observed.clone(),
+            persisted: candidate.persisted.clone(),
+        })
+        .collect::<Vec<_>>();
+    let selected = select_candidate_index(&candidate_states, application, driver)?;
+    let candidate = candidates.swap_remove(selected);
+    Ok((candidate.target, candidate.observed, candidate.store))
+}
+
+struct InstallCandidate {
+    target: SshTarget,
+    observed: TargetIdentity,
+    store: LocalStateStore,
+    persisted: Option<InstallState>,
+    is_original: bool,
+}
+
+struct InstallCandidateState {
+    is_original: bool,
+    observed: TargetIdentity,
+    persisted: Option<InstallState>,
+}
+
+fn select_candidate_index(
+    candidates: &[InstallCandidateState],
+    application: &ArtifactIdentity,
+    driver: &ArtifactIdentity,
+) -> Result<usize, io::Error> {
+    let matching = candidates
+        .iter()
+        .enumerate()
+        .filter_map(|(index, candidate)| {
+            candidate
+                .persisted
+                .as_ref()
+                .is_some_and(|persisted| {
+                    resume_state_matches(persisted, &candidate.observed, application, driver)
+                })
+                .then_some(index)
+        })
+        .collect::<Vec<_>>();
+    match matching.as_slice() {
+        [index] => return Ok(*index),
+        [_, _, ..] => {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "multiple reachable targets match the persisted installation identity",
+            ));
+        }
+        [] => {}
+    }
+    if candidates
+        .iter()
+        .any(|candidate| candidate.persisted.is_some())
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "reachable target does not match its persisted installation identity and artifacts",
+        ));
+    }
+    candidates
+        .iter()
+        .position(|candidate| candidate.is_original)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "desired hostname has no persisted installation identity",
+            )
+        })
 }
 
 fn resume_state_matches(
@@ -210,10 +290,11 @@ fn resume_state_matches(
     application: &ArtifactIdentity,
     driver: &ArtifactIdentity,
 ) -> bool {
-    persisted.phase >= InstallPhase::HostnameChanged
-        && &persisted.target == observed
-        && persisted.application.as_ref() == Some(application)
-        && persisted.driver.as_ref() == Some(driver)
+    &persisted.target == observed
+        && persisted.application
+            == (persisted.phase >= InstallPhase::ApplicationAcquired).then(|| application.clone())
+        && persisted.driver
+            == (persisted.phase >= InstallPhase::DriverReady).then(|| driver.clone())
 }
 
 fn requested_version(config: &InstallConfig) -> Result<Version, Box<dyn std::error::Error>> {
@@ -309,6 +390,10 @@ fn target_install_command(
     ])
 }
 
+fn target_install_ownership_command(helper_path: &str) -> Result<RemoteCommand, TransportError> {
+    RemoteCommand::interactive_sudo(["sudo", helper_path, "installer-ownership"])
+}
+
 fn deploy_helper_command(
     upload_path: &str,
     helper_path: &str,
@@ -329,32 +414,52 @@ fn deploy_helper_command(
 }
 
 fn staged_driver_transaction_command(
-    driver_version: &str,
-    source_revision: &str,
-    kernel_release: &str,
-    overlay_file: &str,
+    expected: &DriverPostconditions,
 ) -> Result<RemoteCommand, TransportError> {
     RemoteCommand::interactive_sudo([
         "sudo",
         "sh",
         "-c",
-        r#"set -eu; state=/var/lib/hyperpixel2r-kms/tryboot-state; test ! -L "$state" && test -f "$state"; test "$(stat -c '%u:%g:%a' -- "$state")" = "0:0:600"; test "$(awk -F= 'NF != 2 || $1 == "" || $2 == "" || seen[$1]++ { bad=1 } END { print bad+0 }' "$state")" = 0; value() { awk -F= -v key="$1" '$1 == key { print $2 }' "$state"; }; test "$(value driver_version)" = "$1"; test "$(value source_revision)" = "$2"; test "$(value kernel_release)" = "$3"; test "$(value overlay_file)" = "$4"; artifact="/var/lib/hyperpixel2r-kms/artifacts/$1/$2/$3"; test ! -L "$artifact" && test -d "$artifact"; manifest="$artifact/manifest.txt"; test ! -L "$manifest" && test -f "$manifest"; test "$(awk -F '\t' -v key=driver_version '$1 == key { print $2 }' "$manifest")" = "$1"; test "$(awk -F '\t' -v key=source_revision '$1 == key { print $2 }' "$manifest")" = "$2"; test "$(awk -F '\t' -v key=kernel_release '$1 == key { print $2 }' "$manifest")" = "$3"; module_sha=$(value module_sha256); overlay_sha=$(value overlay_sha256); case "$module_sha$overlay_sha" in *[!0-9a-f]*|'') exit 1 ;; esac; test "${#module_sha}" = 64 && test "${#overlay_sha}" = 64; test "$(sha256sum -- "/lib/modules/$3/extra/hyperpixel2r_kms.ko" | awk '{print $1}')" = "$module_sha"; test "$(sha256sum -- "/boot/firmware/overlays/$4" | awk '{print $1}')" = "$overlay_sha""#,
+        r#"set -eu; state=/var/lib/hyperpixel2r-kms/tryboot-state; regular() { test ! -L "$1" && test -f "$1" && test "$(stat -c '%u:%g:%a' -- "$1")" = "0:0:$2"; }; digest() { test "$(sha256sum -- "$1" | awk '{print $1}')" = "$2"; }; test ! -L "$state" && regular "$state" 600; test "$(awk -F= 'NF != 2 || $1 == "" || $2 == "" || seen[$1]++ { bad=1 } END { print NR ":" bad+0 }' "$state")" = "16:0"; value() { awk -F= -v key="$1" '$1 == key { print $2 }' "$state"; }; test "$(value schema_version)" = 1; test "$(value driver_version)" = "$1"; test "$(value source_revision)" = "$2"; test "$(value source_tree)" = "$3"; test "$(value kernel_release)" = "$4"; test "$(value module_file)" = "$7"; test "$(value module_sha256)" = "$8"; test "$(value overlay_file)" = "$9"; test "$(value overlay_sha256)" = "${10}"; test "$(value applied_dtb_file)" = "${11}"; test "$(value applied_dtb_sha256)" = "${12}"; test "$(value replaced_overlay)" = "${13}"; prior=$(value prior_tryboot_sha256); case "$(value tryboot_existed)" in true) case "$prior" in *[!0-9a-f]*|'') exit 1;; esac; test "${#prior}" = 64;; false) test "$prior" = none;; *) exit 1;; esac; for key in normal_config_sha256 candidate_config_sha256; do sha=$(value "$key"); case "$sha" in *[!0-9a-f]*|'') exit 1;; esac; test "${#sha}" = 64; done; artifact="/usr/lib/hyperpixel2r-kms/$1/$2/$4"; test ! -L "$artifact" && test -d "$artifact" && test "$(stat -c '%u:%g:%a' -- "$artifact")" = "0:0:755"; manifest="$artifact/manifest.txt"; regular "$manifest" 644 && digest "$manifest" "$6"; field() { awk -F '\t' -v key="$1" '$1 == key { print $2 }' "$manifest"; }; test "$(field driver_version)" = "$1"; test "$(field source_revision)" = "$2"; test "$(field source_tree)" = "$3"; test "$(field kernel_release)" = "$4"; test "$(field module_vermagic)" = "$5"; test "$(field module_file)" = "$7"; test "$(field module_sha256)" = "$8"; test "$(field overlay_file)" = "$9"; test "$(field overlay_sha256)" = "${10}"; test "$(field applied_dtb_file)" = "${11}"; test "$(field applied_dtb_sha256)" = "${12}"; regular "$artifact/$7" 644 && digest "$artifact/$7" "$8"; regular "$artifact/$9" 644 && digest "$artifact/$9" "${10}"; regular "$artifact/${11}" 644 && digest "$artifact/${11}" "${12}"; module="/lib/modules/$4/extra/$7"; overlay="/boot/firmware/overlays/$9"; normal=/boot/firmware/config.txt; candidate=/boot/firmware/tryboot.txt; regular "$module" 644 && digest "$module" "$8"; regular "$overlay" 644 && digest "$overlay" "${10}"; regular "$normal" 644 && digest "$normal" "$(value normal_config_sha256)"; regular "$candidate" 644 && digest "$candidate" "$(value candidate_config_sha256)"; test "$(awk -v wanted="dtoverlay=$9" '{ line=$0; sub(/^[[:space:]]+/, "", line); sub(/[[:space:]]+$/, "", line); if (line !~ /^dtoverlay=/) next; if (line == wanted) { count++; next } if (line ~ /hyperpixel2r/) bad=1 } END { print count ":" bad+0 }' "$candidate")" = "1:0""#,
         "planeradar-driver-transaction",
-        driver_version,
-        source_revision,
-        kernel_release,
-        overlay_file,
+        &expected.driver_version,
+        &expected.source_revision,
+        &expected.source_tree,
+        &expected.kernel_release,
+        &expected.module_vermagic,
+        &expected.manifest_sha256,
+        &expected.module_file,
+        &expected.module_sha256,
+        &expected.overlay_file,
+        &expected.overlay_sha256,
+        &expected.applied_dtb_file,
+        &expected.applied_dtb_sha256,
+        &expected.replaced_overlay,
     ])
 }
 
-fn committed_driver_command(overlay_file: &str) -> Result<RemoteCommand, TransportError> {
+fn committed_driver_command(
+    expected: &DriverPostconditions,
+) -> Result<RemoteCommand, TransportError> {
     RemoteCommand::interactive_sudo([
         "sudo",
         "sh",
         "-c",
-        r#"set -eu; state=/var/lib/hyperpixel2r-kms/tryboot-state; test ! -L "$state" && test ! -e "$state"; config=/boot/firmware/config.txt; overlay="/boot/firmware/overlays/$1"; test ! -L "$config" && test -f "$config"; test ! -L "$overlay" && test -f "$overlay"; test "$(awk -v wanted="dtoverlay=$1" '{ line=$0; sub(/^[[:space:]]+/, "", line); sub(/[[:space:]]+$/, "", line); if (line == wanted) count++ } END { print count+0 }' "$config")" = 1"#,
+        r#"set -eu; state=/var/lib/hyperpixel2r-kms/tryboot-state; regular() { test ! -L "$1" && test -f "$1" && test "$(stat -c '%u:%g:%a' -- "$1")" = "0:0:$2"; }; digest() { test "$(sha256sum -- "$1" | awk '{print $1}')" = "$2"; }; test ! -L "$state" && test ! -e "$state"; artifact="/usr/lib/hyperpixel2r-kms/$1/$2/$4"; test ! -L "$artifact" && test -d "$artifact" && test "$(stat -c '%u:%g:%a' -- "$artifact")" = "0:0:755"; manifest="$artifact/manifest.txt"; regular "$manifest" 644 && digest "$manifest" "$6"; field() { awk -F '\t' -v key="$1" '$1 == key { print $2 }' "$manifest"; }; test "$(field driver_version)" = "$1"; test "$(field source_revision)" = "$2"; test "$(field source_tree)" = "$3"; test "$(field kernel_release)" = "$4"; test "$(field module_vermagic)" = "$5"; test "$(field module_file)" = "$7"; test "$(field module_sha256)" = "$8"; test "$(field overlay_file)" = "$9"; test "$(field overlay_sha256)" = "${10}"; test "$(field applied_dtb_file)" = "${11}"; test "$(field applied_dtb_sha256)" = "${12}"; regular "$artifact/$7" 644 && digest "$artifact/$7" "$8"; regular "$artifact/$9" 644 && digest "$artifact/$9" "${10}"; regular "$artifact/${11}" 644 && digest "$artifact/${11}" "${12}"; module="/lib/modules/$4/extra/$7"; overlay="/boot/firmware/overlays/$9"; config=/boot/firmware/config.txt; regular "$module" 644 && digest "$module" "$8"; regular "$overlay" 644 && digest "$overlay" "${10}"; regular "$config" 644; test "$(awk -v wanted="dtoverlay=$9" '{ line=$0; sub(/^[[:space:]]+/, "", line); sub(/[[:space:]]+$/, "", line); if (line !~ /^dtoverlay=/) next; if (line == wanted) { count++; next } if (line ~ /hyperpixel2r/) bad=1 } END { print count ":" bad+0 }' "$config")" = "1:0""#,
         "planeradar-driver-committed",
-        overlay_file,
+        &expected.driver_version,
+        &expected.source_revision,
+        &expected.source_tree,
+        &expected.kernel_release,
+        &expected.module_vermagic,
+        &expected.manifest_sha256,
+        &expected.module_file,
+        &expected.module_sha256,
+        &expected.overlay_file,
+        &expected.overlay_sha256,
+        &expected.applied_dtb_file,
+        &expected.applied_dtb_sha256,
+        &expected.replaced_overlay,
     ])
 }
 
@@ -492,13 +597,11 @@ impl SystemInstallBackend {
         self.ensure_driver_tool()?;
         let tool = self.driver_tool.borrow();
         let tool = tool.as_ref().ok_or(BackendFailure::OperationFailed)?;
-        let command = staged_driver_transaction_command(
-            tool.driver_version(),
-            tool.source_revision(),
-            tool.kernel_release(),
-            tool.expected_overlay_file(),
-        )
-        .map_err(|_| BackendFailure::OperationFailed)?;
+        let expected = tool
+            .postconditions()
+            .map_err(|_| BackendFailure::OperationFailed)?;
+        let command = staged_driver_transaction_command(&expected)
+            .map_err(|_| BackendFailure::OperationFailed)?;
         self.run_remote_check(command)
     }
 
@@ -506,9 +609,28 @@ impl SystemInstallBackend {
         self.ensure_driver_tool()?;
         let tool = self.driver_tool.borrow();
         let tool = tool.as_ref().ok_or(BackendFailure::OperationFailed)?;
-        let command = committed_driver_command(tool.expected_overlay_file())
+        let expected = tool
+            .postconditions()
             .map_err(|_| BackendFailure::OperationFailed)?;
+        let command =
+            committed_driver_command(&expected).map_err(|_| BackendFailure::OperationFailed)?;
         self.run_remote_check(command)
+    }
+
+    fn verify_accepted_driver(&self, normal_boot: bool) -> Result<bool, BackendFailure> {
+        if !self.verify_committed_driver()? {
+            return Ok(false);
+        }
+        self.ensure_driver_tool()?;
+        let tool = self.driver_tool.borrow();
+        let tool = tool.as_ref().ok_or(BackendFailure::OperationFailed)?;
+        if normal_boot {
+            tool.verify_normal_boot().map(|_| true).or(Ok(false))
+        } else {
+            tool.run(DriverAction::VerifyBoot)
+                .map(|_| true)
+                .or(Ok(false))
+        }
     }
 
     fn desired_target(&self, hostname: &str) -> Result<SshTarget, BackendFailure> {
@@ -734,7 +856,7 @@ impl InstallBackend for SystemInstallBackend {
             .ok_or(BackendFailure::OperationFailed)?
             .run(DriverAction::CommitBoot)
             .map_err(|_| BackendFailure::OperationFailed)?;
-        if self.verify_committed_driver()? {
+        if self.verify_accepted_driver(false)? {
             Ok(())
         } else {
             Err(BackendFailure::OperationFailed)
@@ -744,7 +866,7 @@ impl InstallBackend for SystemInstallBackend {
     fn install_application(
         &self,
         request: &InstallRequest,
-    ) -> Result<TargetInstallResult, BackendFailure> {
+    ) -> Result<TargetApplicationInstall, BackendFailure> {
         if !self.verify_remote_helper(&request.application.sha256)? {
             return Err(BackendFailure::OperationFailed);
         }
@@ -756,7 +878,21 @@ impl InstallBackend for SystemInstallBackend {
             .transport
             .run(&self.current_target(), install)
             .map_err(|_| BackendFailure::SshLost)?;
-        TargetInstallResult::from_json(output.stdout()).map_err(|_| BackendFailure::OperationFailed)
+        let result = TargetInstallResult::from_json(output.stdout())
+            .map_err(|_| BackendFailure::OperationFailed)?;
+        let ownership = self
+            .transport
+            .run(
+                &self.current_target(),
+                target_install_ownership_command(&self.helper_path)
+                    .map_err(|_| BackendFailure::OperationFailed)?,
+            )
+            .map_err(|_| BackendFailure::SshLost)?;
+        Ok(TargetApplicationInstall {
+            result,
+            ownership: TargetInstallOwnership::from_json(ownership.stdout())
+                .map_err(|_| BackendFailure::OperationFailed)?,
+        })
     }
 
     fn change_hostname_and_reconnect(
@@ -852,7 +988,9 @@ impl InstallBackend for SystemInstallBackend {
             InstallPhase::TrybootStaged => {
                 let persisted = *self.persisted_target_phase.borrow();
                 if persisted.is_some_and(|phase| phase >= InstallPhase::DriverAccepted) {
-                    self.verify_committed_driver()
+                    self.verify_accepted_driver(
+                        persisted.is_some_and(|phase| phase >= InstallPhase::FinalRebooted),
+                    )
                 } else {
                     self.verify_staged_driver_transaction()
                 }
@@ -882,23 +1020,18 @@ impl InstallBackend for SystemInstallBackend {
                         .or(Ok(false))
                 }
             }
-            InstallPhase::DriverAccepted => self.verify_committed_driver(),
+            InstallPhase::DriverAccepted => self.verify_accepted_driver(
+                self.persisted_target_phase
+                    .borrow()
+                    .is_some_and(|phase| phase >= InstallPhase::FinalRebooted),
+            ),
             InstallPhase::ApplicationInstalled => self.verify_installed_application(request),
             InstallPhase::HostnameChanged => {
                 let desired = self.desired_target(&request.desired_hostname)?;
                 self.update_reconnected_target(desired, &request.target)
                     .map(|()| true)
             }
-            InstallPhase::FinalRebooted => {
-                self.ensure_driver_tool()?;
-                self.driver_tool
-                    .borrow()
-                    .as_ref()
-                    .ok_or(BackendFailure::OperationFailed)?
-                    .verify_normal_boot()
-                    .map(|_| true)
-                    .or(Ok(false))
-            }
+            InstallPhase::FinalRebooted => self.verify_accepted_driver(true),
             InstallPhase::FinalVerified | InstallPhase::Complete => self.verify_service_health(),
         };
         Ok(if verification? {
@@ -948,10 +1081,11 @@ fn run_driver(command: DriverCommand) -> Result<(), Box<dyn std::error::Error>> 
 #[cfg(test)]
 mod tests {
     use super::{
-        ArtifactIdentity, BackendFailure, InstallPhase, InstallState, TargetIdentity,
-        TransportError, committed_driver_command, deploy_helper_command, final_reboot_command,
-        hostname_command, resume_state_matches, staged_driver_transaction_command,
-        target_install_command, tryboot_reboot_command, tryboot_wait_failure,
+        ArtifactIdentity, BackendFailure, InstallCandidateState, InstallPhase, InstallState,
+        TargetIdentity, TransportError, committed_driver_command, deploy_helper_command,
+        final_reboot_command, hostname_command, resume_state_matches, select_candidate_index,
+        staged_driver_transaction_command, target_install_command,
+        target_install_ownership_command, tryboot_reboot_command, tryboot_wait_failure,
     };
 
     #[test]
@@ -1027,10 +1161,14 @@ mod tests {
             &application,
             &driver
         ));
-        let mut too_early = resumed;
-        too_early.phase = InstallPhase::ApplicationInstalled;
+        let mut wrong_artifact = resumed;
+        wrong_artifact
+            .application
+            .as_mut()
+            .expect("application")
+            .sha256 = "5".repeat(64);
         assert!(!resume_state_matches(
-            &too_early,
+            &wrong_artifact,
             &target,
             &application,
             &driver
@@ -1038,14 +1176,81 @@ mod tests {
     }
 
     #[test]
+    fn durable_matching_identity_wins_over_a_reachable_reused_original_hostname() {
+        let application = ArtifactIdentity {
+            version: "1.2.3".into(),
+            source_commit: "1".repeat(40),
+            sha256: "2".repeat(64),
+        };
+        let driver = ArtifactIdentity {
+            version: "1.2.3".into(),
+            source_commit: "3".repeat(40),
+            sha256: "4".repeat(64),
+        };
+        let installed = TargetIdentity {
+            host_key_sha256: "SHA256:8R2K6pFDwIKY2fWb/4mMxwAA7PY8VYyLmWucTx7D99A".into(),
+            model: "Raspberry Pi Zero 2 W Rev 1.0".into(),
+            serial: "10000000abcdef01".into(),
+        };
+        let reused_original = TargetIdentity {
+            host_key_sha256: "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
+            model: "Raspberry Pi Zero 2 W Rev 1.0".into(),
+            serial: "10000000abcdef02".into(),
+        };
+        let persisted = InstallState {
+            schema_version: 1,
+            target: installed.clone(),
+            phase: InstallPhase::HostnameChanged,
+            application: Some(application.clone()),
+            driver: Some(driver.clone()),
+        };
+        let candidates = [
+            InstallCandidateState {
+                is_original: true,
+                observed: reused_original,
+                persisted: None,
+            },
+            InstallCandidateState {
+                is_original: false,
+                observed: installed,
+                persisted: Some(persisted),
+            },
+        ];
+
+        assert_eq!(
+            select_candidate_index(&candidates, &application, &driver).expect("safe candidate"),
+            1
+        );
+        assert_eq!(
+            select_candidate_index(&candidates[..1], &application, &driver)
+                .expect("fresh original"),
+            0
+        );
+    }
+
+    #[test]
     fn driver_postconditions_are_bound_to_exact_transaction_and_committed_identity() {
-        let command = staged_driver_transaction_command(
-            "0.1.0",
-            "f6213007a8e780309e34b220351fc229e3c7d554",
-            "6.12.47+rpt-rpi-v8",
-            "hyperpixel2r-kms-f6213007a8e7.dtbo",
-        )
-        .expect("staged transaction command");
+        let expected = planeradarctl::driver::DriverPostconditions {
+            driver_version: "0.1.0".into(),
+            source_revision: "f6213007a8e780309e34b220351fc229e3c7d554".into(),
+            source_tree: "1111111111111111111111111111111111111111".into(),
+            kernel_release: "6.12.47+rpt-rpi-v8".into(),
+            module_vermagic: "6.12.47+rpt-rpi-v8 SMP preempt mod_unload aarch64".into(),
+            manifest_sha256: "2222222222222222222222222222222222222222222222222222222222222222"
+                .into(),
+            module_file: "hyperpixel2r_kms.ko".into(),
+            module_sha256: "3333333333333333333333333333333333333333333333333333333333333333"
+                .into(),
+            overlay_file: "hyperpixel2r-kms-f6213007a8e7.dtbo".into(),
+            overlay_sha256: "4444444444444444444444444444444444444444444444444444444444444444"
+                .into(),
+            applied_dtb_file: "hyperpixel2r-kms-applied.dtb".into(),
+            applied_dtb_sha256: "5555555555555555555555555555555555555555555555555555555555555555"
+                .into(),
+            replaced_overlay: "vc4-kms-dpi-hyperpixel2r".into(),
+        };
+        let command =
+            staged_driver_transaction_command(&expected).expect("staged transaction command");
         assert!(command.is_interactive_sudo());
         assert_eq!(
             &command.arguments()[4..],
@@ -1053,19 +1258,39 @@ mod tests {
                 "planeradar-driver-transaction",
                 "0.1.0",
                 "f6213007a8e780309e34b220351fc229e3c7d554",
+                "1111111111111111111111111111111111111111",
                 "6.12.47+rpt-rpi-v8",
+                "6.12.47+rpt-rpi-v8 SMP preempt mod_unload aarch64",
+                "2222222222222222222222222222222222222222222222222222222222222222",
+                "hyperpixel2r_kms.ko",
+                "3333333333333333333333333333333333333333333333333333333333333333",
                 "hyperpixel2r-kms-f6213007a8e7.dtbo",
+                "4444444444444444444444444444444444444444444444444444444444444444",
+                "hyperpixel2r-kms-applied.dtb",
+                "5555555555555555555555555555555555555555555555555555555555555555",
+                "vc4-kms-dpi-hyperpixel2r",
             ]
         );
 
-        let committed =
-            committed_driver_command("hyperpixel2r-kms-f6213007a8e7.dtbo").expect("committed");
+        let committed = committed_driver_command(&expected).expect("committed");
         assert!(committed.is_interactive_sudo());
         assert_eq!(
             &committed.arguments()[4..],
             [
                 "planeradar-driver-committed",
+                "0.1.0",
+                "f6213007a8e780309e34b220351fc229e3c7d554",
+                "1111111111111111111111111111111111111111",
+                "6.12.47+rpt-rpi-v8",
+                "6.12.47+rpt-rpi-v8 SMP preempt mod_unload aarch64",
+                "2222222222222222222222222222222222222222222222222222222222222222",
+                "hyperpixel2r_kms.ko",
+                "3333333333333333333333333333333333333333333333333333333333333333",
                 "hyperpixel2r-kms-f6213007a8e7.dtbo",
+                "4444444444444444444444444444444444444444444444444444444444444444",
+                "hyperpixel2r-kms-applied.dtb",
+                "5555555555555555555555555555555555555555555555555555555555555555",
+                "vc4-kms-dpi-hyperpixel2r",
             ]
         );
     }
@@ -1094,6 +1319,13 @@ mod tests {
                 revision.as_str(),
                 "--json",
             ]
+        );
+        let ownership =
+            target_install_ownership_command(&helper).expect("target ownership command");
+        assert!(ownership.is_interactive_sudo());
+        assert_eq!(
+            ownership.arguments(),
+            ["sudo", helper.as_str(), "installer-ownership"]
         );
 
         let revision_identity = "1".repeat(40);

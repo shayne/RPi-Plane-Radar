@@ -72,6 +72,8 @@ pub enum Command {
         #[command(subcommand)]
         command: InstallerStateCommand,
     },
+    #[command(hide = true)]
+    InstallerOwnership,
     ConfigureDisplay {
         #[arg(long, default_value = "/boot/firmware/config.txt")]
         boot_config: PathBuf,

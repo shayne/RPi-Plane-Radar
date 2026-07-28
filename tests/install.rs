@@ -767,7 +767,7 @@ fn target_install_result_machine_json_has_the_exact_public_schema() {
 
     assert_eq!(
         result.to_json().expect("machine JSON"),
-        r#"{"schema_version":1,"files_changed":true,"boot_config_changed":false,"reboot_required":false,"revision":"0123456789abcdef0123456789abcdef01234567","sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","owned_files":[{"target_path":"/opt/planeradar/bin/planeradar","sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}]}"#
+        r#"{"schema_version":1,"files_changed":true,"boot_config_changed":false,"reboot_required":false,"revision":"0123456789abcdef0123456789abcdef01234567","sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}"#
     );
 }
 
@@ -793,6 +793,40 @@ fn target_install_result_refuses_invalid_machine_identity_fields() {
     ] {
         assert!(result.to_json().is_err());
     }
+}
+
+#[test]
+fn installer_ownership_is_a_separate_exact_internal_contract() {
+    let directory = tempfile::tempdir().expect("temporary root");
+    for (relative, contents) in [
+        ("opt/planeradar/bin/planeradar", b"binary".as_slice()),
+        ("opt/planeradar/REVISION", b"revision".as_slice()),
+        ("opt/planeradar/SHA256", b"checksum".as_slice()),
+        (
+            "etc/systemd/system/planeradar.service",
+            b"service".as_slice(),
+        ),
+    ] {
+        let path = directory.path().join(relative);
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("create parent");
+        std::fs::write(path, contents).expect("write owned file");
+    }
+
+    let encoded =
+        planeradar::install::installer_ownership_json(directory.path()).expect("ownership JSON");
+    let value: serde_json::Value = serde_json::from_str(&encoded).expect("parse ownership JSON");
+    assert_eq!(value["schema_version"], 1);
+    let files = value["owned_files"].as_array().expect("owned files");
+    assert_eq!(files.len(), 4);
+    assert_eq!(files[0]["target_path"], "/opt/planeradar/bin/planeradar");
+    assert_eq!(
+        value
+            .as_object()
+            .expect("object")
+            .keys()
+            .collect::<Vec<_>>(),
+        ["owned_files", "schema_version"]
+    );
 }
 
 #[test]

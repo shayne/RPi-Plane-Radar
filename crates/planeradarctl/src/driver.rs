@@ -1400,6 +1400,23 @@ pub struct DriverTool<R> {
     expected_overlay_file: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DriverPostconditions {
+    pub driver_version: String,
+    pub source_revision: String,
+    pub source_tree: String,
+    pub kernel_release: String,
+    pub module_vermagic: String,
+    pub manifest_sha256: String,
+    pub module_file: String,
+    pub module_sha256: String,
+    pub overlay_file: String,
+    pub overlay_sha256: String,
+    pub applied_dtb_file: String,
+    pub applied_dtb_sha256: String,
+    pub replaced_overlay: String,
+}
+
 impl<R> DriverTool<R> {
     pub fn new(
         runner: R,
@@ -1461,6 +1478,112 @@ impl<R> DriverTool<R> {
 
     pub fn expected_overlay_file(&self) -> &str {
         &self.expected_overlay_file
+    }
+
+    pub fn postconditions(&self) -> Result<DriverPostconditions, DriverError> {
+        let artifact_dir = match &self.plan {
+            DriverPlan::Prebuilt { archive } => archive.clone(),
+            DriverPlan::CrossBuild { .. } => {
+                self.context.artifacts.join(&self.context.kernel_release)
+            }
+        };
+        let manifest_path = artifact_dir.join("manifest.txt");
+        let metadata = fs::symlink_metadata(&manifest_path).map_err(DriverError::Io)?;
+        if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+            return Err(DriverError::InvalidPrebuiltIdentity);
+        }
+        let manifest = fs::read(&manifest_path).map_err(DriverError::Io)?;
+        let text =
+            std::str::from_utf8(&manifest).map_err(|_| DriverError::InvalidPrebuiltIdentity)?;
+        let mut fields = BTreeMap::<String, String>::new();
+        for line in text.lines() {
+            let (key, value) = line
+                .split_once('\t')
+                .ok_or(DriverError::InvalidPrebuiltIdentity)?;
+            if key.is_empty()
+                || value.is_empty()
+                || fields.insert(key.to_owned(), value.to_owned()).is_some()
+            {
+                return Err(DriverError::InvalidPrebuiltIdentity);
+            }
+        }
+        const KEYS: [&str; 14] = [
+            "schema_version",
+            "driver_version",
+            "source_revision",
+            "source_tree",
+            "kernel_release",
+            "architecture",
+            "base_dtb_sha256",
+            "module_file",
+            "module_sha256",
+            "module_vermagic",
+            "overlay_file",
+            "overlay_sha256",
+            "applied_dtb_file",
+            "applied_dtb_sha256",
+        ];
+        if fields.len() != KEYS.len() || KEYS.iter().any(|key| !fields.contains_key(*key)) {
+            return Err(DriverError::InvalidPrebuiltIdentity);
+        }
+        let get = |key: &str| {
+            fields
+                .get(key)
+                .cloned()
+                .ok_or(DriverError::InvalidPrebuiltIdentity)
+        };
+        let result = DriverPostconditions {
+            driver_version: get("driver_version")?,
+            source_revision: get("source_revision")?,
+            source_tree: get("source_tree")?,
+            kernel_release: get("kernel_release")?,
+            module_vermagic: get("module_vermagic")?,
+            manifest_sha256: sha256_bytes(&manifest),
+            module_file: get("module_file")?,
+            module_sha256: get("module_sha256")?,
+            overlay_file: get("overlay_file")?,
+            overlay_sha256: get("overlay_sha256")?,
+            applied_dtb_file: get("applied_dtb_file")?,
+            applied_dtb_sha256: get("applied_dtb_sha256")?,
+            replaced_overlay: self.context.replace_overlay.clone(),
+        };
+        if fields.get("schema_version").map(String::as_str) != Some("1")
+            || fields.get("architecture").map(String::as_str) != Some("aarch64")
+            || result.driver_version != self.driver_version
+            || result.source_revision != self.source_revision
+            || result.kernel_release != self.context.kernel_release
+            || !is_lower_hex(&result.source_tree, 40)
+            || !is_lower_hex(
+                fields
+                    .get("base_dtb_sha256")
+                    .ok_or(DriverError::InvalidPrebuiltIdentity)?,
+                64,
+            )
+            || result.module_file != "hyperpixel2r_kms.ko"
+            || result.overlay_file != self.expected_overlay_file
+            || result.applied_dtb_file != "hyperpixel2r-kms-applied.dtb"
+            || validate_vermagic(&result.module_vermagic, &result.kernel_release).is_err()
+        {
+            return Err(DriverError::InvalidPrebuiltIdentity);
+        }
+        for (name, digest) in [
+            (&result.module_file, &result.module_sha256),
+            (&result.overlay_file, &result.overlay_sha256),
+            (&result.applied_dtb_file, &result.applied_dtb_sha256),
+        ] {
+            if !safe_name(name) || !is_lower_hex(digest, 64) {
+                return Err(DriverError::InvalidPrebuiltIdentity);
+            }
+            let path = artifact_dir.join(name);
+            let leaf = fs::symlink_metadata(&path).map_err(DriverError::Io)?;
+            if !leaf.file_type().is_file()
+                || leaf.file_type().is_symlink()
+                || sha256_bytes(&fs::read(path).map_err(DriverError::Io)?) != *digest
+            {
+                return Err(DriverError::InvalidPrebuiltIdentity);
+            }
+        }
+        Ok(result)
     }
 }
 

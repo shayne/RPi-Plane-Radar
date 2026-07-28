@@ -257,7 +257,7 @@ pub trait InstallBackend: TargetStateStore {
     fn install_application(
         &self,
         request: &InstallRequest,
-    ) -> Result<TargetInstallResult, BackendFailure>;
+    ) -> Result<TargetApplicationInstall, BackendFailure>;
     fn change_hostname_and_reconnect(
         &self,
         expected_identity: &TargetIdentity,
@@ -499,16 +499,21 @@ impl<'a, B: InstallBackend, S: StateStore> Installer<'a, B, S> {
                     .install_application(request)
                     .map_err(ActionError::Backend)?;
                 installed
+                    .result
                     .validate()
                     .map_err(|_| ActionError::Install(InstallError::InvalidTargetInstallResult))?;
-                if installed.revision != request.application.source_commit
-                    || installed.sha256 != request.application.sha256
+                installed
+                    .ownership
+                    .validate()
+                    .map_err(|_| ActionError::Install(InstallError::InvalidTargetInstallResult))?;
+                if installed.result.revision != request.application.source_commit
+                    || installed.result.sha256 != request.application.sha256
                 {
                     return Err(ActionError::Install(
                         InstallError::ArtifactIdentityMismatch { phase },
                     ));
                 }
-                owned_files = Some(installed.owned_files);
+                owned_files = Some(installed.ownership.owned_files);
             }
             InstallPhase::HostnameChanged => self
                 .backend
@@ -691,7 +696,6 @@ pub struct TargetInstallResult {
     pub reboot_required: bool,
     pub revision: String,
     pub sha256: String,
-    pub owned_files: Vec<crate::state::OwnedFile>,
 }
 
 #[derive(Deserialize)]
@@ -703,7 +707,6 @@ struct RawTargetInstallResult {
     reboot_required: bool,
     revision: String,
     sha256: String,
-    owned_files: Vec<crate::state::OwnedFile>,
 }
 
 impl<'de> Deserialize<'de> for TargetInstallResult {
@@ -719,7 +722,6 @@ impl<'de> Deserialize<'de> for TargetInstallResult {
             reboot_required: raw.reboot_required,
             revision: raw.revision,
             sha256: raw.sha256,
-            owned_files: raw.owned_files,
         };
         result
             .validate()
@@ -748,10 +750,63 @@ impl TargetInstallResult {
         if self.schema_version != 1
             || !is_lower_hex(&self.revision, 40)
             || !is_lower_hex(&self.sha256, 64)
-            || self.owned_files.is_empty()
-            || self.owned_files.len() > 64
         {
             return Err("invalid target install result");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TargetApplicationInstall {
+    pub result: TargetInstallResult,
+    pub ownership: TargetInstallOwnership,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct TargetInstallOwnership {
+    pub schema_version: u32,
+    pub owned_files: Vec<crate::state::OwnedFile>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawTargetInstallOwnership {
+    schema_version: u32,
+    owned_files: Vec<crate::state::OwnedFile>,
+}
+
+impl<'de> Deserialize<'de> for TargetInstallOwnership {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = RawTargetInstallOwnership::deserialize(deserializer)?;
+        let ownership = Self {
+            schema_version: raw.schema_version,
+            owned_files: raw.owned_files,
+        };
+        ownership
+            .validate()
+            .map_err(serde::de::Error::custom)
+            .map(|()| ownership)
+    }
+}
+
+impl TargetInstallOwnership {
+    pub fn from_json(contents: &[u8]) -> Result<Self, TargetInstallJsonError> {
+        if contents.len() > MAX_TARGET_INSTALL_JSON_BYTES {
+            return Err(TargetInstallJsonError);
+        }
+        let mut deserializer = serde_json::Deserializer::from_slice(contents);
+        let ownership = Self::deserialize(&mut deserializer).map_err(|_| TargetInstallJsonError)?;
+        deserializer.end().map_err(|_| TargetInstallJsonError)?;
+        Ok(ownership)
+    }
+
+    fn validate(&self) -> Result<(), &'static str> {
+        if self.schema_version != 1 || self.owned_files.len() != 4 {
+            return Err("invalid target install ownership");
         }
         const EXACT_OWNED_PATHS: [&str; 4] = [
             "/opt/planeradar/bin/planeradar",

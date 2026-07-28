@@ -10,7 +10,7 @@ use planeradar::cli::{Cli, Command, DemoCommand, InstallerStateCommand, version_
 use planeradar::display::{DisplayConfig, run_display, run_probe};
 use planeradar::install::{
     BootConfigEditor, DisplaySelection, InstallOptions, Installer, SystemCommandRunner,
-    commit_display_config, ensure_overlay, read_installer_state_json,
+    commit_display_config, ensure_overlay, installer_ownership_json, read_installer_state_json,
     read_optional_installer_state_json, rollback_display_config, stage_tryboot_config,
     stage_tryboot_config_if_source_matches, write_installer_state_json,
 };
@@ -135,6 +135,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     "/var/lib/planeradar-installer/state.json",
                 ))?
             );
+        }
+        Command::InstallerOwnership => {
+            println!("{}", installer_ownership_json(std::path::Path::new("/"))?);
         }
         Command::ConfigureDisplay {
             boot_config,
