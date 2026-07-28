@@ -8,6 +8,7 @@ use tiny_skia::Pixmap;
 use url::Host;
 
 use crate::display::{DisplayConfig, DisplayHandler, DisplayUpdate, InputEvent, run_display};
+use crate::network::local_url_override;
 use crate::render::text::{HorizontalAnchor, TextRasterizer, TextStyle, VerticalAnchor};
 use crate::render::theme;
 use crate::render::{FontAsset, Frame, RenderError};
@@ -56,7 +57,7 @@ impl SetupRenderer {
         message: &str,
     ) -> Result<Frame, RenderError> {
         let local_url =
-            validated_local_url(local_url).unwrap_or_else(|| CANONICAL_LOCAL_URL.to_owned());
+            local_url_override(local_url).unwrap_or_else(|_| CANONICAL_LOCAL_URL.to_owned());
         let code = QrCode::with_error_correction_level(local_url.as_bytes(), EcLevel::M)?;
         let code_modules =
             u32::try_from(code.width()).map_err(|_| RenderError::DimensionsOverflow)?;
@@ -349,25 +350,6 @@ fn validated_ip_url(candidate: Option<&str>) -> Option<String> {
         || parsed.fragment().is_some()
         || parsed.path() != "/"
         || !matches!(parsed.host()?, Host::Ipv4(_) | Host::Ipv6(_))
-    {
-        return None;
-    }
-    Some(parsed.as_str().trim_end_matches('/').to_owned())
-}
-
-fn validated_local_url(candidate: &str) -> Option<String> {
-    let candidate = bounded_url_candidate_with(candidate, str::trim)?;
-    if candidate.is_empty() || candidate.chars().any(char::is_control) {
-        return None;
-    }
-    let parsed = url::Url::parse(candidate).ok()?;
-    if parsed.scheme() != "http"
-        || !parsed.username().is_empty()
-        || parsed.password().is_some()
-        || parsed.query().is_some()
-        || parsed.fragment().is_some()
-        || parsed.path() != "/"
-        || parsed.host().is_none()
     {
         return None;
     }

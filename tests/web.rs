@@ -529,6 +529,12 @@ fn host_header_requires_an_exact_allowlist_entry() {
     );
     assert_eq!(
         server
+            .request("GET", "/", "planeradar.local", Vec::new(), &[], true)
+            .status,
+        403
+    );
+    assert_eq!(
+        server
             .request("GET", "/", "attacker.local", Vec::new(), &[], true)
             .status,
         403

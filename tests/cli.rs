@@ -124,3 +124,23 @@ fn run_leaves_the_local_url_unset_without_an_override() {
     };
     assert_eq!(local_url, None);
 }
+
+#[test]
+fn run_rejects_an_unsafe_local_url_override_before_starting_runtime() {
+    let output = Command::new(env!("CARGO_BIN_EXE_planeradar"))
+        .args([
+            "run",
+            "--headless",
+            "--http",
+            "127.0.0.1:0",
+            "--local-url",
+            "javascript:alert(1)",
+        ])
+        .output()
+        .expect("run planeradar");
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("local URL must be a bounded HTTP origin")
+    );
+}
