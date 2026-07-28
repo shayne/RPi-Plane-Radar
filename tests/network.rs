@@ -1,6 +1,6 @@
 use std::net::{IpAddr, Ipv4Addr};
 
-use planeradar::network::{InterfaceAddress, discover_ip_url, local_url};
+use planeradar::network::{InterfaceAddress, discover_ip_url, local_url, local_url_override};
 
 fn address(name: &str, octets: [u8; 4]) -> InterfaceAddress {
     InterfaceAddress {
@@ -68,5 +68,27 @@ fn rejects_hostname_text_that_could_change_the_authority() {
         "-radar",
     ] {
         assert!(local_url(value).is_err(), "{value}");
+    }
+}
+
+#[test]
+fn canonicalizes_a_safe_explicit_local_url_override() {
+    assert_eq!(
+        local_url_override("http://HANGAR-2.local:8080/").unwrap(),
+        "http://hangar-2.local:8080"
+    );
+}
+
+#[test]
+fn rejects_unsafe_explicit_local_url_overrides() {
+    for value in [
+        "javascript:alert(1)",
+        "https://hangar-2.local",
+        "http://user@hangar-2.local",
+        "http://hangar-2.local/settings",
+        "http://hangar-2.local/?query=1",
+        "http://hangar-2.local/#fragment",
+    ] {
+        assert!(local_url_override(value).is_err(), "{value}");
     }
 }

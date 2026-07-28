@@ -44,7 +44,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             debug_frame,
         } => {
             let local_url = match local_url {
-                Some(url) => url,
+                Some(url) => planeradar::network::local_url_override(&url)?,
                 None => {
                     let hostname = std::fs::read_to_string("/etc/hostname")?;
                     planeradar::network::local_url(hostname.trim())?
