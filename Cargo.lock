@@ -1167,6 +1167,7 @@ dependencies = [
  "clap",
  "jsonschema",
  "libc",
+ "png 0.18.1",
  "semver",
  "serde",
  "serde_json",

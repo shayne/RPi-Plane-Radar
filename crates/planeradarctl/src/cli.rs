@@ -14,8 +14,8 @@ pub enum Command {
     Install(MutatingOptions),
     Upgrade(MutatingOptions),
     Status(TargetOptions),
-    Doctor(TargetOptions),
-    Screenshot(TargetOptions),
+    Doctor(DoctorOptions),
+    Screenshot(ScreenshotOptions),
     Rollback(MutatingOptions),
     Uninstall(MutatingOptions),
     Driver {
@@ -69,4 +69,20 @@ pub struct MutatingOptions {
 pub struct TargetOptions {
     #[arg(value_name = "target")]
     pub target: Option<String>,
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct DoctorOptions {
+    #[arg(value_name = "target")]
+    pub target: Option<String>,
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct ScreenshotOptions {
+    #[arg(value_name = "target")]
+    pub target: Option<String>,
+    #[arg(long, default_value = "planeradar-radar.png")]
+    pub output: PathBuf,
 }

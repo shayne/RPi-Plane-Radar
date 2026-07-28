@@ -21,6 +21,7 @@ use planeradarctl::{
         InstallStatusEvent, Installer, PhaseVerification, TargetApplicationInstall,
         TargetInstallOwnership, TargetInstallResult, extract_application_payload,
     },
+    operations::{OperationsClient, SshOperationsBackend, SystemCaptureClock},
     preflight::{HostPreflight, SystemUnixClock, TargetPreflight},
     release::{GhReleaseSource, MANIFEST_NAME, ReleaseClient, ReleaseInput, Verifier},
     state::{
@@ -52,11 +53,112 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         return run_driver(command);
     }
     let environment = Environment::from_dotenv_path(Path::new(".env"))?;
+    match cli.command.clone() {
+        Command::Status(options) => {
+            return run_remote_operation(options.target, environment, RemoteOperation::Status);
+        }
+        Command::Doctor(options) => {
+            return run_remote_operation(
+                options.target,
+                environment,
+                RemoteOperation::Doctor { json: options.json },
+            );
+        }
+        Command::Screenshot(options) => {
+            return run_remote_operation(
+                options.target,
+                environment,
+                RemoteOperation::Screenshot {
+                    output: options.output,
+                },
+            );
+        }
+        _ => {}
+    }
     if cli.command.is_mutating() {
         let is_install = matches!(cli.command, Command::Install(_));
         let config = InstallConfig::resolve(cli, environment)?;
         if is_install {
             return run_install(config);
+        }
+    }
+    Ok(())
+}
+
+enum RemoteOperation {
+    Status,
+    Doctor { json: bool },
+    Screenshot { output: PathBuf },
+}
+
+fn run_remote_operation(
+    cli_target: Option<String>,
+    environment: Environment,
+    operation: RemoteOperation,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let target_text = cli_target
+        .or(environment.target)
+        .filter(|target| !target.is_empty())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "target is required as user@host or PLANERADAR_PI_TARGET",
+            )
+        })?;
+    let target = target_text.parse::<SshTarget>()?;
+    let home = env::var_os("HOME")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "an absolute home directory is required",
+            )
+        })?;
+    let transport =
+        OpenSshTransport::system(TransportConfig::new(home.join(".ssh").join("known_hosts"))?);
+    let backend = SshOperationsBackend::new(&transport, target, DriverLock::checked_in()?);
+    let client = OperationsClient::new(&backend, SystemCaptureClock::default());
+
+    match operation {
+        RemoteOperation::Status => {
+            println!("{}", client.status()?);
+        }
+        RemoteOperation::Doctor { json } => {
+            let report = client.doctor()?;
+            if json {
+                println!("{}", report.to_json()?);
+            } else if report.healthy {
+                println!("Plane Radar doctor: healthy");
+            } else {
+                println!(
+                    "Plane Radar doctor: unhealthy ({})",
+                    report
+                        .diagnostics
+                        .iter()
+                        .map(|diagnostic| format!("{diagnostic:?}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
+            if !report.healthy {
+                let diagnostic = report
+                    .diagnostics
+                    .first()
+                    .copied()
+                    .ok_or_else(|| io::Error::other("doctor returned no diagnostic"))?;
+                return Err(
+                    planeradarctl::operations::OperationError::Unhealthy(diagnostic).into(),
+                );
+            }
+        }
+        RemoteOperation::Screenshot { output } => {
+            let capture = client.screenshot(&output, Duration::from_secs(15))?;
+            println!(
+                "Screenshot saved to {} (sha256 {})",
+                capture.destination.display(),
+                capture.sha256
+            );
         }
     }
     Ok(())

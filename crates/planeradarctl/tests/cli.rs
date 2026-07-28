@@ -125,6 +125,32 @@ fn command_surface_accepts_all_public_command_names() {
 }
 
 #[test]
+fn diagnostic_and_screenshot_options_are_explicit() {
+    let doctor = Cli::try_parse_from(["planeradarctl", "doctor", "pi@planeradar.local", "--json"])
+        .expect("doctor options");
+    assert!(matches!(
+        doctor.command,
+        Command::Doctor(options)
+            if options.target.as_deref() == Some("pi@planeradar.local") && options.json
+    ));
+
+    let screenshot = Cli::try_parse_from([
+        "planeradarctl",
+        "screenshot",
+        "pi@planeradar.local",
+        "--output",
+        "radar.png",
+    ])
+    .expect("screenshot options");
+    assert!(matches!(
+        screenshot.command,
+        Command::Screenshot(options)
+            if options.target.as_deref() == Some("pi@planeradar.local")
+                && options.output == std::path::Path::new("radar.png")
+    ));
+}
+
+#[test]
 fn maintainer_driver_commands_parse_exact_sync_and_update_forms() {
     let sync = Cli::try_parse_from(["planeradarctl", "driver", "sync"]).expect("driver sync");
     assert!(matches!(
