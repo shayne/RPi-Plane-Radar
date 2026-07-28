@@ -25,6 +25,8 @@ pub struct HttpResponse {
 
 #[derive(Debug, Error, Eq, PartialEq)]
 pub enum HttpError {
+    #[error("HTTP timeout values exceed the supported duration")]
+    InvalidTimeout,
     #[error("HTTP request timed out")]
     Timeout,
     #[error("HTTP transport failed")]
@@ -44,7 +46,7 @@ impl HttpClient for UreqHttpClient {
             return Err(HttpError::TlsVerificationRequired);
         }
 
-        let agent = build_agent(&request);
+        let agent = build_agent(&request)?;
         let mut call = agent.get(&request.url);
         for (name, value) in &request.query {
             call = call.query(name, value);
@@ -61,9 +63,12 @@ impl HttpClient for UreqHttpClient {
     }
 }
 
-fn build_agent(request: &HttpRequest) -> ureq::Agent {
-    let global_timeout = request.connect_timeout.saturating_add(request.read_timeout);
-    ureq::Agent::config_builder()
+fn build_agent(request: &HttpRequest) -> Result<ureq::Agent, HttpError> {
+    let global_timeout = request
+        .connect_timeout
+        .checked_add(request.read_timeout)
+        .ok_or(HttpError::InvalidTimeout)?;
+    Ok(ureq::Agent::config_builder()
         .http_status_as_error(false)
         .https_only(true)
         .tls_config(
@@ -78,7 +83,7 @@ fn build_agent(request: &HttpRequest) -> ureq::Agent {
         .timeout_recv_response(Some(request.read_timeout))
         .timeout_recv_body(Some(request.read_timeout))
         .build()
-        .new_agent()
+        .new_agent())
 }
 
 fn map_request_error(error: ureq::Error) -> HttpError {
@@ -112,7 +117,7 @@ mod tests {
 
     #[test]
     fn agent_bounds_dns_connect_read_and_end_to_end_time() {
-        let agent = build_agent(&request());
+        let agent = build_agent(&request()).expect("agent");
         let timeouts = agent.config().timeouts();
 
         assert_eq!(timeouts.resolve, Some(Duration::from_millis(3050)));
@@ -120,6 +125,17 @@ mod tests {
         assert_eq!(timeouts.recv_response, Some(Duration::from_secs(10)));
         assert_eq!(timeouts.recv_body, Some(Duration::from_secs(10)));
         assert_eq!(timeouts.global, Some(Duration::from_millis(13_050)));
+    }
+
+    #[test]
+    fn timeout_sum_overflow_is_rejected() {
+        let mut request = request();
+        request.connect_timeout = Duration::MAX;
+        request.read_timeout = Duration::from_nanos(1);
+        assert!(matches!(
+            build_agent(&request),
+            Err(HttpError::InvalidTimeout)
+        ));
     }
 
     #[test]
