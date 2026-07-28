@@ -1,5 +1,0 @@
-obj-m += planeradar_hyperpixel2r.o
-planeradar_hyperpixel2r-y := \
-	planeradar_hyperpixel2r_main.o \
-	planeradar_hyperpixel2r_gpio.o \
-	planeradar_hyperpixel2r_protocol.o

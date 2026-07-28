@@ -78,9 +78,10 @@ udevadm info --query=property --name=/dev/input/event0
 sudo evtest /dev/input/event0
 ```
 
-The device ancestry should descend from
-`/sys/devices/platform/planeradar-hyperpixel2r/`, and its X/Y axes should span
-the native 0–479 surface. Confirm the service account and device policy:
+The device ancestry should descend from the bound `hyperpixel2r-kms` platform
+device, whose Device Tree `compatible` value is
+`shayne,hyperpixel2r-kms`, and its X/Y axes should span the native 0–479
+surface. Confirm the service account and device policy:
 
 ```sh
 id planeradar
