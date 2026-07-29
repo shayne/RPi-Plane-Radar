@@ -22,19 +22,39 @@ use tempfile::NamedTempFile;
 use thiserror::Error;
 
 use crate::{
-    config::{DRIVER_REPOSITORY, DriverLock},
+    config::{DRIVER_LIFECYCLE_PROTOCOL, DRIVER_REPOSITORY, DriverLock},
     transport::{CommandRunner, Invocation},
 };
 
 pub const APP_REPOSITORY: &str = "shayne/RPi-Plane-Radar";
+pub const APP_REPOSITORY_URL: &str = "https://github.com/shayne/RPi-Plane-Radar";
 pub const MANIFEST_NAME: &str = "release-manifest.json";
 pub const MAX_MANIFEST_BYTES: usize = 64 * 1024;
-pub const MAX_ARTIFACT_SIZE: u64 = 4 * 1024 * 1024 * 1024;
+pub const MAX_ARTIFACT_SIZE: u64 = 128 * 1024 * 1024;
+pub const MAX_CONTROL_ARTIFACT_SIZE: u64 = 16 * 1024 * 1024;
 pub const MAX_ARTIFACTS: usize = 64;
 pub const MAX_ARTIFACT_NAME_BYTES: usize = 128;
 
 const SUPPORTED_MODEL: &str = "Raspberry Pi Zero 2 W";
+const SUPPORTED_DISPLAY: &str = "HyperPixel 2.1 Round";
 const SUPPORTED_OS: &str = "Raspberry Pi OS Lite Trixie (64-bit)";
+const SUPPORTED_KERNEL_POLICY: &str = "driver-manifest-supported";
+const RELEASE_WORKFLOW_PATH: &str = ".github/workflows/release.yml";
+const REQUIRED_TARGET_PACKAGES: &[&str] = &[
+    "avahi-daemon",
+    "build-essential",
+    "ca-certificates",
+    "device-tree-compiler",
+    "dkms",
+    "evtest",
+    "kmod",
+    "libegl1",
+    "libgl1-mesa-dri",
+    "libgles2",
+    "libsdl2-2.0-0",
+    "linux-headers-rpi-v8",
+    "pngcheck",
+];
 const MAX_STREAM_STDERR_BYTES: usize = 64 * 1024;
 
 /// The driver identity in a release manifest is the same checked-in lock type,
@@ -49,20 +69,46 @@ pub enum Architecture {
     Any,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ArtifactKind {
+    Application,
+    Control,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum Platform {
+    LinuxGnu,
+    AppleDarwin,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SupportedTarget {
     pub model: String,
+    pub display: String,
     pub operating_system: String,
     pub architecture: Architecture,
+    pub kernel_policy: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Artifact {
     pub name: String,
+    pub kind: ArtifactKind,
+    pub platform: Platform,
     pub architecture: Architecture,
     pub size: u64,
     pub sha256: String,
     pub runnable: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorkflowIdentity {
+    pub repository: String,
+    pub path: String,
+    pub source_ref: String,
+    pub commit: String,
 }
 
 #[derive(Clone, Eq, PartialEq)]
@@ -70,7 +116,14 @@ pub struct ReleaseManifest {
     pub schema_version: u32,
     pub version: Version,
     pub source_commit: String,
+    pub source_tree: String,
+    pub source_timestamp: String,
+    pub source_date_epoch: u64,
+    pub repository: String,
+    pub workflow: WorkflowIdentity,
     pub supported: SupportedTarget,
+    pub required_target_packages: Vec<String>,
+    pub minimum_control_version: Version,
     pub driver: LockedDriver,
     pub artifacts: Vec<Artifact>,
 }
@@ -112,9 +165,33 @@ impl ReleaseManifest {
         if !is_lower_hex(&raw.source_commit, 40) {
             return Err(ReleaseError::InvalidManifest);
         }
+        if !is_lower_hex(&raw.source_tree, 40)
+            || !is_utc_timestamp(&raw.source_timestamp)
+            || raw.source_date_epoch == 0
+            || raw.repository != APP_REPOSITORY_URL
+            || raw.workflow.repository != APP_REPOSITORY
+            || raw.workflow.path != RELEASE_WORKFLOW_PATH
+            || !is_safe_github_ref(&raw.workflow.source_ref)
+            || raw.workflow.commit != raw.source_commit
+        {
+            return Err(ReleaseError::InvalidManifest);
+        }
+        let minimum_control_version = parse_canonical_version(&raw.minimum_control_version)?;
+        if minimum_control_version
+            > Version::parse(env!("CARGO_PKG_VERSION")).expect("crate version")
+            || raw.required_target_packages
+                != REQUIRED_TARGET_PACKAGES
+                    .iter()
+                    .map(|value| (*value).to_owned())
+                    .collect::<Vec<_>>()
+        {
+            return Err(ReleaseError::InvalidManifest);
+        }
         if raw.supported.model != SUPPORTED_MODEL
+            || raw.supported.display != SUPPORTED_DISPLAY
             || raw.supported.operating_system != SUPPORTED_OS
             || raw.supported.architecture != Architecture::Aarch64
+            || raw.supported.kernel_policy != SUPPORTED_KERNEL_POLICY
         {
             return Err(ReleaseError::UnsupportedTarget);
         }
@@ -131,6 +208,7 @@ impl ReleaseManifest {
             || raw.driver.version != driver_lock.version.to_string()
             || raw.driver.commit != driver_lock.commit
             || raw.driver.manifest_sha256 != driver_lock.manifest_sha256
+            || raw.driver.lifecycle_protocol != DRIVER_LIFECYCLE_PROTOCOL
         {
             return Err(ReleaseError::DriverLockMismatch);
         }
@@ -143,27 +221,53 @@ impl ReleaseManifest {
             if !is_safe_artifact_name(&name)
                 || artifact.size == 0
                 || artifact.size > MAX_ARTIFACT_SIZE
+                || (artifact.kind == ArtifactKind::Control
+                    && artifact.size > MAX_CONTROL_ARTIFACT_SIZE)
                 || !is_lower_hex(&artifact.sha256, 64)
             {
                 return Err(ReleaseError::InvalidArtifactSet);
             }
             artifacts.push(Artifact {
                 name,
+                kind: artifact.kind,
+                platform: artifact.platform,
                 architecture: artifact.architecture,
                 size: artifact.size,
                 sha256: artifact.sha256,
                 runnable: artifact.runnable,
             });
         }
-        let required_application_count = artifacts
-            .iter()
-            .filter(|artifact| {
-                artifact.name == "planeradar-aarch64-linux-gnu.tar.zst"
-                    && artifact.architecture == Architecture::Aarch64
-                    && artifact.runnable
+        let expected = [
+            (
+                "planeradar-aarch64-linux-gnu.tar.zst",
+                ArtifactKind::Application,
+                Platform::LinuxGnu,
+                Architecture::Aarch64,
+            ),
+            (
+                "planeradarctl-aarch64-apple-darwin.tar.zst",
+                ArtifactKind::Control,
+                Platform::AppleDarwin,
+                Architecture::Aarch64,
+            ),
+            (
+                "planeradarctl-x86_64-apple-darwin.tar.zst",
+                ArtifactKind::Control,
+                Platform::AppleDarwin,
+                Architecture::X86_64,
+            ),
+        ];
+        if artifacts.len() != expected.len()
+            || expected.iter().any(|(name, kind, platform, architecture)| {
+                !artifacts.iter().any(|artifact| {
+                    artifact.name == *name
+                        && artifact.kind == *kind
+                        && artifact.platform == *platform
+                        && artifact.architecture == *architecture
+                        && artifact.runnable
+                })
             })
-            .count();
-        if required_application_count != 1 {
+        {
             return Err(ReleaseError::InvalidArtifactSet);
         }
 
@@ -171,11 +275,25 @@ impl ReleaseManifest {
             schema_version: 1,
             version,
             source_commit: raw.source_commit,
+            source_tree: raw.source_tree,
+            source_timestamp: raw.source_timestamp,
+            source_date_epoch: raw.source_date_epoch,
+            repository: raw.repository,
+            workflow: WorkflowIdentity {
+                repository: raw.workflow.repository,
+                path: raw.workflow.path,
+                source_ref: raw.workflow.source_ref,
+                commit: raw.workflow.commit,
+            },
             supported: SupportedTarget {
                 model: raw.supported.model,
+                display: raw.supported.display,
                 operating_system: raw.supported.operating_system,
                 architecture: raw.supported.architecture,
+                kernel_policy: raw.supported.kernel_policy,
             },
+            required_target_packages: raw.required_target_packages,
+            minimum_control_version,
             driver: driver_lock.clone(),
             artifacts,
         })
@@ -188,17 +306,36 @@ struct RawReleaseManifest {
     schema_version: u32,
     version: String,
     source_commit: String,
+    source_tree: String,
+    source_timestamp: String,
+    source_date_epoch: u64,
+    repository: String,
+    workflow: RawWorkflowIdentity,
     supported: RawSupportedTarget,
+    required_target_packages: Vec<String>,
+    minimum_control_version: String,
     driver: RawLockedDriver,
     artifacts: BTreeMap<String, RawArtifact>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct RawWorkflowIdentity {
+    repository: String,
+    path: String,
+    #[serde(rename = "ref")]
+    source_ref: String,
+    commit: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawSupportedTarget {
     model: String,
+    display: String,
     operating_system: String,
     architecture: Architecture,
+    kernel_policy: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -208,11 +345,14 @@ struct RawLockedDriver {
     version: String,
     commit: String,
     manifest_sha256: String,
+    lifecycle_protocol: String,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawArtifact {
+    kind: ArtifactKind,
+    platform: Platform,
     architecture: Architecture,
     size: u64,
     sha256: String,
@@ -604,6 +744,13 @@ impl<R: CommandRunner> Verifier<R> {
                         artifact.path.clone().into_os_string(),
                         "-R".into(),
                         APP_REPOSITORY.into(),
+                        "--signer-workflow".into(),
+                        format!("{APP_REPOSITORY}/{RELEASE_WORKFLOW_PATH}").into(),
+                        "--source-ref".into(),
+                        release.manifest.workflow.source_ref.clone().into(),
+                        "--source-digest".into(),
+                        release.manifest.workflow.commit.clone().into(),
+                        "--deny-self-hosted-runners".into(),
                     ],
                 ),
             )?;
@@ -697,6 +844,41 @@ fn is_lower_hex(value: &str, expected_length: usize) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn is_utc_timestamp(value: &str) -> bool {
+    value.len() == 20
+        && value.as_bytes()[4] == b'-'
+        && value.as_bytes()[7] == b'-'
+        && value.as_bytes()[10] == b'T'
+        && value.as_bytes()[13] == b':'
+        && value.as_bytes()[16] == b':'
+        && value.as_bytes()[19] == b'Z'
+        && value.bytes().enumerate().all(|(index, byte)| {
+            matches!(index, 4 | 7 | 10 | 13 | 16 | 19) || byte.is_ascii_digit()
+        })
+}
+
+fn is_safe_github_ref(value: &str) -> bool {
+    let Some(suffix) = value
+        .strip_prefix("refs/heads/")
+        .or_else(|| value.strip_prefix("refs/tags/"))
+    else {
+        return false;
+    };
+    !suffix.is_empty()
+        && suffix.len() <= 192
+        && !suffix.contains("..")
+        && !suffix.contains("//")
+        && !suffix.contains("@{")
+        && !suffix.ends_with('/')
+        && !suffix.ends_with('.')
+        && !suffix.ends_with(".lock")
+        && suffix.bytes().enumerate().all(|(index, byte)| match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' => true,
+            b'.' | b'_' | b'-' | b'/' => index != 0,
+            _ => false,
+        })
 }
 
 fn is_safe_artifact_name(name: &str) -> bool {

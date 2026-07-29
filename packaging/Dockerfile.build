@@ -1,6 +1,14 @@
-FROM rust:1.97.1-trixie AS build
+FROM rust:1.97.1-trixie@sha256:1bcff4befb740599103a2c7cb51058e14479b2e35e3a34a3f0dc4ede09927488 AS build
 
-RUN apt-get update \
+RUN rm -f /etc/apt/sources.list /etc/apt/sources.list.d/* \
+    && printf '%s\n' \
+        'Types: deb' \
+        'URIs: https://snapshot.debian.org/archive/debian/20260701T000000Z' \
+        'Suites: trixie' \
+        'Components: main' \
+        'Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg' \
+        > /etc/apt/sources.list.d/snapshot.sources \
+    && apt-get -o Acquire::Check-Valid-Until=false update \
     && apt-get install -y --no-install-recommends \
         binutils \
         ca-certificates \

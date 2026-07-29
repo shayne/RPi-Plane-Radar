@@ -41,3 +41,6 @@ sdl2 = { version = "0.38", features = ["bundled", "static-link"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 sdl2 = "0.38"
+
+[dev-dependencies]
+jsonschema = { version = "0.37", default-features = false }

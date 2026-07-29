@@ -2,29 +2,70 @@
   "schema_version": 1,
   "version": "0.1.0-rc.1",
   "source_commit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "source_tree": "cccccccccccccccccccccccccccccccccccccccc",
+  "source_timestamp": "2026-07-27T12:00:00Z",
+  "source_date_epoch": 1785153600,
+  "repository": "https://github.com/shayne/RPi-Plane-Radar",
+  "workflow": {
+    "repository": "shayne/RPi-Plane-Radar",
+    "path": ".github/workflows/release.yml",
+    "ref": "refs/heads/main",
+    "commit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  },
   "supported": {
     "model": "Raspberry Pi Zero 2 W",
+    "display": "HyperPixel 2.1 Round",
     "operating_system": "Raspberry Pi OS Lite Trixie (64-bit)",
-    "architecture": "aarch64"
+    "architecture": "aarch64",
+    "kernel_policy": "driver-manifest-supported"
   },
+  "required_target_packages": [
+    "avahi-daemon",
+    "build-essential",
+    "ca-certificates",
+    "device-tree-compiler",
+    "dkms",
+    "evtest",
+    "kmod",
+    "libegl1",
+    "libgl1-mesa-dri",
+    "libgles2",
+    "libsdl2-2.0-0",
+    "linux-headers-rpi-v8",
+    "pngcheck"
+  ],
+  "minimum_control_version": "0.1.0",
   "driver": {
     "repository": "https://github.com/shayne/hyperpixel2r-kms",
     "version": "0.1.0-rc.16",
     "commit": "58c42896c8829a034f42a4bc92886dd6f21775a8",
-    "manifest_sha256": "5494a9f7f5c4a3214fff669efa26574b7d2602bafda5992472cd94b90885573c"
+    "manifest_sha256": "5494a9f7f5c4a3214fff669efa26574b7d2602bafda5992472cd94b90885573c",
+    "lifecycle_protocol": "accepted-driver-v2"
   },
   "artifacts": {
     "planeradar-aarch64-linux-gnu.tar.zst": {
+      "kind": "application",
+      "platform": "linux-gnu",
       "architecture": "aarch64",
       "size": 17,
       "sha256": "a8b3f6f4320547c3ef85f3860638f2f0156459307aa4d9e7c369cb8917ace9da",
       "runnable": true
     },
-    "sbom.spdx.json": {
-      "architecture": "any",
-      "size": 9,
-      "sha256": "e4d352a62a3f7cbaed45386e19a05a03381d4d16062e958942b44f3324a49baf",
-      "runnable": false
+    "planeradarctl-aarch64-apple-darwin.tar.zst": {
+      "kind": "control",
+      "platform": "apple-darwin",
+      "architecture": "aarch64",
+      "size": 17,
+      "sha256": "632d8cbc9b0d2daf15661379d8cdc32eba9e042c64d80e0ee8a049bbd99338ac",
+      "runnable": true
+    },
+    "planeradarctl-x86_64-apple-darwin.tar.zst": {
+      "kind": "control",
+      "platform": "apple-darwin",
+      "architecture": "x86_64",
+      "size": 18,
+      "sha256": "dc651016e491e7dbc47655259a378a524329abf17ee07495dc12a5a341b7b28a",
+      "runnable": true
     }
   }
 }

@@ -11,10 +11,10 @@ use jsonschema::Draft;
 use planeradarctl::{
     DriverLock,
     release::{
-        APP_REPOSITORY, Architecture, Artifact, DownloadRequest, GhReleaseSource, ReleaseClient,
-        ReleaseError, ReleaseInput, ReleaseManifest, ReleaseSource, ReleaseSourceError,
-        ResolvedArtifact, ResolvedRelease, StreamingCommandRunner, SupportedTarget,
-        SystemStreamingCommandRunner, Verifier,
+        APP_REPOSITORY, Architecture, Artifact, ArtifactKind, DownloadRequest, GhReleaseSource,
+        Platform, ReleaseClient, ReleaseError, ReleaseInput, ReleaseManifest, ReleaseSource,
+        ReleaseSourceError, ResolvedArtifact, ResolvedRelease, StreamingCommandRunner,
+        SupportedTarget, SystemStreamingCommandRunner, Verifier,
     },
     transport::{CommandOutput, CommandRunner, Invocation, RunnerError},
 };
@@ -23,7 +23,8 @@ use serde_json::{Value, json};
 
 const VALID_MANIFEST: &str = include_str!("../../../tests/fixtures/releases/valid.json");
 const APP_BYTES: &[u8] = b"planeradar-binary";
-const SBOM_BYTES: &[u8] = b"sbom-data";
+const CONTROL_ARM64_BYTES: &[u8] = b"control-arm64-bin";
+const CONTROL_X86_64_BYTES: &[u8] = b"control-x86_64-bin";
 const APP_NAME: &str = "planeradar-aarch64-linux-gnu.tar.zst";
 
 fn lock() -> DriverLock {
@@ -50,6 +51,10 @@ fn set_path(value: &mut Value, pointer: &str, replacement: Value) {
     *value.pointer_mut(pointer).expect("fixture pointer") = replacement;
 }
 
+fn set_version(value: &mut Value, version: &str) {
+    set_path(value, "/version", json!(version));
+}
+
 fn rename_artifact(value: &mut Value, from: &str, to: &str) {
     let artifacts = value["artifacts"].as_object_mut().expect("artifact object");
     let metadata = artifacts.remove(from).expect("artifact key");
@@ -72,19 +77,23 @@ fn parses_the_complete_valid_manifest_and_reuses_the_checked_in_driver_lock() {
         manifest.supported,
         SupportedTarget {
             model: "Raspberry Pi Zero 2 W".into(),
+            display: "HyperPixel 2.1 Round".into(),
             operating_system: "Raspberry Pi OS Lite Trixie (64-bit)".into(),
             architecture: Architecture::Aarch64,
+            kernel_policy: "driver-manifest-supported".into(),
         }
     );
     assert_eq!(manifest.driver.repository, lock().repository);
     assert_eq!(manifest.driver.version, lock().version);
     assert_eq!(manifest.driver.commit, lock().commit);
     assert_eq!(manifest.driver.manifest_sha256, lock().manifest_sha256);
-    assert_eq!(manifest.artifacts.len(), 2);
+    assert_eq!(manifest.artifacts.len(), 3);
     assert_eq!(
         manifest.artifacts[0],
         Artifact {
             name: "planeradar-aarch64-linux-gnu.tar.zst".into(),
+            kind: ArtifactKind::Application,
+            platform: Platform::LinuxGnu,
             architecture: Architecture::Aarch64,
             size: 17,
             sha256: "a8b3f6f4320547c3ef85f3860638f2f0156459307aa4d9e7c369cb8917ace9da".into(),
@@ -268,6 +277,25 @@ fn rejects_invalid_source_commit_grammar() {
 }
 
 #[test]
+fn rejects_workflow_refs_that_cannot_be_the_dispatch_oidc_ref() {
+    for invalid in [
+        "main",
+        "refs/pull/1/merge",
+        "refs/heads/",
+        "refs/heads/feature..branch",
+        "refs/heads/feature/",
+        "refs/tags/release.lock",
+    ] {
+        let mut value = valid_value();
+        set_path(&mut value, "/workflow/ref", json!(invalid));
+        assert!(
+            parse_value(&value, "0.1.0-rc.1").is_err(),
+            "unsafe workflow ref {invalid:?} was accepted"
+        );
+    }
+}
+
+#[test]
 fn rejects_wrong_supported_target_and_artifact_architecture() {
     for (pointer, replacement) in [
         ("/supported/model", json!("Raspberry Pi 4 Model B")),
@@ -292,28 +320,16 @@ fn rejects_wrong_supported_target_and_artifact_architecture() {
 
 #[test]
 fn accepts_closed_cross_platform_artifact_architectures_but_requires_the_pi_app() {
-    let mut value = valid_value();
-    value["artifacts"]
-        .as_object_mut()
-        .expect("artifacts")
-        .insert(
-            "planeradarctl-x86_64-apple-darwin.tar.zst".into(),
-            json!({
-                "architecture": "x86_64",
-                "size": 1,
-                "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                "runnable": true
-            }),
-        );
+    let value = valid_value();
     let parsed = parse_value(&value, "0.1.0-rc.1").expect("closed architecture values");
     assert_eq!(
         parsed
             .artifacts
             .iter()
-            .find(|artifact| artifact.name == "sbom.spdx.json")
-            .expect("SBOM")
+            .find(|artifact| artifact.name == "planeradarctl-aarch64-apple-darwin.tar.zst")
+            .expect("Apple Silicon control artifact")
             .architecture,
-        Architecture::Any
+        Architecture::Aarch64
     );
     assert_eq!(
         parsed
@@ -337,6 +353,10 @@ fn accepts_closed_cross_platform_artifact_architectures_but_requires_the_pi_app(
         (
             "/artifacts/planeradar-aarch64-linux-gnu.tar.zst/runnable",
             json!(false),
+        ),
+        (
+            "/artifacts/planeradarctl-x86_64-apple-darwin.tar.zst/platform",
+            json!("linux-gnu"),
         ),
     ] {
         let mut invalid = valid_value();
@@ -391,7 +411,7 @@ fn rejects_bad_digests_and_unbounded_sizes() {
         );
         assert!(parse_value(&value, "0.1.0-rc.1").is_err());
     }
-    for size in [0_u64, 4_294_967_297] {
+    for size in [0_u64, 134_217_729] {
         let mut value = valid_value();
         set_path(
             &mut value,
@@ -400,6 +420,17 @@ fn rejects_bad_digests_and_unbounded_sizes() {
         );
         assert!(parse_value(&value, "0.1.0-rc.1").is_err());
     }
+
+    let mut oversized_control = valid_value();
+    set_path(
+        &mut oversized_control,
+        "/artifacts/planeradarctl-aarch64-apple-darwin.tar.zst/size",
+        json!(16 * 1024 * 1024 + 1),
+    );
+    assert!(
+        parse_value(&oversized_control, "0.1.0-rc.1").is_err(),
+        "runtime parser must enforce the schema's narrow control-archive cap"
+    );
 }
 
 #[test]
@@ -459,14 +490,8 @@ fn schema_declares_the_same_closed_runtime_boundaries() {
         schema["properties"]["driver"]["properties"]["repository"]["const"],
         "https://github.com/shayne/hyperpixel2r-kms"
     );
-    assert_eq!(
-        schema["properties"]["driver"]["properties"]["commit"]["pattern"],
-        "^[0-9a-f]{40}$"
-    );
-    assert_eq!(
-        schema["properties"]["driver"]["properties"]["manifest_sha256"]["pattern"],
-        "^[0-9a-f]{64}$"
-    );
+    assert_eq!(schema["$defs"]["commit"]["pattern"], "^[0-9a-f]{40}$");
+    assert_eq!(schema["$defs"]["sha256"]["pattern"], "^[0-9a-f]{64}$");
     assert_eq!(schema["$defs"]["artifact"]["additionalProperties"], false);
     assert_eq!(
         schema["$defs"]["artifact"]["properties"]["size"]["minimum"],
@@ -474,20 +499,20 @@ fn schema_declares_the_same_closed_runtime_boundaries() {
     );
     assert_eq!(
         schema["$defs"]["artifact"]["properties"]["size"]["maximum"],
-        4_294_967_296_u64
+        134_217_728_u64
     );
-    assert_eq!(schema["properties"]["artifacts"]["maxProperties"], 64);
-    assert_eq!(
-        schema["properties"]["artifacts"]["propertyNames"]["maxLength"],
-        128
-    );
+    assert_eq!(schema["properties"]["artifacts"]["maxProperties"], 3);
     assert_eq!(
         schema["$defs"]["artifact"]["properties"]["architecture"]["enum"],
-        json!(["aarch64", "x86_64", "any"])
+        json!(["aarch64", "x86_64"])
     );
     assert_eq!(
         schema["properties"]["artifacts"]["required"],
-        json!(["planeradar-aarch64-linux-gnu.tar.zst"])
+        json!([
+            "planeradar-aarch64-linux-gnu.tar.zst",
+            "planeradarctl-aarch64-apple-darwin.tar.zst",
+            "planeradarctl-x86_64-apple-darwin.tar.zst"
+        ])
     );
     assert_eq!(
         schema["properties"]["artifacts"]["properties"]["planeradar-aarch64-linux-gnu.tar.zst"]["allOf"]
@@ -582,7 +607,14 @@ impl FakeSource {
         let source = Self::default();
         source.set("release-manifest.json", manifest);
         source.set("planeradar-aarch64-linux-gnu.tar.zst", APP_BYTES.to_vec());
-        source.set("sbom.spdx.json", SBOM_BYTES.to_vec());
+        source.set(
+            "planeradarctl-aarch64-apple-darwin.tar.zst",
+            CONTROL_ARM64_BYTES.to_vec(),
+        );
+        source.set(
+            "planeradarctl-x86_64-apple-darwin.tar.zst",
+            CONTROL_X86_64_BYTES.to_vec(),
+        );
         source
     }
 
@@ -640,7 +672,16 @@ fn write_local_release(directory: &Path, manifest: &[u8]) {
         APP_BYTES,
     )
     .expect("write app artifact");
-    fs::write(directory.join("sbom.spdx.json"), SBOM_BYTES).expect("write SBOM artifact");
+    fs::write(
+        directory.join("planeradarctl-aarch64-apple-darwin.tar.zst"),
+        CONTROL_ARM64_BYTES,
+    )
+    .expect("write arm64 control artifact");
+    fs::write(
+        directory.join("planeradarctl-x86_64-apple-darwin.tar.zst"),
+        CONTROL_X86_64_BYTES,
+    )
+    .expect("write x86_64 control artifact");
 }
 
 fn directory_snapshot(directory: &Path) -> Vec<(String, Vec<u8>, u32)> {
@@ -650,10 +691,11 @@ fn directory_snapshot(directory: &Path) -> Vec<(String, Vec<u8>, u32)> {
             let entry = entry.expect("directory entry");
             let name = entry.file_name().to_string_lossy().into_owned();
             let metadata = fs::symlink_metadata(entry.path()).expect("metadata");
-            let contents = metadata
-                .is_file()
-                .then(|| fs::read(entry.path()).expect("read source file"))
-                .unwrap_or_default();
+            let contents = if metadata.is_file() {
+                fs::read(entry.path()).expect("read source file")
+            } else {
+                Vec::new()
+            };
             (name, contents, metadata.permissions().mode() & 0o777)
         })
         .collect::<Vec<_>>();
@@ -678,7 +720,8 @@ fn resolves_a_valid_read_only_local_release_without_mutating_it() {
     for name in [
         "release-manifest.json",
         "planeradar-aarch64-linux-gnu.tar.zst",
-        "sbom.spdx.json",
+        "planeradarctl-aarch64-apple-darwin.tar.zst",
+        "planeradarctl-x86_64-apple-darwin.tar.zst",
     ] {
         fs::set_permissions(local.join(name), fs::Permissions::from_mode(0o444))
             .expect("make source read-only");
@@ -696,7 +739,7 @@ fn resolves_a_valid_read_only_local_release_without_mutating_it() {
         .expect("resolve local release");
 
     assert_eq!(resolved.manifest.version, requested("0.1.0-rc.1"));
-    assert_eq!(resolved.artifacts.len(), 2);
+    assert_eq!(resolved.artifacts.len(), 3);
     assert_eq!(directory_snapshot(&local), before);
     fs::set_permissions(&local, fs::Permissions::from_mode(0o700))
         .expect("restore cleanup permissions");
@@ -715,7 +758,8 @@ fn rejects_a_differing_read_only_local_file_without_source_mutation() {
     for name in [
         "release-manifest.json",
         "planeradar-aarch64-linux-gnu.tar.zst",
-        "sbom.spdx.json",
+        "planeradarctl-aarch64-apple-darwin.tar.zst",
+        "planeradarctl-x86_64-apple-darwin.tar.zst",
     ] {
         fs::set_permissions(local.join(name), fs::Permissions::from_mode(0o444))
             .expect("make source read-only");
@@ -852,7 +896,8 @@ fn cache_hits_are_revalidated_without_redownloading_artifacts() {
     let source = FakeSource::with_release(VALID_MANIFEST.as_bytes().to_vec());
     let first = resolve_downloaded(source.clone(), &cache).expect("first resolve");
     source.remove("planeradar-aarch64-linux-gnu.tar.zst");
-    source.remove("sbom.spdx.json");
+    source.remove("planeradarctl-aarch64-apple-darwin.tar.zst");
+    source.remove("planeradarctl-x86_64-apple-darwin.tar.zst");
 
     let second = resolve_downloaded(source.clone(), &cache).expect("cache hit");
 
@@ -861,7 +906,14 @@ fn cache_hits_are_revalidated_without_redownloading_artifacts() {
         source.request_count("planeradar-aarch64-linux-gnu.tar.zst"),
         1
     );
-    assert_eq!(source.request_count("sbom.spdx.json"), 1);
+    assert_eq!(
+        source.request_count("planeradarctl-aarch64-apple-darwin.tar.zst"),
+        1
+    );
+    assert_eq!(
+        source.request_count("planeradarctl-x86_64-apple-darwin.tar.zst"),
+        1
+    );
 }
 
 #[test]
@@ -1020,13 +1072,20 @@ fn production_release_source_builds_fixed_no_shell_gh_download_vectors() {
     let temporary = tempfile::tempdir().expect("temporary directory");
     let runner = RecordingStreamingRunner::default();
     let mut stable_manifest = valid_value();
-    set_path(&mut stable_manifest, "/version", json!("0.1.0"));
+    set_version(&mut stable_manifest, "0.1.0");
     runner.set(
         "release-manifest.json",
         serde_json::to_vec(&stable_manifest).expect("stable manifest"),
     );
     runner.set("planeradar-aarch64-linux-gnu.tar.zst", APP_BYTES.to_vec());
-    runner.set("sbom.spdx.json", SBOM_BYTES.to_vec());
+    runner.set(
+        "planeradarctl-aarch64-apple-darwin.tar.zst",
+        CONTROL_ARM64_BYTES.to_vec(),
+    );
+    runner.set(
+        "planeradarctl-x86_64-apple-darwin.tar.zst",
+        CONTROL_X86_64_BYTES.to_vec(),
+    );
     let source = GhReleaseSource::new(&runner);
 
     ReleaseClient::new(source, temporary.path().join("cache"))
@@ -1034,11 +1093,12 @@ fn production_release_source_builds_fixed_no_shell_gh_download_vectors() {
         .expect("resolve through gh source");
 
     let invocations = runner.invocations.lock().expect("invocations");
-    assert_eq!(invocations.len(), 3);
+    assert_eq!(invocations.len(), 4);
     for (index, name) in [
         "release-manifest.json",
         "planeradar-aarch64-linux-gnu.tar.zst",
-        "sbom.spdx.json",
+        "planeradarctl-aarch64-apple-darwin.tar.zst",
+        "planeradarctl-x86_64-apple-darwin.tar.zst",
     ]
     .iter()
     .enumerate()
@@ -1150,7 +1210,7 @@ impl CommandRunner for &MutatingCommandRunner {
 
 fn stable_resolved(root: &Path) -> ResolvedRelease {
     let mut value = valid_value();
-    set_path(&mut value, "/version", json!("0.1.0"));
+    set_version(&mut value, "0.1.0");
     let manifest = parse_value(&value, "0.1.0").expect("stable manifest");
     resolved_from_manifest(root, manifest)
 }
@@ -1168,7 +1228,8 @@ fn resolved_from_manifest(root: &Path, manifest: ReleaseManifest) -> ResolvedRel
                 let path = root.join(&artifact.name);
                 let bytes = match artifact.name.as_str() {
                     "planeradar-aarch64-linux-gnu.tar.zst" => APP_BYTES,
-                    "sbom.spdx.json" => SBOM_BYTES,
+                    "planeradarctl-aarch64-apple-darwin.tar.zst" => CONTROL_ARM64_BYTES,
+                    "planeradarctl-x86_64-apple-darwin.tar.zst" => CONTROL_X86_64_BYTES,
                     _ => panic!("unexpected test artifact"),
                 };
                 fs::write(&path, bytes).expect("resolved artifact");
@@ -1191,7 +1252,7 @@ fn stable_release_verification_uses_exact_gh_vectors_for_every_runnable_artifact
         .expect("stable verification");
 
     let invocations = runner.invocations.lock().expect("invocations");
-    assert_eq!(invocations.len(), 2);
+    assert_eq!(invocations.len(), 4);
     assert_eq!(invocations[0].program(), "gh");
     assert_eq!(
         invocations[0].arguments(),
@@ -1203,20 +1264,30 @@ fn stable_release_verification_uses_exact_gh_vectors_for_every_runnable_artifact
             "shayne/RPi-Plane-Radar"
         ]
     );
-    assert_eq!(invocations[1].program(), "gh");
-    assert_eq!(
-        invocations[1].os_arguments(),
-        [
-            "attestation".into(),
-            "verify".into(),
-            temporary
-                .path()
-                .join("planeradar-aarch64-linux-gnu.tar.zst")
-                .into_os_string(),
-            "-R".into(),
-            "shayne/RPi-Plane-Radar".into(),
-        ]
-    );
+    for (invocation, name) in invocations[1..].iter().zip([
+        "planeradar-aarch64-linux-gnu.tar.zst",
+        "planeradarctl-aarch64-apple-darwin.tar.zst",
+        "planeradarctl-x86_64-apple-darwin.tar.zst",
+    ]) {
+        assert_eq!(invocation.program(), "gh");
+        assert_eq!(
+            invocation.os_arguments(),
+            [
+                "attestation".into(),
+                "verify".into(),
+                temporary.path().join(name).into_os_string(),
+                "-R".into(),
+                "shayne/RPi-Plane-Radar".into(),
+                "--signer-workflow".into(),
+                "shayne/RPi-Plane-Radar/.github/workflows/release.yml".into(),
+                "--source-ref".into(),
+                "refs/heads/main".into(),
+                "--source-digest".into(),
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
+                "--deny-self-hosted-runners".into(),
+            ]
+        );
+    }
     assert!(invocations.iter().all(|invocation| {
         invocation.program() != "sh"
             && invocation.program() != "bash"
@@ -1266,29 +1337,25 @@ fn stable_verification_rejects_persistent_mutation_during_attestation() {
 }
 
 #[test]
-fn stable_verification_final_pass_rejects_non_runnable_mutation() {
+fn stable_verification_final_pass_rejects_later_runnable_mutation() {
     let temporary = tempfile::tempdir().expect("temporary directory");
     let release = stable_resolved(temporary.path());
-    let metadata = release
-        .artifacts
-        .iter()
-        .find(|artifact| !artifact.artifact.runnable)
-        .expect("non-runnable metadata");
-    let runner = MutatingCommandRunner::new(metadata.path.clone(), 2, b"sbom-datx");
+    let later = release.artifacts.last().expect("later runnable artifact");
+    let runner = MutatingCommandRunner::new(later.path.clone(), 2, b"control-x86_64-bix");
 
     assert!(
         Verifier::new(&runner)
             .verify(&requested("0.1.0"), &release)
             .is_err()
     );
-    assert_eq!(runner.invocations.lock().expect("invocations").len(), 2);
+    assert_eq!(runner.invocations.lock().expect("invocations").len(), 3);
 }
 
 #[test]
 fn stable_build_metadata_is_not_mistaken_for_a_prerelease() {
     let temporary = tempfile::tempdir().expect("temporary directory");
     let mut value = valid_value();
-    set_path(&mut value, "/version", json!("0.1.0+build.7"));
+    set_version(&mut value, "0.1.0+build.7");
     let manifest = parse_value(&value, "0.1.0+build.7").expect("build metadata manifest");
     let release = resolved_from_manifest(temporary.path(), manifest);
     let runner = RecordingCommandRunner::default();
@@ -1297,7 +1364,7 @@ fn stable_build_metadata_is_not_mistaken_for_a_prerelease() {
         .verify(&requested("0.1.0+build.7"), &release)
         .expect("stable build verification");
 
-    assert_eq!(runner.invocations.lock().expect("invocations").len(), 2);
+    assert_eq!(runner.invocations.lock().expect("invocations").len(), 4);
 }
 
 #[test]

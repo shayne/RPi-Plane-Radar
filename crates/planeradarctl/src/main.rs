@@ -1,14 +1,26 @@
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::io;
-use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+use std::io::{Read, Write};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
+use std::process::{Command as ProcessCommand, ExitCode, Stdio};
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 use std::{env, fs};
 
 use clap::Parser;
+use nix::{
+    errno::Errno,
+    sys::signal::{
+        SaFlags, SigAction, SigHandler, SigSet, SigmaskHow, Signal, killpg, pthread_sigmask, raise,
+        sigaction,
+    },
+    unistd::{Pid, geteuid, getpgid, getpgrp, getpid, getppid, setpgid, tcgetpgrp, tcsetpgrp},
+};
 use planeradarctl::{
     DriverLock,
     cli::{Cli, Command, DriverCommand},
@@ -45,9 +57,26 @@ use semver::Version;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
+const INTERNAL_BOOTSTRAP_ARG: &str = "--__planeradar-bootstrap-v1";
+const INTERNAL_RESTORE_TTY_ARG: &str = "--__planeradar-restore-tty-v1";
+const INTERNAL_BOOTSTRAP_MARKER: &str = "control-bootstrap.ready";
+const INTERNAL_MARKER_MAX_BYTES: u64 = 96;
+static TERMINAL_SIGNAL_PARENT: AtomicI32 = AtomicI32::new(0);
+
+extern "C" fn relay_terminal_signal(signal: libc::c_int) {
+    let parent = TERMINAL_SIGNAL_PARENT.load(Ordering::Relaxed);
+    if parent > 1 {
+        // SAFETY: kill is async-signal-safe, and both arguments are plain
+        // integers captured before the handler is installed.
+        unsafe {
+            libc::kill(parent, signal);
+        }
+    }
+}
+
 fn main() -> ExitCode {
     match run() {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(status) => status,
         Err(error) => {
             eprintln!("planeradarctl: {error}");
             ExitCode::FAILURE
@@ -55,46 +84,538 @@ fn main() -> ExitCode {
     }
 }
 
-fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let cli = Cli::parse();
+fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
+    let arguments = match bootstrap_action()? {
+        BootstrapAction::Execute { arguments } => arguments,
+        BootstrapAction::Supervise {
+            arguments,
+            bootstrap,
+        } => {
+            return Ok(ExitCode::from(supervise_internal_control(
+                arguments, bootstrap,
+            )?));
+        }
+        BootstrapAction::Restored => return Ok(ExitCode::SUCCESS),
+    };
+    let cli = Cli::parse_from(arguments);
     if let Command::Driver { command } = cli.command.clone() {
-        return run_driver(command);
+        run_driver(command)?;
+        return Ok(ExitCode::SUCCESS);
     }
     let environment = Environment::from_dotenv_path(Path::new(".env"))?;
     match cli.command.clone() {
         Command::Status(options) => {
-            return run_remote_operation(options.target, environment, RemoteOperation::Status);
+            run_remote_operation(options.target, environment, RemoteOperation::Status)?;
+            return Ok(ExitCode::SUCCESS);
         }
         Command::Doctor(options) => {
-            return run_remote_operation(
+            run_remote_operation(
                 options.target,
                 environment,
                 RemoteOperation::Doctor { json: options.json },
-            );
+            )?;
+            return Ok(ExitCode::SUCCESS);
         }
         Command::Screenshot(options) => {
-            return run_remote_operation(
+            run_remote_operation(
                 options.target,
                 environment,
                 RemoteOperation::Screenshot {
                     output: options.output,
                 },
-            );
+            )?;
+            return Ok(ExitCode::SUCCESS);
         }
         _ => {}
     }
     if cli.command.is_mutating() {
         let command = cli.command.clone();
         let config = InstallConfig::resolve(cli, environment)?;
-        return match command {
+        match command {
             Command::Install(_) => run_install(config),
             Command::Upgrade(_) => run_lifecycle_target(config, "upgrade"),
             Command::Rollback(_) => run_lifecycle_target(config, "rollback"),
             Command::Uninstall(_) => run_lifecycle_target(config, "uninstall"),
             _ => unreachable!("mutating command classification is exhaustive"),
-        };
+        }?;
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+enum BootstrapAction {
+    Execute {
+        arguments: Vec<OsString>,
+    },
+    Supervise {
+        arguments: Vec<OsString>,
+        bootstrap: InternalBootstrap,
+    },
+    Restored,
+}
+
+struct ForegroundTerminalGuard {
+    original_pgid: Pid,
+    control_pgid: Pid,
+    restored: bool,
+}
+
+impl ForegroundTerminalGuard {
+    fn restore(&mut self) -> io::Result<()> {
+        if self.restored {
+            return Ok(());
+        }
+        restore_terminal_foreground(self.original_pgid, self.control_pgid)?;
+        self.restored = true;
+        Ok(())
+    }
+}
+
+impl Drop for ForegroundTerminalGuard {
+    fn drop(&mut self) {
+        let _ = self.restore();
+    }
+}
+
+struct InternalBootstrap {
+    marker_file: fs::File,
+    terminal_guard: Option<ForegroundTerminalGuard>,
+}
+
+impl InternalBootstrap {
+    fn restore_terminal(&mut self) -> io::Result<()> {
+        self.terminal_guard
+            .as_mut()
+            .map(ForegroundTerminalGuard::restore)
+            .unwrap_or(Ok(()))
+    }
+}
+
+enum SavedTerminal {
+    None,
+    Foreground {
+        original_pgid: Pid,
+        control_pgid: Pid,
+    },
+}
+
+fn bootstrap_action() -> Result<BootstrapAction, Box<dyn std::error::Error>> {
+    let mut arguments = env::args_os().collect::<Vec<_>>();
+    match arguments.get(1).and_then(|value| value.to_str()) {
+        Some(INTERNAL_RESTORE_TTY_ARG) => {
+            block_sigttou_permanently()?;
+            if arguments.len() != 3 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "internal terminal restore marker is required",
+                )
+                .into());
+            }
+            restore_internal_terminal(Path::new(&arguments[2]))?;
+            Ok(BootstrapAction::Restored)
+        }
+        Some(INTERNAL_BOOTSTRAP_ARG) => {
+            if arguments.len() < 3 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "internal bootstrap marker is required",
+                )
+                .into());
+            }
+            let marker = PathBuf::from(arguments.remove(2));
+            arguments.remove(1);
+            let bootstrap = enter_internal_bootstrap(&marker)?;
+            Ok(BootstrapAction::Supervise {
+                arguments,
+                bootstrap,
+            })
+        }
+        _ => Ok(BootstrapAction::Execute { arguments }),
+    }
+}
+
+fn supervise_internal_control(
+    arguments: Vec<OsString>,
+    mut bootstrap: InternalBootstrap,
+) -> io::Result<u8> {
+    let executable = env::current_exe()?;
+    let worker_status = match ProcessCommand::new(executable)
+        .args(arguments.iter().skip(1))
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .and_then(|mut worker| worker.wait())
+    {
+        Ok(status) => worker_exit_code(status),
+        Err(error) => {
+            eprintln!("planeradarctl: internal control worker failed: {error}");
+            1
+        }
+    };
+
+    bootstrap.restore_terminal()?;
+    writeln!(bootstrap.marker_file, "complete {worker_status}")?;
+    bootstrap.marker_file.sync_all()?;
+    killpg(getpgrp(), Signal::SIGSTOP).map_err(|error| {
+        io::Error::other(format!(
+            "internal supervisor process-group stop failed: {error}"
+        ))
+    })?;
+    Ok(worker_status)
+}
+
+fn worker_exit_code(status: std::process::ExitStatus) -> u8 {
+    if let Some(code) = status.code() {
+        u8::try_from(code).unwrap_or(1)
+    } else if let Some(signal) = status.signal() {
+        u8::try_from(128_i32.saturating_add(signal)).unwrap_or(1)
+    } else {
+        1
+    }
+}
+
+fn validate_internal_marker(marker: &Path, require_empty: bool) -> io::Result<fs::File> {
+    if !marker.is_absolute()
+        || marker.file_name().and_then(|name| name.to_str()) != Some(INTERNAL_BOOTSTRAP_MARKER)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "internal bootstrap marker path is invalid",
+        ));
+    }
+
+    let executable = env::current_exe()?;
+    let executable_parent = executable.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "internal bootstrap executable has no parent",
+        )
+    })?;
+    let marker_parent = marker.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "internal bootstrap marker has no parent",
+        )
+    })?;
+    if fs::canonicalize(executable_parent)? != fs::canonicalize(marker_parent)? {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "internal bootstrap marker is outside the executable directory",
+        ));
+    }
+
+    let expected_uid = geteuid().as_raw();
+    let parent_metadata = fs::symlink_metadata(executable_parent)?;
+    if !parent_metadata.is_dir()
+        || parent_metadata.uid() != expected_uid
+        || parent_metadata.mode() & 0o7777 != 0o700
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "internal bootstrap executable directory is not private",
+        ));
+    }
+
+    let marker_metadata = fs::symlink_metadata(marker)?;
+    if !marker_metadata.is_file()
+        || marker_metadata.uid() != expected_uid
+        || marker_metadata.mode() & 0o7777 != 0o600
+        || (require_empty && marker_metadata.len() != 0)
+        || (!require_empty
+            && (marker_metadata.len() == 0 || marker_metadata.len() > INTERNAL_MARKER_MAX_BYTES))
+        || marker_metadata.nlink() != 1
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "internal bootstrap marker is not a new private regular file",
+        ));
+    }
+    let marker_file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(marker)?;
+    let opened_metadata = marker_file.metadata()?;
+    if opened_metadata.dev() != marker_metadata.dev()
+        || opened_metadata.ino() != marker_metadata.ino()
+        || !opened_metadata.is_file()
+        || opened_metadata.uid() != expected_uid
+        || opened_metadata.mode() & 0o7777 != 0o600
+        || opened_metadata.len() != marker_metadata.len()
+        || opened_metadata.nlink() != 1
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "internal bootstrap marker identity changed",
+        ));
+    }
+
+    Ok(marker_file)
+}
+
+fn inherited_foreground_terminal() -> io::Result<Option<Pid>> {
+    let foreground = match tcgetpgrp(io::stdin()) {
+        Ok(pgid) => pgid,
+        Err(Errno::ENOTTY) => return Ok(None),
+        Err(error) => {
+            return Err(io::Error::other(format!(
+                "internal bootstrap terminal inspection failed: {error}"
+            )));
+        }
+    };
+    let parent_pgid = getpgid(Some(getppid())).map_err(|error| {
+        io::Error::other(format!(
+            "internal bootstrap parent process-group inspection failed: {error}"
+        ))
+    })?;
+    if foreground != parent_pgid || getpgrp() != parent_pgid {
+        block_sigttou_permanently()?;
+        return Err(io::Error::other(
+            "internal bootstrap installer is not the terminal foreground process group",
+        ));
+    }
+    Ok(Some(foreground))
+}
+
+fn with_sigttou_blocked<T>(operation: impl FnOnce() -> io::Result<T>) -> io::Result<T> {
+    let mut blocked = SigSet::empty();
+    blocked.add(Signal::SIGTTOU);
+    let mut previous = SigSet::empty();
+    pthread_sigmask(SigmaskHow::SIG_BLOCK, Some(&blocked), Some(&mut previous))
+        .map_err(|error| io::Error::other(format!("could not block SIGTTOU: {error}")))?;
+    let result = operation();
+    let restored = pthread_sigmask(SigmaskHow::SIG_SETMASK, Some(&previous), None)
+        .map_err(|error| io::Error::other(format!("could not restore signal mask: {error}")));
+    match (result, restored) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+    }
+}
+
+fn block_sigttou_permanently() -> io::Result<()> {
+    let mut blocked = SigSet::empty();
+    blocked.add(Signal::SIGTTOU);
+    pthread_sigmask(SigmaskHow::SIG_BLOCK, Some(&blocked), None)
+        .map_err(|error| io::Error::other(format!("could not block SIGTTOU: {error}")))
+}
+
+fn install_terminal_signal_relay(parent: Pid) -> io::Result<()> {
+    TERMINAL_SIGNAL_PARENT.store(parent.as_raw(), Ordering::Relaxed);
+    let action = SigAction::new(
+        SigHandler::Handler(relay_terminal_signal),
+        SaFlags::SA_RESTART,
+        SigSet::empty(),
+    );
+    for signal in [Signal::SIGHUP, Signal::SIGINT, Signal::SIGTERM] {
+        // SAFETY: the handler has C ABI, performs only an async-signal-safe
+        // kill, and remains valid for the lifetime of this process.
+        unsafe { sigaction(signal, &action) }.map_err(|error| {
+            io::Error::other(format!(
+                "internal bootstrap terminal signal relay failed: {error}"
+            ))
+        })?;
     }
     Ok(())
+}
+
+fn hand_off_terminal_foreground(
+    original_pgid: Pid,
+    control_pgid: Pid,
+) -> io::Result<ForegroundTerminalGuard> {
+    with_sigttou_blocked(|| {
+        let foreground = tcgetpgrp(io::stdin()).map_err(|error| {
+            io::Error::other(format!(
+                "internal bootstrap terminal handoff inspection failed: {error}"
+            ))
+        })?;
+        if foreground != original_pgid {
+            return Err(io::Error::other(
+                "internal bootstrap terminal foreground changed before handoff",
+            ));
+        }
+        tcsetpgrp(io::stdin(), control_pgid).map_err(|error| {
+            io::Error::other(format!(
+                "internal bootstrap terminal foreground handoff failed: {error}"
+            ))
+        })?;
+        if tcgetpgrp(io::stdin()).map_err(|error| {
+            io::Error::other(format!(
+                "internal bootstrap terminal handoff verification failed: {error}"
+            ))
+        })? != control_pgid
+        {
+            return Err(io::Error::other(
+                "internal bootstrap terminal foreground handoff was not retained",
+            ));
+        }
+        Ok(ForegroundTerminalGuard {
+            original_pgid,
+            control_pgid,
+            restored: false,
+        })
+    })
+}
+
+fn restore_terminal_foreground(original_pgid: Pid, control_pgid: Pid) -> io::Result<()> {
+    with_sigttou_blocked(|| {
+        let foreground = tcgetpgrp(io::stdin()).map_err(|error| {
+            io::Error::other(format!(
+                "internal terminal restore inspection failed: {error}"
+            ))
+        })?;
+        if foreground == original_pgid {
+            return Ok(());
+        }
+        if foreground != control_pgid {
+            return Err(io::Error::other(
+                "internal terminal restore refused an unrelated foreground process group",
+            ));
+        }
+        tcsetpgrp(io::stdin(), original_pgid).map_err(|error| {
+            io::Error::other(format!(
+                "internal terminal foreground restore failed: {error}"
+            ))
+        })?;
+        if tcgetpgrp(io::stdin()).map_err(|error| {
+            io::Error::other(format!(
+                "internal terminal restore verification failed: {error}"
+            ))
+        })? != original_pgid
+        {
+            return Err(io::Error::other(
+                "internal terminal foreground restore was not retained",
+            ));
+        }
+        Ok(())
+    })
+}
+
+fn parse_saved_terminal(contents: &str) -> io::Result<SavedTerminal> {
+    let mut lines = contents.split_inclusive('\n');
+    let readiness = lines.next().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "internal terminal marker is empty",
+        )
+    })?;
+    if let Some(completion) = lines.next() {
+        let completion = completion
+            .strip_prefix("complete ")
+            .and_then(|value| value.strip_suffix('\n'))
+            .and_then(|value| value.parse::<u16>().ok())
+            .filter(|status| *status <= u8::MAX.into());
+        if completion.is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "internal terminal completion marker is malformed",
+            ));
+        }
+    }
+    if lines.next().is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "internal terminal marker has unexpected records",
+        ));
+    }
+    if readiness == "ready none\n" {
+        return Ok(SavedTerminal::None);
+    }
+    let line = readiness.strip_suffix('\n').ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "internal terminal marker is not newline terminated",
+        )
+    })?;
+    let fields = line.split(' ').collect::<Vec<_>>();
+    if fields.len() != 4 || fields[0] != "ready" || fields[1] != "tty" {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "internal terminal marker is malformed",
+        ));
+    }
+    let parse_pgid = |value: &str| {
+        value
+            .parse::<i32>()
+            .ok()
+            .filter(|pgid| *pgid > 0)
+            .map(Pid::from_raw)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "internal terminal marker process group is malformed",
+                )
+            })
+    };
+    Ok(SavedTerminal::Foreground {
+        original_pgid: parse_pgid(fields[2])?,
+        control_pgid: parse_pgid(fields[3])?,
+    })
+}
+
+fn restore_internal_terminal(marker: &Path) -> io::Result<()> {
+    let mut marker_file = validate_internal_marker(marker, false)?;
+    let mut contents = String::new();
+    Read::by_ref(&mut marker_file)
+        .take(INTERNAL_MARKER_MAX_BYTES + 1)
+        .read_to_string(&mut contents)?;
+    if contents.len() as u64 != marker_file.metadata()?.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "internal terminal marker length changed",
+        ));
+    }
+    match parse_saved_terminal(&contents)? {
+        SavedTerminal::None => Ok(()),
+        SavedTerminal::Foreground {
+            original_pgid,
+            control_pgid,
+        } => {
+            let parent_pgid = getpgid(Some(getppid())).map_err(|error| {
+                io::Error::other(format!(
+                    "internal terminal restore parent inspection failed: {error}"
+                ))
+            })?;
+            if parent_pgid != original_pgid || getpgrp() != original_pgid {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "internal terminal restore parent process group is invalid",
+                ));
+            }
+            restore_terminal_foreground(original_pgid, control_pgid)
+        }
+    }
+}
+
+fn enter_internal_bootstrap(marker: &Path) -> io::Result<InternalBootstrap> {
+    let mut marker_file = validate_internal_marker(marker, true)?;
+    let inherited_terminal = inherited_foreground_terminal()?;
+    let pid = getpid();
+    setpgid(Pid::from_raw(0), Pid::from_raw(0))
+        .map_err(|error| io::Error::other(format!("internal bootstrap setpgid failed: {error}")))?;
+    if getpgrp() != pid {
+        return Err(io::Error::other(
+            "internal bootstrap process group identity is invalid",
+        ));
+    }
+    if inherited_terminal.is_some() {
+        install_terminal_signal_relay(getppid())?;
+    }
+    let marker_contents = inherited_terminal.map_or_else(
+        || "ready none\n".to_owned(),
+        |original_pgid| format!("ready tty {} {}\n", original_pgid.as_raw(), pid.as_raw()),
+    );
+    marker_file.write_all(marker_contents.as_bytes())?;
+    marker_file.sync_all()?;
+    raise(Signal::SIGSTOP)
+        .map_err(|error| io::Error::other(format!("internal bootstrap stop failed: {error}")))?;
+    let terminal_guard = inherited_terminal
+        .map(|original_pgid| hand_off_terminal_foreground(original_pgid, pid))
+        .transpose()?;
+    Ok(InternalBootstrap {
+        marker_file,
+        terminal_guard,
+    })
 }
 
 fn run_lifecycle_target(
@@ -150,6 +671,9 @@ fn run_lifecycle_target(
     Ok(())
 }
 
+#[cfg(test)]
+type DriverProtocolActions = std::rc::Rc<RefCell<Vec<(DriverAction, Option<String>)>>>;
+
 struct SystemLifecycleBackend<R = SystemCommandRunner, C = SystemClock> {
     transport: OpenSshTransport<R, C>,
     target: RefCell<SshTarget>,
@@ -167,8 +691,7 @@ struct SystemLifecycleBackend<R = SystemCommandRunner, C = SystemClock> {
     protocol_tool: RefCell<Option<DriverTool<SystemCommandRunner>>>,
     retained_driver_transition: Cell<bool>,
     #[cfg(test)]
-    driver_protocol_actions:
-        RefCell<Option<std::rc::Rc<RefCell<Vec<(DriverAction, Option<String>)>>>>>,
+    driver_protocol_actions: RefCell<Option<DriverProtocolActions>>,
 }
 
 impl<R: TransportCommandRunner, C: Clock> SystemLifecycleBackend<R, C> {
@@ -2498,6 +3021,7 @@ mod tests {
     use std::collections::{BTreeMap, VecDeque};
     use std::fs;
     use std::path::{Path, PathBuf};
+    use std::process::Command as SystemCommand;
     use std::rc::Rc;
 
     use planeradarctl::config::DriverLock;
@@ -2514,14 +3038,38 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     use super::{
-        BackendFailure, InstallCandidateState, InstallPhase, InstallState, SystemLifecycleBackend,
-        TargetIdentity, TransportError, committed_driver_command, deploy_helper_command,
-        final_reboot_command, finalize_lifecycle_uninstall_command, hostname_command,
-        preserve_lifecycle_helper_command, private_state_read_command, resume_state_matches,
-        retire_lifecycle_helper_command, select_candidate_index, staged_driver_transaction_command,
-        target_install_command, target_install_ownership_command, tryboot_reboot_command,
-        tryboot_wait_failure,
+        BackendFailure, DriverProtocolActions, InstallCandidateState, InstallPhase, InstallState,
+        SystemLifecycleBackend, TargetIdentity, TransportError, committed_driver_command,
+        deploy_helper_command, final_reboot_command, finalize_lifecycle_uninstall_command,
+        hostname_command, preserve_lifecycle_helper_command, private_state_read_command,
+        resume_state_matches, retire_lifecycle_helper_command, select_candidate_index,
+        staged_driver_transaction_command, target_install_command,
+        target_install_ownership_command, tryboot_reboot_command, tryboot_wait_failure,
+        worker_exit_code,
     };
+
+    #[test]
+    fn native_supervisor_maps_worker_exit_and_signal_statuses() {
+        let exited = SystemCommand::new("/bin/sh")
+            .args(["-c", "exit 37"])
+            .status()
+            .expect("run exiting worker");
+        assert_eq!(worker_exit_code(exited), 37);
+
+        let mut signaled = SystemCommand::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .expect("run signaled worker");
+        // SAFETY: the child PID is live and retained until the following wait.
+        assert_eq!(
+            unsafe { libc::kill(signaled.id() as libc::pid_t, libc::SIGTERM) },
+            0
+        );
+        assert_eq!(
+            worker_exit_code(signaled.wait().expect("wait for signaled worker")),
+            143
+        );
+    }
 
     #[derive(Default)]
     struct RecordingLifecycleRunner {
@@ -2591,9 +3139,7 @@ mod tests {
         root: &Path,
         verified_payloads: BTreeMap<String, (ReleasePair, ApplicationPayload)>,
         management_helper: Option<ManagementHelper>,
-        driver_protocol_actions: Option<
-            Rc<RefCell<Vec<(planeradarctl::driver::DriverAction, Option<String>)>>>,
-        >,
+        driver_protocol_actions: Option<DriverProtocolActions>,
     ) -> SystemLifecycleBackend<&'a ScriptedLifecycleRunner> {
         SystemLifecycleBackend {
             transport: OpenSshTransport::with_runner(

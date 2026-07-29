@@ -771,7 +771,9 @@ fn first_install_persists_the_exact_owned_files_returned_by_the_target() {
     );
 }
 
-fn application_archive(members: &[(&str, &[u8], u32, u64, u64, u64, tar::EntryType)]) -> Vec<u8> {
+type ApplicationArchiveMember<'a> = (&'a str, &'a [u8], u32, u64, u64, u64, tar::EntryType);
+
+fn application_archive(members: &[ApplicationArchiveMember<'_>]) -> Vec<u8> {
     let mut tar_bytes = Vec::new();
     {
         let encoder = zstd::stream::write::Encoder::new(&mut tar_bytes, 3).expect("zstd encoder");

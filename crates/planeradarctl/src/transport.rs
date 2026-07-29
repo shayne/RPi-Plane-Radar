@@ -47,6 +47,13 @@ const TRANSIENT_SSH_FAILURE_MARKERS: [&[u8]; 9] = [
     b"could not resolve hostname",
 ];
 
+#[derive(Clone, Copy)]
+struct ProbeDeadline {
+    deadline: Duration,
+    configured_timeout: Duration,
+    timeout_error: TransportError,
+}
+
 /// Injectable elapsed-time boundary for reboot polling. Test implementations
 /// advance deterministic time without waiting.
 pub trait Clock {
@@ -1043,15 +1050,17 @@ impl<R, C> OpenSshTransport<R, C> {
         script: &str,
         known_hosts: &Path,
         host_key: &HostKey,
-        deadline: Duration,
-        configured_timeout: Duration,
-        timeout_error: TransportError,
+        timing: ProbeDeadline,
     ) -> Result<String, TransportError>
     where
         R: CommandRunner,
         C: Clock,
     {
-        let timeout = self.attempt_timeout(deadline, configured_timeout, timeout_error)?;
+        let timeout = self.attempt_timeout(
+            timing.deadline,
+            timing.configured_timeout,
+            timing.timeout_error,
+        )?;
         let mut arguments = self.noninteractive_arguments_for(
             known_hosts,
             timeout.as_secs(),
@@ -1062,8 +1071,8 @@ impl<R, C> OpenSshTransport<R, C> {
         let output = self.run_until_deadline(
             Invocation::new("ssh", arguments),
             timeout,
-            deadline,
-            timeout_error,
+            timing.deadline,
+            timing.timeout_error,
         )?;
         if !output.succeeded() {
             return Err(classify_probe_failure(&output));
@@ -1182,18 +1191,22 @@ impl<R, C> OpenSshTransport<R, C> {
             "tr -d '\\0' < /proc/device-tree/model",
             known_hosts,
             &host_key,
-            deadline,
-            configured_timeout,
-            timeout_error,
+            ProbeDeadline {
+                deadline,
+                configured_timeout,
+                timeout_error,
+            },
         )?;
         let serial = self.fixed_probe_with_known_hosts_until_deadline(
             target,
             "awk -F ': ' '/^Serial/{print $2; exit}' /proc/cpuinfo",
             known_hosts,
             &host_key,
-            deadline,
-            configured_timeout,
-            timeout_error,
+            ProbeDeadline {
+                deadline,
+                configured_timeout,
+                timeout_error,
+            },
         )?;
         validate_probe_identity(&host_key.fingerprint, &model, &serial)?;
         Ok(TargetProbe {

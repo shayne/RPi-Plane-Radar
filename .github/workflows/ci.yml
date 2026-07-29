@@ -1,32 +1,67 @@
-name: Rust CI
+name: Verify Plane Radar
 
 on:
   push:
+    branches: [main]
   pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   verify:
+    name: Rust, release, installer, and Linux ARM64
     runs-on: ubuntu-24.04-arm
     steps:
-      - name: Checkout
-        uses: actions/checkout@v6
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
 
       - name: Set up mise
-        uses: jdx/mise-action@v4
-
-      - name: Install Rust components
-        run: rustup component add clippy rustfmt
+        uses: jdx/mise-action@9e7f7633ff6f6d6048a9418a68d48f288f50eb14 # v4.2.3
 
       - name: Install native dependencies
-        run: sudo apt-get update && sudo apt-get install -y libsdl2-dev pkg-config
-
-      - name: Test HyperPixel protocol
-        run: mise run test-driver-protocol
-
-      - name: Verify
-        run: mise run verify
-
-      - name: Build Raspberry Pi binary
         run: |
-          PLANERADAR_SOURCE_REF=HEAD mise run build-pi
-          file dist/planeradar
+          sudo apt-get update
+          sudo apt-get install --yes libsdl2-dev pkg-config zstd
+          rustup component add clippy rustfmt
+
+      - name: Verify source, release schema, driver lock, installer fixtures, and README commands
+        run: |
+          mise run verify
+          mise exec -- cargo test --test release_contract
+          mise exec -- cargo test -p planeradarctl --test release
+          mise exec -- cargo test -p planeradarctl --test install
+          mise run readme-commands
+
+      - name: Build Linux ARM64 release in pinned Trixie container
+        run: |
+          PLANERADAR_SOURCE_REF="$GITHUB_SHA" mise run build-pi
+          file dist/planeradar | grep 'ELF 64-bit LSB.*ARM aarch64'
+
+  control:
+    name: Native control build and tests (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            arch: arm64
+          - runner: macos-15-intel
+            arch: x86_64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up mise
+        uses: jdx/mise-action@9e7f7633ff6f6d6048a9418a68d48f288f50eb14 # v4.2.3
+
+      - name: Build and test native control tool
+        run: |
+          mise exec -- cargo test --locked -p planeradarctl
+          PLANERADAR_REVISION="$GITHUB_SHA" mise exec -- cargo build --locked --release -p planeradarctl
+          file target/release/planeradarctl | grep 'Mach-O 64-bit'
+          test "$(lipo -archs target/release/planeradarctl)" = '${{ matrix.arch }}'

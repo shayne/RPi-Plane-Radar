@@ -449,7 +449,10 @@ fn status_is_concise_on_success_and_typed_on_failure() {
     let client = OperationsClient::new(&backend, FakeClock::default());
     assert_eq!(
         client.status().expect("healthy status").to_string(),
-        "Plane Radar healthy: app 0.1.0@111111111111, driver 0.1.0-rc.16@e5953b27463c, 480x480 opengles2"
+        format!(
+            "Plane Radar healthy: app 0.1.0@111111111111, driver 0.1.0-rc.16@{}, 480x480 opengles2",
+            &DRIVER_REVISION[..12]
+        )
     );
 
     let mut facts = healthy_facts();

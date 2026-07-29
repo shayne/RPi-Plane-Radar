@@ -674,11 +674,11 @@ fn first_upgrade_resolves_the_rc_candidate_before_migrating_or_attesting_task14(
     );
     assert_eq!(
         backend.prepared_helpers.borrow().as_slice(),
-        &[rc_candidate.clone()]
+        std::slice::from_ref(&rc_candidate)
     );
     assert_eq!(
         backend.staged_pairs.borrow().as_slice(),
-        &[rc_candidate.clone()]
+        std::slice::from_ref(&rc_candidate)
     );
     assert_eq!(backend.state.borrow().accepted()[0].pair, rc_candidate);
 }

@@ -1,0 +1,236 @@
+name: Publish Plane Radar release candidate
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Unused semantic release tag, for example v0.1.0-rc.1
+        required: true
+        type: string
+      source_ref:
+        description: Exact source branch, tag, or commit to release
+        default: main
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  resolve:
+    runs-on: ubuntu-24.04
+    outputs:
+      commit: ${{ steps.source.outputs.commit }}
+    steps:
+      - name: Check out selected source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.source_ref }}
+          fetch-depth: 0
+
+      - name: Resolve and validate the exact source once
+        id: source
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          git diff --quiet
+          git diff --cached --quiet
+          git fetch --no-tags origin "$GITHUB_SHA"
+          git cat-file -e "$GITHUB_SHA:.github/workflows/release.yml"
+          source_commit="$(git rev-parse 'HEAD^{commit}')"
+          test "$source_commit" = "$GITHUB_SHA"
+          git cat-file -e "$source_commit:.github/workflows/release.yml"
+          version="${TAG#v}"
+          test "$TAG" = "v$version"
+          [[ "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-([0-9A-Za-z-]+)(\.[0-9A-Za-z-]+)*)?(\+([0-9A-Za-z-]+)(\.[0-9A-Za-z-]+)*)?$ ]]
+          package_version="$(sed -n '/^\[package\]$/,/^\[/s/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)"
+          test "${version%%-*}" = "$package_version"
+          git fetch --tags --force
+          ! git rev-parse --verify --quiet "refs/tags/$TAG"
+          printf 'commit=%s\n' "$source_commit" >>"$GITHUB_OUTPUT"
+
+  linux:
+    needs: resolve
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: Check out exact source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.resolve.outputs.commit }}
+
+      - name: Set up mise
+        uses: jdx/mise-action@9e7f7633ff6f6d6048a9418a68d48f288f50eb14 # v4.2.3
+
+      - name: Build and verify exact Linux ARM64 application
+        env:
+          RELEASE_COMMIT: ${{ needs.resolve.outputs.commit }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$RELEASE_COMMIT"
+          PLANERADAR_SOURCE_REF="$RELEASE_COMMIT" mise run build-pi
+          file dist/planeradar | grep 'ELF 64-bit LSB.*ARM aarch64'
+          test "$(cat dist/planeradar.revision)" = "$RELEASE_COMMIT"
+
+      - name: Upload immutable Linux input
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: linux-aarch64
+          path: |
+            dist/planeradar
+            dist/planeradar.readelf.txt
+            dist/planeradar.revision
+            dist/planeradar.tree
+            dist/planeradar.sha256
+          if-no-files-found: error
+          retention-days: 1
+
+  control:
+    needs: resolve
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            arch: arm64
+          - runner: macos-15-intel
+            arch: x86_64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Check out exact source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.resolve.outputs.commit }}
+
+      - name: Set up mise
+        uses: jdx/mise-action@9e7f7633ff6f6d6048a9418a68d48f288f50eb14 # v4.2.3
+
+      - name: Test and build exact native control tool
+        env:
+          RELEASE_COMMIT: ${{ needs.resolve.outputs.commit }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$RELEASE_COMMIT"
+          mise exec -- cargo test --locked -p planeradarctl
+          PLANERADAR_REVISION="$RELEASE_COMMIT" mise exec -- cargo build --locked --release -p planeradarctl
+          test "$(lipo -archs target/release/planeradarctl)" = '${{ matrix.arch }}'
+
+      - name: Upload immutable native control input
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: control-${{ matrix.arch }}
+          path: target/release/planeradarctl
+          if-no-files-found: error
+          retention-days: 1
+
+  verify-release:
+    needs: [resolve, linux, control]
+    runs-on: macos-15
+    steps:
+      - name: Check out exact source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.resolve.outputs.commit }}
+          fetch-depth: 0
+
+      - name: Set up mise
+        uses: jdx/mise-action@9e7f7633ff6f6d6048a9418a68d48f288f50eb14 # v4.2.3
+
+      - name: Download exact build inputs
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: dist/inputs
+
+      - name: Verify complete release twice
+        env:
+          RELEASE_COMMIT: ${{ needs.resolve.outputs.commit }}
+          VERSION: ${{ inputs.tag }}
+          PLANERADAR_PACKAGE_SKIP_BUILDS: "1"
+          PLANERADAR_WORKFLOW_REF: ${{ github.ref }}
+          PLANERADAR_WORKFLOW_COMMIT: ${{ github.sha }}
+          PLANERADAR_APP_BINARY: dist/inputs/linux-aarch64/planeradar
+          PLANERADAR_CTL_ARM64_BINARY: dist/inputs/control-arm64/planeradarctl
+          PLANERADAR_CTL_X86_64_BINARY: dist/inputs/control-x86_64/planeradarctl
+        run: |
+          test "$(git rev-parse HEAD)" = "$RELEASE_COMMIT"
+          chmod +x "$PLANERADAR_APP_BINARY" "$PLANERADAR_CTL_ARM64_BINARY" "$PLANERADAR_CTL_X86_64_BINARY"
+          cp dist/inputs/linux-aarch64/planeradar.* dist/
+          mise run package-release -- "${VERSION#v}"
+          cp -R dist/release "$RUNNER_TEMP/release-one"
+          mise run package-release -- "${VERSION#v}"
+          diff -r "$RUNNER_TEMP/release-one" dist/release
+          (cd dist/release && shasum -a 256 -c SHA256SUMS)
+          PLANERADAR_RELEASE_FIXTURE_DIR="$PWD/dist/release" mise exec -- cargo test --test release_contract
+
+      - name: Upload verified exact release
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: verified-release
+          path: dist/release/*
+          if-no-files-found: error
+          retention-days: 1
+
+  release:
+    needs: [resolve, verify-release]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Check out exact verified source without running it
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.resolve.outputs.commit }}
+          fetch-depth: 0
+
+      - name: Download verified release
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: verified-release
+          path: dist/release
+
+      - name: Verify complete release
+        env:
+          RELEASE_COMMIT: ${{ needs.resolve.outputs.commit }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$RELEASE_COMMIT"
+          test "$(find dist/release -maxdepth 1 -type f | wc -l)" = 7
+          (cd dist/release && sha256sum -c SHA256SUMS)
+          ./scripts/validate-release-metadata.sh \
+            dist/release/release-manifest.json \
+            dist/release/SBOM.spdx.json
+          test "$(jq -r .source_commit dist/release/release-manifest.json)" = "$RELEASE_COMMIT"
+
+      - name: Create annotated tag
+        id: tag
+        env:
+          TAG: ${{ inputs.tag }}
+          RELEASE_COMMIT: ${{ needs.resolve.outputs.commit }}
+        run: |
+          git fetch --tags --force
+          ! git rev-parse --verify --quiet "refs/tags/$TAG"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag --annotate "$TAG" "$RELEASE_COMMIT" --message "RPi Plane Radar $TAG"
+          git push origin "refs/tags/$TAG:refs/tags/$TAG"
+          test "$(git rev-parse "$TAG^{}")" = "$RELEASE_COMMIT"
+
+      - name: Attest release subjects
+        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
+        with:
+          subject-checksums: dist/release/SHA256SUMS
+
+      - name: Attest SPDX SBOM for every runnable archive
+        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
+        with:
+          subject-path: dist/release/*.tar.zst
+          sbom-path: dist/release/SBOM.spdx.json
+
+      - name: Create draft prerelease
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
+        with:
+          tag_name: ${{ inputs.tag }}
+          target_commitish: ${{ needs.resolve.outputs.commit }}
+          name: RPi Plane Radar ${{ inputs.tag }}
+          draft: true
+          prerelease: true
+          fail_on_unmatched_files: true
+          files: dist/release/*

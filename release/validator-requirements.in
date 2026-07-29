@@ -1,0 +1,9 @@
+# Direct release-metadata validator requirements.  Run
+# ./scripts/lock-release-validators.sh to regenerate the complete hash lock.
+check-jsonschema==0.37.4
+spdx-tools==0.8.3
+# `referencing` 0.36 and later use the Python 3.13-only TypeVar default
+# argument.
+# Keep the lock usable by the explicit Python 3.12 Linux CI and Python 3.13
+# macOS validation hosts.
+referencing<0.36

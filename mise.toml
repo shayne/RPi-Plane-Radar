@@ -5,6 +5,7 @@ CMAKE_POLICY_VERSION_MINIMUM = "3.5"
 CC = "/usr/bin/clang"
 CXX = "/usr/bin/clang++"
 CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER = "/usr/bin/clang"
+CARGO_TARGET_X86_64_APPLE_DARWIN_LINKER = "/usr/bin/clang"
 _.file = { path = ".env", redact = true }
 
 [tools]
@@ -17,16 +18,29 @@ cmake = "4.3.3"
 run = "cargo fmt --all --check"
 
 [tasks.lint]
-run = "cargo clippy --all-targets --all-features -- -D warnings"
+run = "cargo clippy --workspace --all-targets --all-features -- -D warnings"
 
 [tasks.test]
-run = "cargo nextest run --all-features"
+run = "cargo nextest run --workspace --all-features"
 
 [tasks.deny]
 run = "cargo deny check"
 
 [tasks.verify]
 depends = ["fmt", "lint", "test", "deny"]
+
+[tasks.package-release]
+run = './scripts/package-release.sh "$@"'
+
+[tasks.validate-release-metadata]
+run = './scripts/validate-release-metadata.sh "$@"'
+
+[tasks.readme-commands]
+run = '''
+set -euo pipefail
+test -f README.md
+grep -q 'mise install' README.md
+'''
 
 [tasks.install]
 run = 'cargo run --locked -p planeradarctl -- install "$@"'

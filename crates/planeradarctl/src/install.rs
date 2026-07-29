@@ -184,7 +184,6 @@ pub fn extract_application_payload(
     if entries.next().is_some() {
         return Err(ApplicationArchiveError::InvalidMember);
     }
-    drop(entries);
     let decoded_position = archive.into_inner().position() as usize;
     if expanded[decoded_position..].iter().any(|byte| *byte != 0) {
         return Err(ApplicationArchiveError::InvalidArchive);
