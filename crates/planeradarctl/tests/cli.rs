@@ -175,13 +175,13 @@ fn maintainer_driver_commands_parse_exact_sync_and_update_forms() {
         }
     ));
 
-    let update = Cli::try_parse_from(["planeradarctl", "driver", "update", "0.1.0-rc.15"])
+    let update = Cli::try_parse_from(["planeradarctl", "driver", "update", "0.1.0-rc.16"])
         .expect("driver update");
     assert!(matches!(
         update.command,
         Command::Driver {
             command: DriverCommand::Update { version }
-        } if version == "0.1.0-rc.15"
+        } if version == "0.1.0-rc.16"
     ));
 }
 
@@ -193,11 +193,11 @@ fn driver_lock_matches_the_next_release_candidate_gate() {
         lock.repository,
         "https://github.com/shayne/hyperpixel2r-kms"
     );
-    assert_eq!(lock.version.to_string(), "0.1.0-rc.15");
-    assert_eq!(lock.commit, "ab3f88c7f106df9fbfd70afa43bab1b24ca6dd8d");
+    assert_eq!(lock.version.to_string(), "0.1.0-rc.16");
+    assert_eq!(lock.commit, "e5953b27463cb531ecfd52b44deddf4e1301e2f5");
     assert_eq!(
         lock.manifest_sha256,
-        "77a6efdd0afdb8cffce7737b7244f9cc902aca4623769272cd5b9dcd485d85b0"
+        "bddbe2c305de56427568660548f715a23c15a8dcbfeb46a9d392c6cbcfd48f88"
     );
 }
 
@@ -243,11 +243,11 @@ fn driver_lock_rejects_invalid_or_ambiguous_identity_fields() {
         ),
         (
             "missing lifecycle protocol",
-            LOCK.replace("lifecycle_protocol = \"accepted-driver-v1\"\n", ""),
+            LOCK.replace("lifecycle_protocol = \"accepted-driver-v2\"\n", ""),
         ),
         (
             "wrong lifecycle protocol",
-            replace_current("accepted-driver-v1", "unsupported-driver-v1"),
+            replace_current("accepted-driver-v2", "unsupported-driver-v1"),
         ),
         ("unknown field", format!("{LOCK}unexpected = \"value\"\n")),
         (

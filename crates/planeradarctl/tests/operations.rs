@@ -21,8 +21,8 @@ use sha2::{Digest, Sha256};
 
 const APP_REVISION: &str = "1111111111111111111111111111111111111111";
 const APP_SHA256: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-const DRIVER_REVISION: &str = "ab3f88c7f106df9fbfd70afa43bab1b24ca6dd8d";
-const DRIVER_MANIFEST: &str = "77a6efdd0afdb8cffce7737b7244f9cc902aca4623769272cd5b9dcd485d85b0";
+const DRIVER_REVISION: &str = "e5953b27463cb531ecfd52b44deddf4e1301e2f5";
+const DRIVER_MANIFEST: &str = "bddbe2c305de56427568660548f715a23c15a8dcbfeb46a9d392c6cbcfd48f88";
 const MODULE_SHA256: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 const OVERLAY_SHA256: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
 const BOOT_CONFIG_SHA256: &str = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
@@ -51,9 +51,9 @@ fn healthy_facts() -> DiagnosticFacts {
         installed_application: artifact("0.1.0", APP_REVISION, APP_SHA256),
         expected_application: artifact("0.1.0", APP_REVISION, APP_SHA256),
         running_application_revision: APP_REVISION.into(),
-        installed_driver: artifact("0.1.0-rc.15", DRIVER_REVISION, DRIVER_MANIFEST),
+        installed_driver: artifact("0.1.0-rc.16", DRIVER_REVISION, DRIVER_MANIFEST),
         persisted_driver_manifest_sha256: DRIVER_MANIFEST.into(),
-        expected_driver: artifact("0.1.0-rc.15", DRIVER_REVISION, DRIVER_MANIFEST),
+        expected_driver: artifact("0.1.0-rc.16", DRIVER_REVISION, DRIVER_MANIFEST),
         running_kernel: KERNEL.into(),
         expected_kernel: KERNEL.into(),
         module_name: "hyperpixel2r_kms".into(),
@@ -449,7 +449,7 @@ fn status_is_concise_on_success_and_typed_on_failure() {
     let client = OperationsClient::new(&backend, FakeClock::default());
     assert_eq!(
         client.status().expect("healthy status").to_string(),
-        "Plane Radar healthy: app 0.1.0@111111111111, driver 0.1.0-rc.15@ab3f88c7f106, 480x480 opengles2"
+        "Plane Radar healthy: app 0.1.0@111111111111, driver 0.1.0-rc.16@e5953b27463c, 480x480 opengles2"
     );
 
     let mut facts = healthy_facts();
@@ -1051,7 +1051,7 @@ fn target_state_json() -> Vec<u8> {
 
 fn target_state_json_with_driver_manifest(driver_manifest: &str) -> Vec<u8> {
     format!(
-        r#"{{"schema_version":1,"hardware":{{"model":"Raspberry Pi Zero 2 W Rev 1.0","serial":"1000000012345678"}},"application":{{"version":"0.1.0","source_commit":"{APP_REVISION}","sha256":"{APP_SHA256}"}},"driver":{{"version":"0.1.0-rc.15","source_commit":"{DRIVER_REVISION}","sha256":"{driver_manifest}"}},"owned_files":[{{"target_path":"/opt/planeradar/bin/planeradar","sha256":"{APP_SHA256}"}}],"last_verified_phase":"complete"}}"#
+        r#"{{"schema_version":1,"hardware":{{"model":"Raspberry Pi Zero 2 W Rev 1.0","serial":"1000000012345678"}},"application":{{"version":"0.1.0","source_commit":"{APP_REVISION}","sha256":"{APP_SHA256}"}},"driver":{{"version":"0.1.0-rc.16","source_commit":"{DRIVER_REVISION}","sha256":"{driver_manifest}"}},"owned_files":[{{"target_path":"/opt/planeradar/bin/planeradar","sha256":"{APP_SHA256}"}}],"last_verified_phase":"complete"}}"#
     )
     .into_bytes()
 }
@@ -1064,7 +1064,7 @@ fn diagnostic_probe_json() -> Vec<u8> {
         ),
     );
     format!(
-        r#"{{"schema_version":1,"os_id":"raspbian","os_version":"13","architecture":"arm64","application_version":"0.1.0","application_revision":"{APP_REVISION}","application_sha256":"{APP_SHA256}","driver_version":"0.1.0-rc.15","driver_revision":"{DRIVER_REVISION}","driver_manifest_sha256":"{DRIVER_MANIFEST}","expected_kernel":"{KERNEL}","running_kernel":"{KERNEL}","module_loaded":true,"module_vermagic":"{VERMAGIC}","expected_module_vermagic":"{VERMAGIC}","module_sha256":"{MODULE_SHA256}","expected_module_sha256":"{MODULE_SHA256}","overlay_file":"hyperpixel2r-kms-ab3f88c7f106.dtbo","expected_overlay_file":"hyperpixel2r-kms-ab3f88c7f106.dtbo","overlay_sha256":"{OVERLAY_SHA256}","expected_overlay_sha256":"{OVERLAY_SHA256}","boot_config_sha256":"{BOOT_CONFIG_SHA256}","overlay_configured":true,"drm_device":"/dev/dri/card0","drm_mode":"480x480","renderer":"opengles2","touch_device":"HyperPixel 2.1 Round Touch","service_active":true,"service_restart_count":0,"health_base64":"{health}","hostname":"planeradar"}}"#
+        r#"{{"schema_version":1,"os_id":"raspbian","os_version":"13","architecture":"arm64","application_version":"0.1.0","application_revision":"{APP_REVISION}","application_sha256":"{APP_SHA256}","driver_version":"0.1.0-rc.16","driver_revision":"{DRIVER_REVISION}","driver_manifest_sha256":"{DRIVER_MANIFEST}","expected_kernel":"{KERNEL}","running_kernel":"{KERNEL}","module_loaded":true,"module_vermagic":"{VERMAGIC}","expected_module_vermagic":"{VERMAGIC}","module_sha256":"{MODULE_SHA256}","expected_module_sha256":"{MODULE_SHA256}","overlay_file":"hyperpixel2r-kms-e5953b27463c.dtbo","expected_overlay_file":"hyperpixel2r-kms-e5953b27463c.dtbo","overlay_sha256":"{OVERLAY_SHA256}","expected_overlay_sha256":"{OVERLAY_SHA256}","boot_config_sha256":"{BOOT_CONFIG_SHA256}","overlay_configured":true,"drm_device":"/dev/dri/card0","drm_mode":"480x480","renderer":"opengles2","touch_device":"HyperPixel 2.1 Round Touch","service_active":true,"service_restart_count":0,"health_base64":"{health}","hostname":"planeradar"}}"#
     )
     .into_bytes()
 }

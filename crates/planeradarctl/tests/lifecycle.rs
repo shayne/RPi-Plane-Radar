@@ -43,6 +43,7 @@ fn accepted(version: &str, app_seed: char, driver_seed: char, sequence: u64) -> 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Call {
     Resolve,
+    VerifyHistorical,
     StageApplication,
     StageDriver,
     TrybootDriver,
@@ -52,11 +53,14 @@ enum Call {
     ActivateApplication,
     RestartApplication,
     VerifyPair,
+    FinalizeDriverAcceptance,
     RestoreApplication,
     RestoreDriver,
+    RetireCandidate,
     PrepareUninstall,
     UninstallApplication,
     UninstallDriver,
+    FinalizeDriverUninstall,
     FinalizeUninstall,
 }
 
@@ -69,7 +73,11 @@ struct FakeBackend {
     fail_save: Cell<Option<u32>>,
     save_count: Cell<u32>,
     requested: RefCell<Vec<Option<Version>>>,
+    historical_expected: RefCell<Vec<ReleasePair>>,
+    legacy_migration_expected: RefCell<Option<ReleasePair>>,
+    staged_pairs: RefCell<Vec<ReleasePair>>,
     uninstall_drivers: RefCell<Vec<ArtifactIdentity>>,
+    retired_candidates: RefCell<Vec<Vec<OwnedFile>>>,
 }
 
 impl FakeBackend {
@@ -95,7 +103,11 @@ impl FakeBackend {
             fail_save: Cell::new(None),
             save_count: Cell::new(0),
             requested: RefCell::new(Vec::new()),
+            historical_expected: RefCell::new(Vec::new()),
+            legacy_migration_expected: RefCell::new(None),
+            staged_pairs: RefCell::new(Vec::new()),
             uninstall_drivers: RefCell::new(Vec::new()),
+            retired_candidates: RefCell::new(Vec::new()),
         }
     }
 
@@ -111,6 +123,9 @@ impl FakeBackend {
 
 impl LifecycleBackend for FakeBackend {
     fn load_lifecycle_state(&self) -> Result<LifecycleState, LifecycleError> {
+        if let Some(expected) = self.legacy_migration_expected.borrow_mut().take() {
+            self.verify_historical_release(&expected)?;
+        }
         Ok(self.state.borrow().clone())
     }
 
@@ -130,7 +145,13 @@ impl LifecycleBackend for FakeBackend {
         Ok(self.release.borrow().clone())
     }
 
-    fn stage_application(&self, _pair: &ReleasePair) -> Result<(), LifecycleError> {
+    fn verify_historical_release(&self, expected: &ReleasePair) -> Result<(), LifecycleError> {
+        self.historical_expected.borrow_mut().push(expected.clone());
+        self.call(Call::VerifyHistorical)
+    }
+
+    fn stage_application(&self, pair: &ReleasePair) -> Result<(), LifecycleError> {
+        self.staged_pairs.borrow_mut().push(pair.clone());
         self.call(Call::StageApplication)
     }
 
@@ -167,12 +188,24 @@ impl LifecycleBackend for FakeBackend {
         self.call(Call::VerifyPair)
     }
 
-    fn restore_application(&self, _prior: &AcceptedPair) -> Result<(), LifecycleError> {
-        self.call(Call::RestoreApplication)
+    fn finalize_driver_acceptance(&self, _pair: &ReleasePair) -> Result<(), LifecycleError> {
+        self.call(Call::FinalizeDriverAcceptance)
+    }
+
+    fn restore_application(&self, _prior: &AcceptedPair) -> Result<Vec<OwnedFile>, LifecycleError> {
+        self.call(Call::RestoreApplication)?;
+        Ok(self.owned.borrow().clone())
     }
 
     fn restore_driver(&self, _prior: &AcceptedPair) -> Result<(), LifecycleError> {
         self.call(Call::RestoreDriver)
+    }
+
+    fn retire_candidate(&self, owned_files: &[OwnedFile]) -> Result<(), LifecycleError> {
+        self.retired_candidates
+            .borrow_mut()
+            .push(owned_files.to_vec());
+        self.call(Call::RetireCandidate)
     }
 
     fn prepare_uninstall(&self, accepted: &AcceptedPair) -> Result<OwnedFile, LifecycleError> {
@@ -197,6 +230,10 @@ impl LifecycleBackend for FakeBackend {
     fn uninstall_driver(&self, drivers: &[ArtifactIdentity]) -> Result<(), LifecycleError> {
         *self.uninstall_drivers.borrow_mut() = drivers.to_vec();
         self.call(Call::UninstallDriver)
+    }
+
+    fn finalize_driver_uninstall(&self) -> Result<(), LifecycleError> {
+        self.call(Call::FinalizeDriverUninstall)
     }
 
     fn finalize_uninstall(&self, state: &LifecycleState) -> Result<(), LifecycleError> {
@@ -284,23 +321,39 @@ fn every_application_failure_restores_and_proves_the_prior_pair() {
         backend.fail.set(Some(failure));
 
         assert!(LifecycleManager::new(&backend).upgrade(None).is_err());
-        assert_eq!(
-            backend
-                .calls
-                .borrow()
-                .iter()
-                .rev()
-                .take(3)
-                .copied()
-                .collect::<Vec<_>>(),
-            [
-                Call::VerifyPair,
-                Call::RestartApplication,
-                Call::RestoreApplication
-            ],
-            "{failure:?}"
-        );
-        assert_eq!(backend.state.borrow().accepted(), &[current]);
+        let calls = backend.calls.borrow();
+        let restore = calls
+            .iter()
+            .position(|call| *call == Call::RestoreApplication)
+            .expect("application restored");
+        assert_eq!(calls[restore], Call::RestoreApplication);
+        assert_eq!(calls[restore + 1], Call::RestartApplication);
+        if failure == Call::ActivateApplication {
+            assert_eq!(
+                &calls[restore..],
+                [
+                    Call::RestoreApplication,
+                    Call::RestartApplication,
+                    Call::VerifyPair,
+                    Call::RetireCandidate,
+                ],
+            );
+            assert_eq!(backend.state.borrow().accepted()[0].pair, current.pair);
+            assert_eq!(
+                backend.state.borrow().accepted()[0].owned_files,
+                backend.owned.borrow().clone()
+            );
+        } else {
+            assert!(
+                backend
+                    .state
+                    .borrow()
+                    .to_json()
+                    .expect("resumable recovery")
+                    .contains("\"transaction\":{"),
+                "{failure:?}"
+            );
+        }
     }
 }
 
@@ -326,6 +379,7 @@ fn driver_change_uses_exact_tryboot_commit_normal_boot_sequence() {
             Call::ActivateApplication,
             Call::RestartApplication,
             Call::VerifyPair,
+            Call::FinalizeDriverAcceptance,
         ]
     );
 }
@@ -344,8 +398,13 @@ fn driver_change_failure_restores_the_last_exact_application_and_driver_pair() {
         Call::RestoreApplication,
         Call::RestartApplication,
         Call::VerifyPair,
+        Call::RetireCandidate,
     ]));
-    assert_eq!(backend.state.borrow().accepted(), &[current]);
+    assert_eq!(backend.state.borrow().accepted()[0].pair, current.pair);
+    assert_eq!(
+        backend.state.borrow().accepted()[0].owned_files,
+        backend.owned.borrow().clone()
+    );
 }
 
 #[test]
@@ -373,12 +432,13 @@ fn rollback_chooses_newest_prior_or_an_explicit_accepted_version() {
             model: "Raspberry Pi Zero 2 W".into(),
             serial: "10000000abcdef01".into(),
         },
-        history,
+        history.clone(),
     )
     .unwrap();
     *backend.release.borrow_mut() = pair("1.0.0", '1', 'a');
     backend.calls.borrow_mut().clear();
     backend.requested.borrow_mut().clear();
+    backend.historical_expected.borrow_mut().clear();
     LifecycleManager::new(&backend)
         .rollback(Some(&Version::parse("1.0.0").unwrap()))
         .expect("explicit rollback");
@@ -389,10 +449,13 @@ fn rollback_chooses_newest_prior_or_an_explicit_accepted_version() {
             .version,
         "1.0.0"
     );
-    assert_eq!(backend.calls.borrow().first(), Some(&Call::Resolve));
     assert_eq!(
-        backend.requested.borrow().as_slice(),
-        [Some(Version::parse("1.0.0").unwrap())]
+        backend.calls.borrow().first(),
+        Some(&Call::VerifyHistorical)
+    );
+    assert_eq!(
+        backend.historical_expected.borrow().as_slice(),
+        &[history[2].pair.clone()]
     );
 }
 
@@ -437,10 +500,44 @@ fn a_task14_complete_state_migrates_deterministically_without_losing_owned_hashe
 
     let migrated = LifecycleState::migrate_task14(&task14).expect("migration");
 
-    assert_eq!(migrated.schema_version(), 2);
+    assert_eq!(migrated.schema_version(), 3);
     assert_eq!(migrated.accepted().len(), 1);
     assert_eq!(migrated.accepted()[0].sequence, 1);
     assert_eq!(migrated.accepted()[0].owned_files, task14.owned_files);
+}
+
+#[test]
+fn first_upgrade_migrates_and_attests_the_task14_pair_before_resolving_the_rc_candidate() {
+    let task14_pair = pair("1.0.0", '1', 'a');
+    let rc_candidate = pair("2.0.0", '2', 'b');
+    let prior = AcceptedPair {
+        pair: task14_pair.clone(),
+        sequence: 1,
+        owned_files: vec![OwnedFile {
+            target_path: APP_PATH.into(),
+            sha256: task14_pair.application.sha256.clone(),
+        }],
+    };
+    let backend = FakeBackend::installed(vec![prior], rc_candidate.clone());
+    *backend.legacy_migration_expected.borrow_mut() = Some(task14_pair.clone());
+
+    LifecycleManager::new(&backend)
+        .upgrade(None)
+        .expect("first post-Task-14 upgrade");
+
+    assert_eq!(
+        &backend.calls.borrow()[..2],
+        [Call::VerifyHistorical, Call::Resolve]
+    );
+    assert_eq!(
+        backend.historical_expected.borrow().as_slice(),
+        &[task14_pair]
+    );
+    assert_eq!(
+        backend.staged_pairs.borrow().as_slice(),
+        &[rc_candidate.clone()]
+    );
+    assert_eq!(backend.state.borrow().accepted()[0].pair, rc_candidate);
 }
 
 #[test]
@@ -460,6 +557,7 @@ fn uninstall_uses_recorded_ownership_then_driver_and_is_idempotent() {
             Call::PrepareUninstall,
             Call::UninstallApplication,
             Call::UninstallDriver,
+            Call::FinalizeDriverUninstall,
             Call::FinalizeUninstall,
         ]
     );
@@ -574,6 +672,9 @@ fn purge_settings_is_passed_only_when_explicitly_requested() {
         ) -> Result<ReleasePair, LifecycleError> {
             self.inner.resolve_release(requested)
         }
+        fn verify_historical_release(&self, expected: &ReleasePair) -> Result<(), LifecycleError> {
+            self.inner.verify_historical_release(expected)
+        }
         fn stage_application(&self, pair: &ReleasePair) -> Result<(), LifecycleError> {
             self.inner.stage_application(pair)
         }
@@ -604,11 +705,20 @@ fn purge_settings_is_passed_only_when_explicitly_requested() {
         fn verify_pair(&self, pair: &ReleasePair) -> Result<(), LifecycleError> {
             self.inner.verify_pair(pair)
         }
-        fn restore_application(&self, prior: &AcceptedPair) -> Result<(), LifecycleError> {
+        fn finalize_driver_acceptance(&self, pair: &ReleasePair) -> Result<(), LifecycleError> {
+            self.inner.finalize_driver_acceptance(pair)
+        }
+        fn restore_application(
+            &self,
+            prior: &AcceptedPair,
+        ) -> Result<Vec<OwnedFile>, LifecycleError> {
             self.inner.restore_application(prior)
         }
         fn restore_driver(&self, prior: &AcceptedPair) -> Result<(), LifecycleError> {
             self.inner.restore_driver(prior)
+        }
+        fn retire_candidate(&self, owned_files: &[OwnedFile]) -> Result<(), LifecycleError> {
+            self.inner.retire_candidate(owned_files)
         }
 
         fn prepare_uninstall(&self, accepted: &AcceptedPair) -> Result<OwnedFile, LifecycleError> {
@@ -625,6 +735,9 @@ fn purge_settings_is_passed_only_when_explicitly_requested() {
         }
         fn uninstall_driver(&self, drivers: &[ArtifactIdentity]) -> Result<(), LifecycleError> {
             self.inner.uninstall_driver(drivers)
+        }
+        fn finalize_driver_uninstall(&self) -> Result<(), LifecycleError> {
+            self.inner.finalize_driver_uninstall()
         }
         fn finalize_uninstall(&self, state: &LifecycleState) -> Result<(), LifecycleError> {
             self.inner.finalize_uninstall(state)
@@ -718,13 +831,14 @@ fn every_persisted_mutation_boundary_recovers_the_prior_pair_before_retrying() {
             .expect("recover then retry");
 
         assert_eq!(
-            &backend.calls.borrow()[..5],
+            &backend.calls.borrow()[..6],
             [
-                Call::Resolve,
                 Call::RestoreDriver,
                 Call::RestoreApplication,
                 Call::RestartApplication,
                 Call::VerifyPair,
+                Call::RetireCandidate,
+                Call::Resolve,
             ],
             "{phase}"
         );
@@ -761,5 +875,163 @@ fn explicit_rollback_rejects_a_verified_release_that_does_not_match_accepted_ide
         LifecycleManager::new(&backend).rollback(Some(&Version::parse("1.0.0").unwrap())),
         Err(LifecycleError::ImmutableReleaseMismatch)
     );
-    assert_eq!(backend.calls.borrow().as_slice(), [Call::Resolve]);
+    assert_eq!(backend.calls.borrow().as_slice(), []);
+}
+
+#[test]
+fn explicit_old_driver_rollback_verifies_the_exact_historical_pair_without_current_lock_resolution()
+{
+    let current = accepted("2.0.0", '2', 'b', 2);
+    let historical = accepted("1.0.0", '1', 'a', 1);
+    let backend =
+        FakeBackend::installed(vec![current, historical.clone()], pair("9.9.9", '9', 'f'));
+
+    LifecycleManager::new(&backend)
+        .rollback(Some(&Version::parse("1.0.0").unwrap()))
+        .expect("verified old-driver rollback");
+
+    assert_eq!(
+        backend.historical_expected.borrow().as_slice(),
+        &[historical.pair]
+    );
+    assert!(!backend.calls.borrow().contains(&Call::Resolve));
+}
+
+#[test]
+fn app_acceptance_save_failure_restores_prior_and_retires_exact_candidate_assets() {
+    let prior = accepted("1.0.0", '1', 'a', 1);
+    let candidate = pair("2.0.0", '2', 'b');
+    let backend = FakeBackend::installed(vec![prior.clone()], candidate.clone());
+    backend.fail_save.set(Some(9));
+
+    assert_eq!(
+        LifecycleManager::new(&backend).upgrade(None),
+        Err(LifecycleError::Backend)
+    );
+    assert!(
+        !backend
+            .calls
+            .borrow()
+            .contains(&Call::FinalizeDriverAcceptance)
+    );
+    assert!(backend.calls.borrow().contains(&Call::RestoreDriver));
+    assert_eq!(backend.state.borrow().accepted()[0].pair, prior.pair);
+    assert_eq!(
+        backend.retired_candidates.borrow().last().unwrap(),
+        &vec![
+            OwnedFile {
+                target_path: format!(
+                    "/opt/planeradar/releases/{}/{}/planeradar",
+                    candidate.application.version, candidate.application.sha256
+                ),
+                sha256: candidate.application.sha256.clone(),
+            },
+            OwnedFile {
+                target_path: format!(
+                    "/var/lib/planeradar-installer/helpers/{}/planeradar",
+                    candidate.application.sha256
+                ),
+                sha256: candidate.application.sha256,
+            },
+        ]
+    );
+}
+
+#[test]
+fn crash_after_durable_app_acceptance_finalizes_candidate_instead_of_rolling_back() {
+    let prior = accepted("1.0.0", '1', 'a', 1);
+    let candidate_pair = pair("2.0.0", '2', 'b');
+    let candidate = AcceptedPair {
+        pair: candidate_pair.clone(),
+        sequence: 2,
+        owned_files: vec![OwnedFile {
+            target_path: APP_PATH.into(),
+            sha256: "2".repeat(64),
+        }],
+    };
+    let release_path = format!(
+        "/opt/planeradar/releases/{}/{}/planeradar",
+        candidate_pair.application.version, candidate_pair.application.sha256
+    );
+    let helper_path = format!(
+        "/var/lib/planeradar-installer/helpers/{}/planeradar",
+        candidate_pair.application.sha256
+    );
+    let state = LifecycleState::from_json(
+        serde_json::to_vec(&serde_json::json!({
+            "schema_version": 3,
+            "hardware": {
+                "model": "Raspberry Pi Zero 2 W",
+                "serial": "10000000abcdef01"
+            },
+            "accepted": [candidate, prior.clone()],
+            "transaction": {
+                "prior": prior,
+                "candidate": candidate_pair.clone(),
+                "candidate_owned_files": [
+                    {
+                        "target_path": release_path,
+                        "sha256": candidate_pair.application.sha256
+                    },
+                    {
+                        "target_path": helper_path,
+                        "sha256": candidate_pair.application.sha256
+                    }
+                ],
+                "restored_owned_files": null,
+                "phase": "pair_accepted"
+            },
+            "uninstall": null
+        }))
+        .unwrap()
+        .as_slice(),
+    )
+    .expect("durable pair acceptance");
+    let backend = FakeBackend::installed(Vec::new(), candidate_pair);
+    *backend.state.borrow_mut() = state;
+
+    LifecycleManager::new(&backend)
+        .upgrade(None)
+        .expect("resume accepted candidate");
+
+    assert_eq!(
+        backend.calls.borrow().first(),
+        Some(&Call::FinalizeDriverAcceptance)
+    );
+    assert!(!backend.calls.borrow().contains(&Call::RestoreDriver));
+}
+
+#[test]
+fn repeated_failed_candidates_are_exactly_retired_and_never_expand_accepted_history() {
+    let prior = accepted("1.0.0", '1', 'a', 1);
+    let backend = FakeBackend::installed(vec![prior.clone()], pair("2.0.0", '2', 'a'));
+    backend.fail.set(Some(Call::ActivateApplication));
+
+    for (version, seed) in [
+        ("2.0.0", '2'),
+        ("3.0.0", '3'),
+        ("4.0.0", '4'),
+        ("5.0.0", '5'),
+        ("6.0.0", '6'),
+    ] {
+        *backend.release.borrow_mut() = pair(version, seed, 'a');
+        assert_eq!(
+            LifecycleManager::new(&backend).upgrade(None),
+            Err(LifecycleError::Backend)
+        );
+    }
+
+    assert_eq!(backend.state.borrow().accepted().len(), 1);
+    assert_eq!(backend.state.borrow().accepted()[0].pair, prior.pair);
+    let retired = backend.retired_candidates.borrow();
+    assert_eq!(retired.len(), 5);
+    assert!(retired.iter().all(|candidate| {
+        candidate.len() == 2
+            && candidate[0]
+                .target_path
+                .starts_with("/opt/planeradar/releases/")
+            && candidate[1]
+                .target_path
+                .starts_with("/var/lib/planeradar-installer/helpers/")
+    }));
 }

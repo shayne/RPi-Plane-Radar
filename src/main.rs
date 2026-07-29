@@ -18,8 +18,9 @@ use planeradar::install::{
     commit_display_config, ensure_overlay, installer_ownership_json,
     parse_application_ownership_json, read_installer_state_json, read_lifecycle_state_json,
     read_optional_installer_state_json, read_optional_lifecycle_state_json,
-    rollback_display_config, stage_tryboot_config, stage_tryboot_config_if_source_matches,
-    uninstall_owned_installation, write_installer_state_json, write_lifecycle_state_json,
+    retire_application_artifacts, rollback_display_config, stage_tryboot_config,
+    stage_tryboot_config_if_source_matches, uninstall_owned_installation,
+    write_installer_state_json, write_lifecycle_state_json,
 };
 use planeradar::logging;
 use planeradar::render::FontAsset;
@@ -192,6 +193,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 &SystemCommandRunner,
             )?;
             println!("uninstalled");
+        }
+        Command::LifecycleRetire { owned_json } => {
+            let owned = parse_application_ownership_json(owned_json.as_bytes())?;
+            retire_application_artifacts(std::path::Path::new("/"), &owned)?;
+            println!("retired");
         }
         Command::InstallerOwnership => {
             println!("{}", installer_ownership_json(std::path::Path::new("/"))?);

@@ -98,6 +98,11 @@ pub enum Command {
         purge_settings: bool,
     },
     #[command(hide = true)]
+    LifecycleRetire {
+        #[arg(long, value_name = "JSON")]
+        owned_json: String,
+    },
+    #[command(hide = true)]
     InstallerOwnership,
     #[command(hide = true)]
     CaptureMetadata,

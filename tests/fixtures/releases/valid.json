@@ -9,9 +9,9 @@
   },
   "driver": {
     "repository": "https://github.com/shayne/hyperpixel2r-kms",
-    "version": "0.1.0-rc.15",
-    "commit": "ab3f88c7f106df9fbfd70afa43bab1b24ca6dd8d",
-    "manifest_sha256": "77a6efdd0afdb8cffce7737b7244f9cc902aca4623769272cd5b9dcd485d85b0"
+    "version": "0.1.0-rc.16",
+    "commit": "e5953b27463cb531ecfd52b44deddf4e1301e2f5",
+    "manifest_sha256": "bddbe2c305de56427568660548f715a23c15a8dcbfeb46a9d392c6cbcfd48f88"
   },
   "artifacts": {
     "planeradar-aarch64-linux-gnu.tar.zst": {

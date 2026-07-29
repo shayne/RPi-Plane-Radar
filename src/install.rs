@@ -23,7 +23,9 @@ const INSTALL_CHECKSUM: &str = "opt/planeradar/SHA256";
 const INSTALL_SERVICE: &str = "etc/systemd/system/planeradar.service";
 const INSTALL_STATE: &str = "var/lib/planeradar";
 const INSTALL_SETTINGS: &str = "var/lib/planeradar/settings.json";
+const INSTALL_SETTINGS_MARKER: &str = "var/lib/planeradar-installer/settings-owned-v1";
 const LIFECYCLE_STATE: &str = "var/lib/planeradar-installer/lifecycle.json";
+const SETTINGS_MARKER: &[u8] = b"schema_version=1\npath=/var/lib/planeradar/settings.json\n";
 const DEFAULT_SETTINGS: &[u8] = b"{\n  \"schema_version\": 1,\n  \"location\": null,\n  \"units\": \"km\",\n  \"show_runways\": true,\n  \"range_index\": 1\n}\n";
 const MAX_ACCEPTED_APPLICATION_RELEASES: usize = 3;
 const RUNTIME_PACKAGES: &[&str] = &[
@@ -514,6 +516,10 @@ struct LifecycleReleasePair {
 struct LifecycleTransactionDocument {
     prior: LifecycleAcceptedPair,
     candidate: LifecycleReleasePair,
+    #[serde(default)]
+    candidate_owned_files: Vec<InstalledFile>,
+    #[serde(default)]
+    restored_owned_files: Option<Vec<InstalledFile>>,
     phase: LifecyclePhaseDocument,
 }
 
@@ -528,6 +534,10 @@ enum LifecyclePhaseDocument {
     NormalBootVerified,
     ApplicationActivated,
     ApplicationRestarted,
+    PairAccepted,
+    RecoveryDriverRestored,
+    RecoveryApplicationRestored,
+    RecoveryCandidateRetired,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -710,16 +720,35 @@ fn parse_lifecycle_state(contents: &[u8]) -> Result<LifecycleStateDocument, Inst
                     .iter()
                     .all(|prior| prior.sequence > accepted.sequence && prior.pair != accepted.pair)
         });
-    if state.schema_version == 1 && state.uninstall.is_none() {
-        state.schema_version = 2;
+    if matches!(state.schema_version, 1 | 2) {
+        state.schema_version = 3;
+        if let Some(transaction) = state.transaction.as_mut()
+            && transaction.candidate_owned_files.is_empty()
+        {
+            transaction.candidate_owned_files =
+                installer_candidate_owned_files(&transaction.candidate);
+        }
     }
     let transaction_valid = state.transaction.as_ref().is_none_or(|transaction| {
         valid_installer_artifact(&transaction.candidate.application)
             && valid_installer_artifact(&transaction.candidate.driver)
-            && state
-                .accepted
-                .first()
-                .is_some_and(|current| current == &transaction.prior)
+            && transaction.candidate_owned_files
+                == installer_candidate_owned_files(&transaction.candidate)
+            && transaction
+                .restored_owned_files
+                .as_ref()
+                .is_none_or(|files| validate_application_ownership(files).is_ok())
+            && if transaction.phase == LifecyclePhaseDocument::PairAccepted {
+                state.accepted.first().is_some_and(|current| {
+                    current.pair == transaction.candidate
+                        && state.accepted.contains(&transaction.prior)
+                })
+            } else {
+                state
+                    .accepted
+                    .first()
+                    .is_some_and(|current| current == &transaction.prior)
+            }
     });
     let uninstall_valid = state.uninstall.as_ref().is_none_or(|uninstall| {
         state.transaction.is_none()
@@ -737,7 +766,7 @@ fn parse_lifecycle_state(contents: &[u8]) -> Result<LifecycleStateDocument, Inst
                     uninstall.accepted.pair.application.sha256
                 )
     });
-    if state.schema_version != 2
+    if state.schema_version != 3
         || !valid_installer_hardware(&state.hardware)
         || !accepted_valid
         || !transaction_valid
@@ -746,6 +775,25 @@ fn parse_lifecycle_state(contents: &[u8]) -> Result<LifecycleStateDocument, Inst
         return Err(InstallError::InvalidInstallerState);
     }
     Ok(state)
+}
+
+fn installer_candidate_owned_files(candidate: &LifecycleReleasePair) -> Vec<InstalledFile> {
+    vec![
+        InstalledFile {
+            target_path: format!(
+                "/opt/planeradar/releases/{}/{}/planeradar",
+                candidate.application.version, candidate.application.sha256
+            ),
+            sha256: candidate.application.sha256.clone(),
+        },
+        InstalledFile {
+            target_path: format!(
+                "/var/lib/planeradar-installer/helpers/{}/planeradar",
+                candidate.application.sha256
+            ),
+            sha256: candidate.application.sha256.clone(),
+        },
+    ]
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -789,7 +837,7 @@ struct MachineInstallOwnership {
 }
 
 pub fn installer_ownership_json(root: &Path) -> Result<String, InstallError> {
-    let owned_files = [
+    let mut owned_files = [
         INSTALL_BINARY,
         INSTALL_REVISION,
         INSTALL_CHECKSUM,
@@ -808,6 +856,24 @@ pub fn installer_ownership_json(root: &Path) -> Result<String, InstallError> {
         })
     })
     .collect::<Result<Vec<_>, InstallError>>()?;
+    let marker = install_path(root, INSTALL_SETTINGS_MARKER);
+    match fs::symlink_metadata(&marker) {
+        Ok(_) => {
+            verify_settings_marker(root)?;
+            let settings = install_path(root, INSTALL_SETTINGS);
+            require_settings_regular(&settings)?;
+            owned_files.push(InstalledFile {
+                target_path: format!("/{INSTALL_SETTINGS}"),
+                sha256: format!("{:x}", Sha256::digest(fs::read(settings)?)),
+            });
+            owned_files.push(InstalledFile {
+                target_path: format!("/{INSTALL_SETTINGS_MARKER}"),
+                sha256: settings_marker_sha256(),
+            });
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
     serde_json::to_string(&MachineInstallOwnership {
         schema_version: 1,
         owned_files,
@@ -976,16 +1042,25 @@ pub fn uninstall_owned_installation(
 ) -> Result<(), InstallError> {
     let root = canonical_installation_root(root)?;
     if purge_settings
-        && !owned_files
+        && (!owned_files
             .iter()
             .any(|file| file.target_path == "/var/lib/planeradar/settings.json")
+            || !owned_files
+                .iter()
+                .any(|file| file.target_path == "/var/lib/planeradar-installer/settings-owned-v1"))
     {
         return Err(InstallError::SettingsNotOwned);
     }
     verify_owned_manifest(&root, owned_files, purge_settings)?;
     commands.run("systemctl", &["disable", "--now", "planeradar.service"])?;
     for file in owned_files {
-        if !purge_settings && file.target_path == "/var/lib/planeradar/settings.json" {
+        if !purge_settings
+            && matches!(
+                file.target_path.as_str(),
+                "/var/lib/planeradar/settings.json"
+                    | "/var/lib/planeradar-installer/settings-owned-v1"
+            )
+        {
             continue;
         }
         let path = owned_target_path(&root, &file.target_path)?;
@@ -1002,6 +1077,67 @@ pub fn uninstall_owned_installation(
     }
     commands.run("systemctl", &["daemon-reload"])?;
     Ok(())
+}
+
+pub fn retire_application_artifacts(
+    root: &Path,
+    owned_files: &[InstalledFile],
+) -> Result<(), InstallError> {
+    let root = canonical_installation_root(root)?;
+    if owned_files.is_empty()
+        || owned_files.len() > 2
+        || owned_files.iter().any(|file| {
+            !candidate_release_path(&file.target_path, &file.sha256)
+                && !candidate_helper_path(&file.target_path, &file.sha256)
+        })
+    {
+        return Err(InstallError::InvalidOwnershipManifest);
+    }
+    for file in owned_files {
+        let path = owned_target_path(&root, &file.target_path)?;
+        match fs::symlink_metadata(&path) {
+            Ok(_) => {
+                require_single_link_regular(&path, Some(&root))?;
+                if format!("{:x}", Sha256::digest(fs::read(&path)?)) != file.sha256 {
+                    return Err(InstallError::OwnedPathDrift(path));
+                }
+                fs::remove_file(&path)?;
+                if let Some(parent) = path.parent() {
+                    File::open(parent)?.sync_all()?;
+                    let _ = fs::remove_dir(parent);
+                    if let Some(grandparent) = parent.parent() {
+                        let _ = fs::remove_dir(grandparent);
+                    }
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
+fn candidate_release_path(path: &str, digest: &str) -> bool {
+    let Some(release) = path.strip_prefix("/opt/planeradar/releases/") else {
+        return false;
+    };
+    let mut components = release.split('/');
+    let (Some(version), Some(path_digest), Some("planeradar"), None) = (
+        components.next(),
+        components.next(),
+        components.next(),
+        components.next(),
+    ) else {
+        return false;
+    };
+    semver::Version::parse(version).is_ok_and(|parsed| parsed.to_string() == version)
+        && path_digest == digest
+        && is_lower_hex(digest, 64)
+}
+
+fn candidate_helper_path(path: &str, digest: &str) -> bool {
+    path == format!("/var/lib/planeradar-installer/helpers/{digest}/planeradar")
+        && is_lower_hex(digest, 64)
 }
 
 fn canonical_installation_root(root: &Path) -> Result<PathBuf, InstallError> {
@@ -1115,10 +1251,33 @@ fn interrupted_candidate_digest(
 fn verify_owned_manifest(
     root: &Path,
     owned_files: &[InstalledFile],
-    verify_settings_content: bool,
+    _verify_settings_content: bool,
 ) -> Result<(), InstallError> {
     if owned_files.is_empty() || owned_files.len() > 64 {
         return Err(InstallError::InvalidOwnershipManifest);
+    }
+    let has_settings = owned_files
+        .iter()
+        .any(|file| file.target_path == "/var/lib/planeradar/settings.json");
+    let has_marker = owned_files
+        .iter()
+        .any(|file| file.target_path == "/var/lib/planeradar-installer/settings-owned-v1");
+    if has_settings != has_marker {
+        return Err(InstallError::InvalidOwnershipManifest);
+    }
+    if has_marker {
+        let marker = install_path(root, INSTALL_SETTINGS_MARKER);
+        let settings = install_path(root, INSTALL_SETTINGS);
+        match (
+            fs::symlink_metadata(&marker),
+            fs::symlink_metadata(&settings),
+        ) {
+            (Ok(_), Ok(_)) => verify_settings_marker(root)?,
+            (Err(marker_error), Err(settings_error))
+                if marker_error.kind() == io::ErrorKind::NotFound
+                    && settings_error.kind() == io::ErrorKind::NotFound => {}
+            _ => return Err(InstallError::SettingsNotOwned),
+        }
     }
     for (index, file) in owned_files.iter().enumerate() {
         if owned_files[..index]
@@ -1133,13 +1292,17 @@ fn verify_owned_manifest(
         match fs::symlink_metadata(&path) {
             Ok(_) => {
                 let settings = file.target_path == "/var/lib/planeradar/settings.json";
+                let marker = file.target_path == "/var/lib/planeradar-installer/settings-owned-v1";
                 if settings {
                     require_settings_regular(&path)?;
                 } else {
                     require_single_link_regular(&path, Some(root))?;
                 }
                 let digest = format!("{:x}", Sha256::digest(fs::read(&path)?));
-                if digest != file.sha256 && (!settings || verify_settings_content) {
+                if marker && file.sha256 != settings_marker_sha256() {
+                    return Err(InstallError::InvalidOwnershipManifest);
+                }
+                if digest != file.sha256 && !settings {
                     return Err(InstallError::OwnedPathDrift(path));
                 }
             }
@@ -1158,6 +1321,7 @@ fn allowed_owned_path(path: &str) -> bool {
             | "/opt/planeradar/SHA256"
             | "/etc/systemd/system/planeradar.service"
             | "/var/lib/planeradar/settings.json"
+            | "/var/lib/planeradar-installer/settings-owned-v1"
     ) {
         return true;
     }
@@ -1191,6 +1355,20 @@ fn require_settings_regular(path: &Path) -> Result<(), InstallError> {
         || !matches!(metadata.permissions().mode() & 0o777, 0o600 | 0o640)
     {
         return Err(InstallError::OwnedPathDrift(path.to_owned()));
+    }
+    Ok(())
+}
+
+fn settings_marker_sha256() -> String {
+    format!("{:x}", Sha256::digest(SETTINGS_MARKER))
+}
+
+fn verify_settings_marker(root: &Path) -> Result<(), InstallError> {
+    let marker = install_path(root, INSTALL_SETTINGS_MARKER);
+    require_single_link_regular(&marker, Some(root))?;
+    let metadata = fs::symlink_metadata(&marker)?;
+    if metadata.permissions().mode() & 0o777 != 0o600 || fs::read(&marker)? != SETTINGS_MARKER {
+        return Err(InstallError::OwnedPathDrift(marker));
     }
     Ok(())
 }
@@ -1303,7 +1481,14 @@ impl<'a> Installer<'a> {
         files_changed |= ensure_install_directory(&root, Path::new("var"), 0o755, false)?;
         files_changed |= ensure_install_directory(&root, Path::new("var/lib"), 0o755, false)?;
         files_changed |= ensure_install_directory(&root, Path::new(INSTALL_STATE), 0o750, true)?;
+        files_changed |= ensure_install_directory(
+            &root,
+            Path::new("var/lib/planeradar-installer"),
+            0o700,
+            true,
+        )?;
         let settings_path = install_path(&root, INSTALL_SETTINGS);
+        let settings_marker_path = install_path(&root, INSTALL_SETTINGS_MARKER);
         let settings_created = match fs::symlink_metadata(&settings_path) {
             Ok(metadata) => {
                 if !metadata.file_type().is_file()
@@ -1320,6 +1505,21 @@ impl<'a> Installer<'a> {
                 true
             }
             Err(error) => return Err(error.into()),
+        };
+        let settings_owned = if settings_created {
+            files_changed |=
+                durable_atomic_write_bytes(&settings_marker_path, SETTINGS_MARKER, 0o600)?;
+            true
+        } else {
+            match fs::symlink_metadata(&settings_marker_path) {
+                Ok(_) => {
+                    verify_settings_marker(&root)?;
+                    require_settings_regular(&settings_path)?;
+                    true
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+                Err(error) => return Err(error.into()),
+            }
         };
         ensure_existing_directory(&root, Path::new("etc"))?;
         files_changed |= ensure_install_directory(&root, Path::new("etc/systemd"), 0o755, false)?;
@@ -1377,10 +1577,14 @@ impl<'a> Installer<'a> {
             sha256: format!("{:x}", Sha256::digest(contents)),
         })
         .collect::<Vec<_>>();
-        if settings_created {
+        if settings_owned {
             owned_files.push(InstalledFile {
                 target_path: format!("/{INSTALL_SETTINGS}"),
-                sha256: format!("{:x}", Sha256::digest(DEFAULT_SETTINGS)),
+                sha256: format!("{:x}", Sha256::digest(fs::read(&settings_path)?)),
+            });
+            owned_files.push(InstalledFile {
+                target_path: format!("/{INSTALL_SETTINGS_MARKER}"),
+                sha256: settings_marker_sha256(),
             });
         }
 

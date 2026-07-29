@@ -1,4 +1,5 @@
 use std::cell::{Cell, RefCell};
+use std::collections::BTreeMap;
 use std::io;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -124,7 +125,7 @@ fn run_lifecycle_target(
         release_dir: config.release_dir,
         cache_root,
         lock: DriverLock::checked_in()?,
-        application_payload: RefCell::new(None),
+        verified_payloads: RefCell::new(BTreeMap::new()),
         candidate: RefCell::new(None),
         staged_helper: RefCell::new(None),
         last_owned_files: RefCell::new(None),
@@ -151,7 +152,7 @@ struct SystemLifecycleBackend {
     release_dir: Option<PathBuf>,
     cache_root: PathBuf,
     lock: DriverLock,
-    application_payload: RefCell<Option<ApplicationPayload>>,
+    verified_payloads: RefCell<BTreeMap<String, (ReleasePair, ApplicationPayload)>>,
     candidate: RefCell<Option<ReleasePair>>,
     staged_helper: RefCell<Option<String>>,
     last_owned_files: RefCell<Option<Vec<OwnedFile>>>,
@@ -162,6 +163,18 @@ struct SystemLifecycleBackend {
 }
 
 impl SystemLifecycleBackend {
+    fn verified_payload_key(pair: &ReleasePair) -> String {
+        format!(
+            "{}:{}:{}:{}:{}:{}",
+            pair.application.version,
+            pair.application.source_commit,
+            pair.application.sha256,
+            pair.driver.version,
+            pair.driver.source_commit,
+            pair.driver.sha256
+        )
+    }
+
     fn target(&self) -> SshTarget {
         self.target.borrow().clone()
     }
@@ -279,6 +292,48 @@ impl SystemLifecycleBackend {
             return Version::parse(version).map_err(|_| LifecycleError::Backend);
         }
         self.latest_release_version()
+    }
+
+    fn verify_release_with_lock(
+        &self,
+        version: &Version,
+        driver_lock: &DriverLock,
+    ) -> Result<(ReleasePair, ApplicationPayload), LifecycleError> {
+        let input = self
+            .release_dir
+            .as_deref()
+            .map_or(ReleaseInput::Downloaded, ReleaseInput::Local);
+        let release =
+            ReleaseClient::new(GhReleaseSource::system(), self.cache_root.join("release"))
+                .resolve(version, driver_lock, input)
+                .map_err(|_| LifecycleError::ImmutableReleaseMismatch)?;
+        Verifier::new(SystemCommandRunner)
+            .verify(version, &release)
+            .map_err(|_| LifecycleError::ImmutableReleaseMismatch)?;
+        let artifact = release
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.artifact.name == "planeradar-aarch64-linux-gnu.tar.zst")
+            .ok_or(LifecycleError::ImmutableReleaseMismatch)?;
+        let payload = extract_application_payload(
+            &artifact.path,
+            &artifact.artifact.sha256,
+            &self.cache_root.join("payloads"),
+        )
+        .map_err(|_| LifecycleError::ImmutableReleaseMismatch)?;
+        let pair = ReleasePair {
+            application: ArtifactIdentity {
+                version: release.manifest.version.to_string(),
+                source_commit: release.manifest.source_commit,
+                sha256: payload.sha256().into(),
+            },
+            driver: ArtifactIdentity {
+                version: release.manifest.driver.version.to_string(),
+                source_commit: release.manifest.driver.commit,
+                sha256: release.manifest.driver.manifest_sha256,
+            },
+        };
+        Ok((pair, payload))
     }
 
     fn ensure_driver_tool(&self, identity: &ArtifactIdentity) -> Result<(), LifecycleError> {
@@ -483,12 +538,16 @@ impl SystemLifecycleBackend {
         pair: &ReleasePair,
         current_owned: &[OwnedFile],
     ) -> Result<Vec<OwnedFile>, LifecycleError> {
+        let expected_helper = format!(
+            "/var/lib/planeradar-installer/helpers/{}/planeradar",
+            pair.application.sha256
+        );
         let artifact = self
-            .candidate
+            .staged_helper
             .borrow()
             .as_ref()
-            .filter(|candidate| *candidate == pair)
-            .and_then(|_| self.staged_helper.borrow().clone())
+            .filter(|helper| **helper == expected_helper)
+            .cloned()
             .unwrap_or_else(|| {
                 format!(
                     "/opt/planeradar/releases/{}/{}/planeradar",
@@ -499,11 +558,11 @@ impl SystemLifecycleBackend {
     }
 
     fn deploy_candidate_helper(&self, pair: &ReleasePair) -> Result<String, LifecycleError> {
-        if self.candidate.borrow().as_ref() != Some(pair) {
-            return Err(LifecycleError::ImmutableReleaseMismatch);
-        }
-        let payload = self.application_payload.borrow();
-        let payload = payload.as_ref().ok_or(LifecycleError::Backend)?;
+        let payloads = self.verified_payloads.borrow();
+        let (_, payload) = payloads
+            .get(&Self::verified_payload_key(pair))
+            .filter(|(verified, _)| verified == pair)
+            .ok_or(LifecycleError::ImmutableReleaseMismatch)?;
         let create = RemoteCommand::ordinary([
             "sh",
             "-c",
@@ -622,25 +681,13 @@ impl LifecycleBackend for SystemLifecycleBackend {
             {
                 return Err(LifecycleError::InvalidState);
             }
-            let version = Version::parse(
-                &migrated
-                    .accepted()
-                    .first()
-                    .ok_or(LifecycleError::InvalidState)?
-                    .pair
-                    .application
-                    .version,
-            )
-            .map_err(|_| LifecycleError::InvalidState)?;
-            let verified = self.resolve_release(Some(&version))?;
-            if migrated
+            let expected = &migrated
                 .accepted()
                 .first()
-                .is_none_or(|accepted| accepted.pair != verified)
-            {
-                return Err(LifecycleError::ImmutableReleaseMismatch);
-            }
-            self.deploy_candidate_helper(&verified)?;
+                .ok_or(LifecycleError::InvalidState)?
+                .pair;
+            self.verify_historical_release(expected)?;
+            self.deploy_candidate_helper(expected)?;
             self.run_driver_protocol(
                 DriverAction::RecordAccepted,
                 Some(&migrated.accepted()[0].pair.driver),
@@ -656,21 +703,6 @@ impl LifecycleBackend for SystemLifecycleBackend {
 
     fn save_lifecycle_state(&self, state: &LifecycleState) -> Result<(), LifecycleError> {
         let helper = self.state_helper();
-        let json = state.to_json()?;
-        let command = RemoteCommand::interactive_sudo([
-            "sudo",
-            helper.as_str(),
-            "lifecycle-state",
-            "write",
-            "--json",
-            json.as_str(),
-        ])
-        .map_err(|_| LifecycleError::Backend)?;
-        let output = self.run_remote(command)?;
-        let returned = LifecycleState::from_json(output.stdout())?;
-        if &returned != state {
-            return Err(LifecycleError::InvalidState);
-        }
         if let Some(current) = state.accepted().first() {
             let target_state = TargetInstallState {
                 schema_version: 1,
@@ -694,67 +726,65 @@ impl LifecycleBackend for SystemLifecycleBackend {
             .map_err(|_| LifecycleError::Backend)?;
             self.run_remote(command)?;
         }
+        // lifecycle.json is the commit record.  Compatibility state is written
+        // first so an error can never report failure after the new lifecycle
+        // pair has already become durable.
+        let json = state.to_json()?;
+        let command = RemoteCommand::interactive_sudo([
+            "sudo",
+            helper.as_str(),
+            "lifecycle-state",
+            "write",
+            "--json",
+            json.as_str(),
+        ])
+        .map_err(|_| LifecycleError::Backend)?;
+        let output = self.run_remote(command)?;
+        let returned = LifecycleState::from_json(output.stdout())?;
+        if &returned != state {
+            return Err(LifecycleError::InvalidState);
+        }
         Ok(())
     }
 
     fn resolve_release(&self, requested: Option<&Version>) -> Result<ReleasePair, LifecycleError> {
         let version = self.release_version(requested)?;
-        let input = self
-            .release_dir
-            .as_deref()
-            .map_or(ReleaseInput::Downloaded, ReleaseInput::Local);
-        let release =
-            ReleaseClient::new(GhReleaseSource::system(), self.cache_root.join("release"))
-                .resolve(&version, &self.lock, input)
-                .map_err(|_| LifecycleError::ImmutableReleaseMismatch)?;
-        Verifier::new(SystemCommandRunner)
-            .verify(&version, &release)
-            .map_err(|_| LifecycleError::ImmutableReleaseMismatch)?;
-        let artifact = release
-            .artifacts
-            .iter()
-            .find(|artifact| artifact.artifact.name == "planeradar-aarch64-linux-gnu.tar.zst")
-            .ok_or(LifecycleError::ImmutableReleaseMismatch)?;
-        let payload = extract_application_payload(
-            &artifact.path,
-            &artifact.artifact.sha256,
-            &self.cache_root.join("payloads"),
-        )
-        .map_err(|_| LifecycleError::ImmutableReleaseMismatch)?;
-        let pair = ReleasePair {
-            application: ArtifactIdentity {
-                version: release.manifest.version.to_string(),
-                source_commit: release.manifest.source_commit,
-                sha256: payload.sha256().into(),
-            },
-            driver: ArtifactIdentity {
-                version: release.manifest.driver.version.to_string(),
-                source_commit: release.manifest.driver.commit,
-                sha256: release.manifest.driver.manifest_sha256,
-            },
-        };
-        *self.application_payload.borrow_mut() = Some(payload);
+        let (pair, payload) = self.verify_release_with_lock(&version, &self.lock)?;
+        self.verified_payloads
+            .borrow_mut()
+            .insert(Self::verified_payload_key(&pair), (pair.clone(), payload));
         *self.candidate.borrow_mut() = Some(pair.clone());
         Ok(pair)
     }
 
+    fn verify_historical_release(&self, expected: &ReleasePair) -> Result<(), LifecycleError> {
+        let version = Version::parse(&expected.application.version)
+            .map_err(|_| LifecycleError::ImmutableReleaseMismatch)?;
+        let lock = DriverLock {
+            repository: planeradarctl::config::DRIVER_REPOSITORY.into(),
+            version: Version::parse(&expected.driver.version)
+                .map_err(|_| LifecycleError::ImmutableReleaseMismatch)?,
+            commit: expected.driver.source_commit.clone(),
+            manifest_sha256: expected.driver.sha256.clone(),
+        };
+        let (verified, payload) = self.verify_release_with_lock(&version, &lock)?;
+        if &verified != expected {
+            return Err(LifecycleError::ImmutableReleaseMismatch);
+        }
+        self.verified_payloads
+            .borrow_mut()
+            .insert(Self::verified_payload_key(&verified), (verified, payload));
+        Ok(())
+    }
+
     fn stage_application(&self, pair: &ReleasePair) -> Result<(), LifecycleError> {
-        if self.candidate.borrow().as_ref() != Some(pair) {
-            let artifact = format!(
-                "/opt/planeradar/releases/{}/{}/planeradar",
-                pair.application.version, pair.application.sha256
-            );
-            let command = RemoteCommand::ordinary([
-                "sh",
-                "-c",
-                "test ! -L \"$1\" && test -f \"$1\" && test \"$(stat -c '%u:%g:%a:%h' -- \"$1\")\" = '0:0:755:1' && test \"$(sha256sum -- \"$1\" | awk '{print $1}')\" = \"$2\"",
-                "planeradar-rollback-artifact",
-                artifact.as_str(),
-                pair.application.sha256.as_str(),
-            ])
-            .map_err(|_| LifecycleError::Backend)?;
-            self.run_remote(command)?;
-            return Ok(());
+        if !self
+            .verified_payloads
+            .borrow()
+            .get(&Self::verified_payload_key(pair))
+            .is_some_and(|(verified, _)| verified == pair)
+        {
+            return Err(LifecycleError::ImmutableReleaseMismatch);
         }
         let state = self.load_lifecycle_state()?;
         let current = state
@@ -789,14 +819,27 @@ impl LifecycleBackend for SystemLifecycleBackend {
             return self.run_driver_protocol(DriverAction::StageRetained, Some(&pair.driver));
         }
         self.ensure_driver_tool(&pair.driver)?;
+        let postconditions = {
+            let driver = self.driver_tool.borrow();
+            let tool = &driver.as_ref().ok_or(LifecycleError::Backend)?.1;
+            tool.prepare_artifacts()
+                .map_err(|_| LifecycleError::Backend)?;
+            tool.postconditions().map_err(|_| LifecycleError::Backend)?
+        };
+        self.ensure_protocol_tool()?;
+        self.protocol_tool
+            .borrow()
+            .as_ref()
+            .ok_or(LifecycleError::Backend)?
+            .prepare_accepted_protocol(&postconditions)
+            .map_err(|_| LifecycleError::Backend)?;
         self.driver_tool
             .borrow()
             .as_ref()
             .ok_or(LifecycleError::Backend)?
             .1
-            .prepare_and_stage()
-            .map_err(|_| LifecycleError::Backend)?;
-        self.run_driver_protocol(DriverAction::BindStagedAccepted, None)
+            .stage_prepared()
+            .map_err(|_| LifecycleError::Backend)
     }
 
     fn tryboot_driver(&self, _pair: &ReleasePair) -> Result<(), LifecycleError> {
@@ -870,23 +913,31 @@ impl LifecycleBackend for SystemLifecycleBackend {
             .map_err(|_| LifecycleError::Backend)?;
         self.verify_application(pair)?;
         if self.driver_transition_active.get() {
-            self.run_driver_protocol(DriverAction::AcceptRetained, None)?;
+            self.run_driver_protocol(DriverAction::MarkVerifiedAccepted, None)?;
+        }
+        Ok(())
+    }
+
+    fn finalize_driver_acceptance(&self, _pair: &ReleasePair) -> Result<(), LifecycleError> {
+        if self.driver_transition_active.get() {
+            self.run_driver_protocol(DriverAction::FinalizeAccepted, None)?;
             self.driver_transition_active.set(false);
         }
         Ok(())
     }
 
-    fn restore_application(&self, prior: &AcceptedPair) -> Result<(), LifecycleError> {
+    fn restore_application(&self, prior: &AcceptedPair) -> Result<Vec<OwnedFile>, LifecycleError> {
         if self.verify_application(&prior.pair).is_ok() {
-            return Ok(());
+            return Ok(prior.owned_files.clone());
         }
         let current = self
             .last_owned_files
             .borrow()
             .clone()
             .unwrap_or_else(|| prior.owned_files.clone());
-        self.activate_pair(&prior.pair, &current)?;
-        Ok(())
+        let restored = self.activate_pair(&prior.pair, &current)?;
+        *self.last_owned_files.borrow_mut() = Some(restored.clone());
+        Ok(restored)
     }
 
     fn restore_driver(&self, prior: &AcceptedPair) -> Result<(), LifecycleError> {
@@ -914,6 +965,21 @@ impl LifecycleBackend for SystemLifecycleBackend {
         self.verify_tryboot_driver(&prior.pair)?;
         self.commit_driver(&prior.pair)?;
         self.reboot_normal(&prior.pair)
+    }
+
+    fn retire_candidate(&self, owned_files: &[OwnedFile]) -> Result<(), LifecycleError> {
+        let helper = self.state_helper();
+        let json = Self::ownership_json(owned_files)?;
+        let command = RemoteCommand::interactive_sudo([
+            "sudo",
+            helper.as_str(),
+            "lifecycle-retire",
+            "--owned-json",
+            json.as_str(),
+        ])
+        .map_err(|_| LifecycleError::Backend)?;
+        self.run_remote(command)?;
+        Ok(())
     }
 
     fn prepare_uninstall(&self, accepted: &AcceptedPair) -> Result<OwnedFile, LifecycleError> {
@@ -984,6 +1050,10 @@ impl LifecycleBackend for SystemLifecycleBackend {
             self.run_driver_protocol(DriverAction::RetireInactive, Some(inactive))?;
         }
         Ok(())
+    }
+
+    fn finalize_driver_uninstall(&self) -> Result<(), LifecycleError> {
+        self.run_driver_protocol(DriverAction::FinalizeUninstall, None)
     }
 
     fn finalize_uninstall(&self, state: &LifecycleState) -> Result<(), LifecycleError> {
@@ -2486,7 +2556,7 @@ mod tests {
     fn driver_postconditions_are_bound_to_exact_transaction_and_committed_identity() {
         let expected = planeradarctl::driver::DriverPostconditions {
             driver_version: "0.1.0".into(),
-            source_revision: "ab3f88c7f106df9fbfd70afa43bab1b24ca6dd8d".into(),
+            source_revision: "e5953b27463cb531ecfd52b44deddf4e1301e2f5".into(),
             source_tree: "1111111111111111111111111111111111111111".into(),
             kernel_release: "6.12.47+rpt-rpi-v8".into(),
             module_vermagic: "6.12.47+rpt-rpi-v8 SMP preempt mod_unload aarch64".into(),
@@ -2495,7 +2565,7 @@ mod tests {
             module_file: "hyperpixel2r_kms.ko".into(),
             module_sha256: "3333333333333333333333333333333333333333333333333333333333333333"
                 .into(),
-            overlay_file: "hyperpixel2r-kms-f6213007a8e7.dtbo".into(),
+            overlay_file: "hyperpixel2r-kms-e5953b27463c.dtbo".into(),
             overlay_sha256: "4444444444444444444444444444444444444444444444444444444444444444"
                 .into(),
             applied_dtb_file: "hyperpixel2r-kms-applied.dtb".into(),
@@ -2511,14 +2581,14 @@ mod tests {
             [
                 "planeradar-driver-transaction",
                 "0.1.0",
-                "ab3f88c7f106df9fbfd70afa43bab1b24ca6dd8d",
+                "e5953b27463cb531ecfd52b44deddf4e1301e2f5",
                 "1111111111111111111111111111111111111111",
                 "6.12.47+rpt-rpi-v8",
                 "6.12.47+rpt-rpi-v8 SMP preempt mod_unload aarch64",
                 "2222222222222222222222222222222222222222222222222222222222222222",
                 "hyperpixel2r_kms.ko",
                 "3333333333333333333333333333333333333333333333333333333333333333",
-                "hyperpixel2r-kms-f6213007a8e7.dtbo",
+                "hyperpixel2r-kms-e5953b27463c.dtbo",
                 "4444444444444444444444444444444444444444444444444444444444444444",
                 "hyperpixel2r-kms-applied.dtb",
                 "5555555555555555555555555555555555555555555555555555555555555555",
@@ -2533,14 +2603,14 @@ mod tests {
             [
                 "planeradar-driver-committed",
                 "0.1.0",
-                "ab3f88c7f106df9fbfd70afa43bab1b24ca6dd8d",
+                "e5953b27463cb531ecfd52b44deddf4e1301e2f5",
                 "1111111111111111111111111111111111111111",
                 "6.12.47+rpt-rpi-v8",
                 "6.12.47+rpt-rpi-v8 SMP preempt mod_unload aarch64",
                 "2222222222222222222222222222222222222222222222222222222222222222",
                 "hyperpixel2r_kms.ko",
                 "3333333333333333333333333333333333333333333333333333333333333333",
-                "hyperpixel2r-kms-f6213007a8e7.dtbo",
+                "hyperpixel2r-kms-e5953b27463c.dtbo",
                 "4444444444444444444444444444444444444444444444444444444444444444",
                 "hyperpixel2r-kms-applied.dtb",
                 "5555555555555555555555555555555555555555555555555555555555555555",

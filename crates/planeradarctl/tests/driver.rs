@@ -1074,7 +1074,7 @@ fn failed_update_leaves_the_existing_lock_byte_for_byte_unchanged() {
     );
     let temporary = tempfile::tempdir().expect("temporary lock");
     let lock_path = temporary.path().join("driver.lock.toml");
-    let before = b"repository = \"https://github.com/shayne/hyperpixel2r-kms\"\nversion = \"0.1.0-rc.4\"\ncommit = \"6826419b4f3ab01c2e1ce9a3ef870186ae2cc3b8\"\nmanifest_sha256 = \"93f413aac135b44585703a03717d5aa2e9ae6b2b2d4b178d193d4758dfdedee7\"\nlifecycle_protocol = \"accepted-driver-v1\"\n";
+    let before = b"repository = \"https://github.com/shayne/hyperpixel2r-kms\"\nversion = \"0.1.0-rc.4\"\ncommit = \"6826419b4f3ab01c2e1ce9a3ef870186ae2cc3b8\"\nmanifest_sha256 = \"93f413aac135b44585703a03717d5aa2e9ae6b2b2d4b178d193d4758dfdedee7\"\nlifecycle_protocol = \"accepted-driver-v2\"\n";
     fs::write(&lock_path, before).expect("seed lock");
 
     assert!(
@@ -1562,21 +1562,38 @@ fn accepted_driver_protocol_actions_are_typed_exact_and_bounded() {
 
     for (action, revision) in [
         (DriverAction::RecordAccepted, Some(DRIVER_COMMIT)),
-        (DriverAction::BindStagedAccepted, None),
         (DriverAction::MarkCommittedAccepted, None),
         (DriverAction::StageRetained, Some(DRIVER_COMMIT)),
         (DriverAction::CommitRetained, None),
         (DriverAction::RecoverAccepted, None),
-        (DriverAction::AcceptRetained, None),
+        (DriverAction::MarkVerifiedAccepted, None),
+        (DriverAction::FinalizeAccepted, None),
         (DriverAction::UninstallAccepted, Some(DRIVER_COMMIT)),
+        (DriverAction::FinalizeUninstall, None),
         (DriverAction::RetireInactive, Some(DRIVER_COMMIT)),
     ] {
         tool.run_accepted_protocol(action, revision)
             .expect("accepted protocol action");
     }
+    tool.prepare_accepted_protocol(&planeradarctl::driver::DriverPostconditions {
+        driver_version: "0.1.0".into(),
+        source_revision: DRIVER_COMMIT.into(),
+        source_tree: "1".repeat(40),
+        kernel_release: "6.18.34+rpt-rpi-v8".into(),
+        module_vermagic: "6.18.34+rpt-rpi-v8 SMP preempt mod_unload aarch64".into(),
+        manifest_sha256: "2".repeat(64),
+        module_file: "hyperpixel2r_kms.ko".into(),
+        module_sha256: "3".repeat(64),
+        overlay_file: format!("hyperpixel2r-kms-{}.dtbo", &DRIVER_COMMIT[..12]),
+        overlay_sha256: "4".repeat(64),
+        applied_dtb_file: "hyperpixel2r-kms-applied.dtb".into(),
+        applied_dtb_sha256: "5".repeat(64),
+        replaced_overlay: "vc4-kms-dpi-hyperpixel2r".into(),
+    })
+    .expect("pre-mutation accepted journal");
 
     let invocations = runner.invocations.lock().expect("invocation lock");
-    assert_eq!(invocations.len(), 9);
+    assert_eq!(invocations.len(), 11);
     for invocation in invocations.iter() {
         assert_eq!(invocation.program(), "bash");
         assert_eq!(invocation.timeout(), Some(Duration::from_secs(15 * 60)));
@@ -1597,6 +1614,18 @@ fn accepted_driver_protocol_actions_are_typed_exact_and_bounded() {
             .arguments()
             .windows(2)
             .any(|pair| pair == ["--source-revision", DRIVER_COMMIT])
+    );
+    assert!(
+        invocations[10]
+            .arguments()
+            .windows(2)
+            .any(|pair| pair == ["--action", "prepare-new"])
+    );
+    assert!(
+        invocations[10]
+            .arguments()
+            .windows(2)
+            .any(|pair| pair == ["--manifest-sha256", "2".repeat(64).as_str()])
     );
     assert!(
         tool.run_accepted_protocol(DriverAction::CommitBoot, None)

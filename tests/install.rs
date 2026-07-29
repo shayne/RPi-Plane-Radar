@@ -11,7 +11,8 @@ use planeradar::install::{
     InstalledFile, Installer, PLANERADAR_SERVICE, activate_application_release,
     application_release_ownership_json, parse_application_ownership_json,
     read_installer_state_json, read_lifecycle_state_json, read_optional_installer_state_json,
-    uninstall_owned_installation, write_installer_state_json, write_lifecycle_state_json,
+    retire_application_artifacts, uninstall_owned_installation, write_installer_state_json,
+    write_lifecycle_state_json,
 };
 use sha2::{Digest, Sha256};
 
@@ -262,6 +263,7 @@ fn installer_verifies_then_installs_once_and_is_idempotent() {
             "/opt/planeradar/SHA256",
             "/etc/systemd/system/planeradar.service",
             "/var/lib/planeradar/settings.json",
+            "/var/lib/planeradar-installer/settings-owned-v1",
         ]
     );
     for owned in &first.owned_files {
@@ -964,7 +966,7 @@ fn application_upgrade_stages_content_addressed_bytes_and_atomically_switches_th
         fs::read(&next).unwrap()
     );
     assert_eq!(fs::read(&settings).unwrap(), old_settings);
-    assert_eq!(owned.len(), 6);
+    assert_eq!(owned.len(), 7);
     assert_eq!(
         owned.last().unwrap().target_path,
         format!(
@@ -1093,7 +1095,10 @@ fn exact_manifest_uninstall_preserves_settings_unrelated_files_and_boot_lines_an
         .expect("idempotent repeat");
 
     for owned in &installed.owned_files {
-        if owned.target_path == "/var/lib/planeradar/settings.json" {
+        if matches!(
+            owned.target_path.as_str(),
+            "/var/lib/planeradar/settings.json" | "/var/lib/planeradar-installer/settings-owned-v1"
+        ) {
             continue;
         }
         assert!(
@@ -1129,6 +1134,73 @@ fn purge_settings_requires_and_removes_only_an_exact_owned_settings_record() {
     uninstall_owned_installation(&fixture.root, &installed.owned_files, true, &runner)
         .expect("purge installer-created settings");
     assert!(!settings.exists());
+}
+
+#[test]
+fn production_ownership_rediscovers_mutable_installer_settings_through_immutable_marker() {
+    let fixture = Fixture::new("[all]\n");
+    let runner = RecordingRunner::for_root(&fixture.root);
+    Installer::new(&runner)
+        .install(&fixture.options(false))
+        .expect("initial install");
+    let settings = fixture.root.join("var/lib/planeradar/settings.json");
+    fs::write(&settings, b"{\"user\":\"changed after install\"}\n").expect("mutable settings");
+
+    let encoded =
+        planeradar::install::installer_ownership_json(&fixture.root).expect("production ownership");
+    let owned = parse_application_ownership_json(encoded.as_bytes()).expect("typed ownership");
+    assert!(
+        owned
+            .iter()
+            .any(|file| { file.target_path == "/var/lib/planeradar/settings.json" })
+    );
+    assert!(
+        owned
+            .iter()
+            .any(|file| { file.target_path == "/var/lib/planeradar-installer/settings-owned-v1" })
+    );
+
+    uninstall_owned_installation(&fixture.root, &owned, true, &runner)
+        .expect("purge mutable installer settings");
+    assert!(!settings.exists());
+    assert!(
+        !fixture
+            .root
+            .join("var/lib/planeradar-installer/settings-owned-v1")
+            .exists()
+    );
+}
+
+#[test]
+fn settings_purge_rejects_missing_or_mutated_immutable_ownership_marker() {
+    for hostile in ["missing", "mutated", "hardlink"] {
+        let fixture = Fixture::new("[all]\n");
+        let runner = RecordingRunner::for_root(&fixture.root);
+        let installed = Installer::new(&runner)
+            .install(&fixture.options(false))
+            .expect("initial install");
+        let marker = fixture
+            .root
+            .join("var/lib/planeradar-installer/settings-owned-v1");
+        match hostile {
+            "missing" => fs::remove_file(&marker).expect("remove marker"),
+            "mutated" => fs::write(&marker, b"forged\n").expect("mutate marker"),
+            "hardlink" => {
+                fs::hard_link(&marker, marker.with_extension("link")).expect("hardlink marker");
+            }
+            _ => unreachable!(),
+        }
+        assert!(
+            uninstall_owned_installation(&fixture.root, &installed.owned_files, true, &runner)
+                .is_err()
+        );
+        assert!(
+            fixture
+                .root
+                .join("var/lib/planeradar/settings.json")
+                .exists()
+        );
+    }
 }
 
 #[test]
@@ -1232,7 +1304,7 @@ fn target_lifecycle_state_round_trips_strict_bounded_json_atomically() {
 
     write_lifecycle_state_json(&path, json.as_bytes()).expect("write lifecycle");
     let migrated = json
-        .replace("\"schema_version\":1", "\"schema_version\":2")
+        .replace("\"schema_version\":1", "\"schema_version\":3")
         .replace(
             "\"transaction\":null",
             "\"transaction\":null,\"uninstall\":null",
@@ -1241,7 +1313,7 @@ fn target_lifecycle_state_round_trips_strict_bounded_json_atomically() {
     assert_eq!(mode(&path), 0o600);
 
     for hostile in [
-        json.replace("\"schema_version\":1", "\"schema_version\":3"),
+        json.replace("\"schema_version\":1", "\"schema_version\":4"),
         json.replace("\"sequence\":1", "\"sequence\":0"),
         format!("{json}\n{{}}"),
     ] {
@@ -1327,6 +1399,60 @@ fn target_lifecycle_cli_exposes_only_typed_state_activation_and_uninstall_argume
             ..
         }
     ));
+
+    let retire = Cli::try_parse_from([
+        "planeradar",
+        "lifecycle-retire",
+        "--owned-json",
+        "{\"schema_version\":1,\"owned_files\":[]}",
+    ])
+    .expect("lifecycle retire");
+    assert!(matches!(retire.command, CliCommand::LifecycleRetire { .. }));
+}
+
+#[test]
+fn failed_candidate_retirement_is_exact_idempotent_and_never_accepts_live_paths() {
+    let fixture = Fixture::new("[all]\n");
+    let digest = format!("{:x}", Sha256::digest(b"candidate"));
+    let release = fixture
+        .root
+        .join("opt/planeradar/releases/1.2.3")
+        .join(&digest)
+        .join("planeradar");
+    let helper = fixture
+        .root
+        .join("var/lib/planeradar-installer/helpers")
+        .join(&digest)
+        .join("planeradar");
+    for path in [&release, &helper] {
+        fs::create_dir_all(path.parent().unwrap()).expect("candidate parent");
+        fs::write(path, b"candidate").expect("candidate artifact");
+    }
+    let owned = vec![
+        InstalledFile {
+            target_path: format!("/opt/planeradar/releases/1.2.3/{digest}/planeradar"),
+            sha256: digest.clone(),
+        },
+        InstalledFile {
+            target_path: format!("/var/lib/planeradar-installer/helpers/{digest}/planeradar"),
+            sha256: digest.clone(),
+        },
+    ];
+
+    retire_application_artifacts(&fixture.root, &owned).expect("retire candidate");
+    retire_application_artifacts(&fixture.root, &owned).expect("idempotent retire");
+    assert!(!release.exists());
+    assert!(!helper.exists());
+    assert!(
+        retire_application_artifacts(
+            &fixture.root,
+            &[InstalledFile {
+                target_path: "/opt/planeradar/bin/planeradar".into(),
+                sha256: "a".repeat(64),
+            }]
+        )
+        .is_err()
+    );
 }
 
 #[test]

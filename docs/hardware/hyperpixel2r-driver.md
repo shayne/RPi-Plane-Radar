@@ -23,7 +23,7 @@ whose release identity still matches the lock.
 To intentionally move the lock to another published version:
 
 ```sh
-mise run driver:update -- 0.1.0-rc.15
+mise run driver:update -- 0.1.0-rc.16
 mise run driver:sync
 ```
 
@@ -47,12 +47,14 @@ procedures.
 
 ## Accepted Raspberry Pi Zero 2 W installation
 
-The accepted external lifecycle source is release `v0.1.0-rc.15`, commit
-`ab3f88c7f106df9fbfd70afa43bab1b24ca6dd8d`, locked by manifest SHA-256
-`77a6efdd0afdb8cffce7737b7244f9cc902aca4623769272cd5b9dcd485d85b0`.
-The running driver remains the already accepted RC13-built image because RC14
-changes only migration cleanup behavior and was deliberately verified without
-staging or rebooting the Pi. It targets kernel `6.18.34+rpt-rpi-v8` with:
+The next accepted external lifecycle source is the pending release
+`v0.1.0-rc.16`, commit
+`e5953b27463cb531ecfd52b44deddf4e1301e2f5`, locked by manifest SHA-256
+`bddbe2c305de56427568660548f715a23c15a8dcbfeb46a9d392c6cbcfd48f88`.
+The running driver remains the already accepted RC13-built image. RC14 through
+the pending RC16 contain migration, release-control, and crash-recovery
+improvements and were deliberately verified here without staging or rebooting
+the Pi. It targets kernel `6.18.34+rpt-rpi-v8` with:
 
 - module `hyperpixel2r_kms`, vermagic
   `6.18.34+rpt-rpi-v8 SMP preempt mod_unload modversions aarch64`;

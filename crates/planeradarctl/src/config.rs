@@ -10,7 +10,7 @@ use crate::cli::{Cli, Command, MutatingOptions, UninstallOptions};
 
 pub const DEFAULT_HOSTNAME: &str = "planeradar";
 pub const DRIVER_REPOSITORY: &str = "https://github.com/shayne/hyperpixel2r-kms";
-pub const DRIVER_LIFECYCLE_PROTOCOL: &str = "accepted-driver-v1";
+pub const DRIVER_LIFECYCLE_PROTOCOL: &str = "accepted-driver-v2";
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Environment {

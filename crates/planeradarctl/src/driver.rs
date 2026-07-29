@@ -1384,13 +1384,15 @@ pub enum DriverAction {
     CommitBoot,
     RollbackBoot,
     RecordAccepted,
-    BindStagedAccepted,
+    PrepareAccepted,
     MarkCommittedAccepted,
     StageRetained,
     CommitRetained,
     RecoverAccepted,
-    AcceptRetained,
+    MarkVerifiedAccepted,
+    FinalizeAccepted,
     UninstallAccepted,
+    FinalizeUninstall,
     RetireInactive,
     Uninstall,
 }
@@ -1610,13 +1612,14 @@ impl<R: CommandRunner> DriverTool<R> {
         if !matches!(
             action,
             DriverAction::RecordAccepted
-                | DriverAction::BindStagedAccepted
                 | DriverAction::MarkCommittedAccepted
                 | DriverAction::StageRetained
                 | DriverAction::CommitRetained
                 | DriverAction::RecoverAccepted
-                | DriverAction::AcceptRetained
+                | DriverAction::MarkVerifiedAccepted
+                | DriverAction::FinalizeAccepted
                 | DriverAction::UninstallAccepted
+                | DriverAction::FinalizeUninstall
                 | DriverAction::RetireInactive
         ) {
             return Err(DriverError::InvalidContext);
@@ -1635,13 +1638,14 @@ impl<R: CommandRunner> DriverTool<R> {
         }
         let action_name = match action {
             DriverAction::RecordAccepted => "record",
-            DriverAction::BindStagedAccepted => "bind-staged",
             DriverAction::MarkCommittedAccepted => "mark-committed",
             DriverAction::StageRetained => "stage-retained",
             DriverAction::CommitRetained => "commit-retained",
             DriverAction::RecoverAccepted => "recover",
-            DriverAction::AcceptRetained => "accept-retained",
+            DriverAction::MarkVerifiedAccepted => "mark-verified",
+            DriverAction::FinalizeAccepted => "finalize",
             DriverAction::UninstallAccepted => "uninstall",
+            DriverAction::FinalizeUninstall => "finalize-uninstall",
             DriverAction::RetireInactive => "retire-inactive",
             _ => unreachable!("accepted protocol action was validated"),
         };
@@ -1669,19 +1673,72 @@ impl<R: CommandRunner> DriverTool<R> {
         Ok(())
     }
 
-    pub fn prepare_and_stage(&self) -> Result<(), DriverError> {
+    pub fn prepare_accepted_protocol(
+        &self,
+        candidate: &DriverPostconditions,
+    ) -> Result<(), DriverError> {
+        if candidate.kernel_release != self.context.kernel_release
+            || candidate.module_file != "hyperpixel2r_kms.ko"
+            || !is_lower_hex(&candidate.source_revision, 40)
+            || !is_lower_hex(&candidate.manifest_sha256, 64)
+            || !is_lower_hex(&candidate.module_sha256, 64)
+            || !is_lower_hex(&candidate.overlay_sha256, 64)
+            || candidate.overlay_file
+                != format!("hyperpixel2r-kms-{}.dtbo", &candidate.source_revision[..12])
+        {
+            return Err(DriverError::InvalidContext);
+        }
+        let arguments = vec![
+            self.source
+                .join("scripts/accepted-lifecycle.sh")
+                .to_string_lossy()
+                .into_owned(),
+            "--target".into(),
+            self.context.target.clone(),
+            "--action".into(),
+            "prepare-new".into(),
+            "--driver-version".into(),
+            candidate.driver_version.clone(),
+            "--source-revision".into(),
+            candidate.source_revision.clone(),
+            "--kernel-release".into(),
+            candidate.kernel_release.clone(),
+            "--manifest-sha256".into(),
+            candidate.manifest_sha256.clone(),
+            "--module-file".into(),
+            candidate.module_file.clone(),
+            "--module-sha256".into(),
+            candidate.module_sha256.clone(),
+            "--overlay-file".into(),
+            candidate.overlay_file.clone(),
+            "--overlay-sha256".into(),
+            candidate.overlay_sha256.clone(),
+        ];
+        self.execute(DriverAction::PrepareAccepted, arguments)?;
+        Ok(())
+    }
+
+    pub fn prepare_artifacts(&self) -> Result<(), DriverError> {
         match self.plan {
             DriverPlan::Prebuilt { .. } => {
                 self.run(DriverAction::ExportKernel)?;
-                self.run(DriverAction::StageTryboot)?;
             }
             DriverPlan::CrossBuild { .. } => {
                 self.run(DriverAction::ExportKernel)?;
                 self.run(DriverAction::Build)?;
-                self.run(DriverAction::StageTryboot)?;
             }
         }
         Ok(())
+    }
+
+    pub fn stage_prepared(&self) -> Result<(), DriverError> {
+        self.run(DriverAction::StageTryboot)?;
+        Ok(())
+    }
+
+    pub fn prepare_and_stage(&self) -> Result<(), DriverError> {
+        self.prepare_artifacts()?;
+        self.stage_prepared()
     }
 
     pub fn cleanup_legacy_planeradar(&self) -> Result<(), DriverError> {
@@ -1728,14 +1785,17 @@ impl<R: CommandRunner> DriverTool<R> {
             DriverAction::CommitBoot => "commit-boot.sh",
             DriverAction::RollbackBoot => "rollback-boot.sh",
             DriverAction::RecordAccepted
-            | DriverAction::BindStagedAccepted
+            | DriverAction::PrepareAccepted
             | DriverAction::MarkCommittedAccepted
             | DriverAction::StageRetained
             | DriverAction::CommitRetained
             | DriverAction::RecoverAccepted
-            | DriverAction::AcceptRetained
+            | DriverAction::MarkVerifiedAccepted
+            | DriverAction::FinalizeAccepted
             | DriverAction::UninstallAccepted => "accepted-lifecycle.sh",
-            DriverAction::RetireInactive => "accepted-lifecycle.sh",
+            DriverAction::FinalizeUninstall | DriverAction::RetireInactive => {
+                "accepted-lifecycle.sh"
+            }
             DriverAction::Uninstall => "uninstall.sh",
         };
         let script = self.source.join("scripts").join(script);
@@ -1792,23 +1852,27 @@ impl<R: CommandRunner> DriverTool<R> {
                 ]);
             }
             DriverAction::RecordAccepted
-            | DriverAction::BindStagedAccepted
+            | DriverAction::PrepareAccepted
             | DriverAction::MarkCommittedAccepted
             | DriverAction::StageRetained
             | DriverAction::CommitRetained
             | DriverAction::RecoverAccepted
-            | DriverAction::AcceptRetained
+            | DriverAction::MarkVerifiedAccepted
+            | DriverAction::FinalizeAccepted
             | DriverAction::UninstallAccepted
+            | DriverAction::FinalizeUninstall
             | DriverAction::RetireInactive => {
                 let action_name = match action {
                     DriverAction::RecordAccepted => "record",
-                    DriverAction::BindStagedAccepted => "bind-staged",
+                    DriverAction::PrepareAccepted => "prepare-new",
                     DriverAction::MarkCommittedAccepted => "mark-committed",
                     DriverAction::StageRetained => "stage-retained",
                     DriverAction::CommitRetained => "commit-retained",
                     DriverAction::RecoverAccepted => "recover",
-                    DriverAction::AcceptRetained => "accept-retained",
+                    DriverAction::MarkVerifiedAccepted => "mark-verified",
+                    DriverAction::FinalizeAccepted => "finalize",
                     DriverAction::UninstallAccepted => "uninstall",
+                    DriverAction::FinalizeUninstall => "finalize-uninstall",
                     DriverAction::RetireInactive => "retire-inactive",
                     _ => unreachable!("accepted driver action classification"),
                 };
@@ -1816,6 +1880,7 @@ impl<R: CommandRunner> DriverTool<R> {
                 if matches!(
                     action,
                     DriverAction::RecordAccepted
+                        | DriverAction::PrepareAccepted
                         | DriverAction::StageRetained
                         | DriverAction::UninstallAccepted
                         | DriverAction::RetireInactive
