@@ -22,7 +22,7 @@
 - Run repository-defined tool and build commands through mise.
 - Use GitButler for all version-control writes on `rpi-port`; do not use `git commit`.
 - Do not push or promote the candidate into permanent normal boot in this plan.
-- The Pi target is `shayne@planeradar.local`, AArch64 release `6.18.34+rpt-rpi-v8`.
+- The Pi target is `pi@raspberrypi.local`, AArch64 release `6.18.34+rpt-rpi-v8`.
 - `/boot/firmware/config.txt` must remain byte-identical to `/boot/firmware/config.txt.task6-baseline.20260727T003128Z.bak` at SHA-256 `d237a211ad67b941f2c36e08917984143d256793f1aaf348cf7ee4249df7dbeb`.
 
 ---
@@ -353,7 +353,7 @@ Pi.
 Run:
 
 ```bash
-ssh -o BatchMode=yes -o ConnectTimeout=8 shayne@planeradar.local '
+ssh -o BatchMode=yes -o ConnectTimeout=8 pi@raspberrypi.local '
   set -eu
   sudo systemctl stop planeradar-gesture-acceptance.service 2>/dev/null || true
   test "$(sudo sha256sum /boot/firmware/config.txt | cut -d" " -f1)" = \
@@ -412,7 +412,7 @@ Then verify:
 ```bash
 revision="$(git rev-parse HEAD)"
 prefix="${revision:0:12}"
-ssh -o BatchMode=yes -o ConnectTimeout=8 shayne@planeradar.local "
+ssh -o BatchMode=yes -o ConnectTimeout=8 pi@raspberrypi.local "
   set -eu
   sudo cmp -s \
     /boot/firmware/config.txt \
@@ -446,13 +446,13 @@ Run:
 
 ```bash
 revision="$(git rev-parse HEAD)"
-ssh -o BatchMode=yes -o ConnectTimeout=8 shayne@planeradar.local "
+ssh -o BatchMode=yes -o ConnectTimeout=8 pi@raspberrypi.local "
   set -eu
   sudo rm -f /var/lib/planeradar/debug.png
   sudo systemd-run \
     --unit=planeradar-gesture-acceptance \
     --collect \
-    --uid=shayne \
+    --uid=pi \
     --property=StateDirectory=planeradar \
     --property=StateDirectoryMode=0750 \
     --property=AmbientCapabilities=CAP_NET_BIND_SERVICE \

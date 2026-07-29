@@ -14,7 +14,7 @@ uploads complete 480×480 frames and converts touch events; ADS-B and settings
 HTTP each use one worker thread with immutable snapshots in a narrow shared
 model. `mise` pins every development tool and drives native checks, an ARM64
 Debian 13 container build on this Mac, checksummed deployment, and repeated
-end-to-end checks on `shayne@planeradar.local`.
+end-to-end checks on `pi@raspberrypi.local`.
 
 **Tech Stack:** Rust 1.97.1, Rust 2024, mise 2026.7.7+, SDL2 2.32, tiny-skia,
 fontdue, qrcode, ureq with rustls, tiny_http, serde, cargo-nextest, cargo-deny,
@@ -44,7 +44,7 @@ Docker/OrbStack, systemd, Raspberry Pi DRM/KMS, GitButler, and GitHub Actions.
 - `mise run build-pi` refuses an uncommitted workspace, builds in a pinned ARM64
   Debian 13 container, and emits an ELF/checksum/revision bundle under `dist/`.
 - Every hardware checkpoint cross-builds on this Mac, deploys the checksummed
-  artifact to `shayne@planeradar.local`, and exercises the real screen or target
+  artifact to `pi@raspberrypi.local`, and exercises the real screen or target
   service before dependent work continues.
 - A failed hardware checkpoint is fixed by first adding an automated regression
   test in the responsible task.
@@ -490,7 +490,7 @@ but commit rpi-port -m "feat: add HyperPixel SDL probe"
 mise run build-pi
 mise run deploy-pi
 stage="$(cat dist/last-stage-path)"
-ssh -t shayne@planeradar.local \
+ssh -t pi@raspberrypi.local \
   "sudo '$stage/planeradar' configure-display \
    --boot-config /boot/firmware/config.txt"
 ```
@@ -502,10 +502,10 @@ when the command reports `changed`.
 - [ ] **Step 8: Run the physical probe and calibrate**
 
 ```bash
-ssh shayne@planeradar.local \
+ssh pi@raspberrypi.local \
   'cat /sys/class/drm/*/status; \
    for modes in /sys/class/drm/*/modes; do echo "$modes"; cat "$modes"; done'
-ssh -t shayne@planeradar.local \
+ssh -t pi@raspberrypi.local \
   "sudo env SDL_VIDEODRIVER=kmsdrm '$stage/planeradar' probe"
 ```
 
@@ -1262,7 +1262,7 @@ Expected: clean workspace, green checks, ARM64 artifact, remote version equal to
 
 ```bash
 stage="$(cat dist/last-stage-path)"
-ssh -t shayne@planeradar.local \
+ssh -t pi@raspberrypi.local \
   "sudo env SDL_VIDEODRIVER=kmsdrm \
    '$stage/planeradar' demo radar --seconds 45"
 ```
@@ -1274,7 +1274,7 @@ dot. Compare orientation with the inspected PNG.
 - [ ] **Step 3: Show and scan the setup fixture**
 
 ```bash
-ssh -t shayne@planeradar.local \
+ssh -t pi@raspberrypi.local \
   "sudo env SDL_VIDEODRIVER=kmsdrm \
    '$stage/planeradar' demo setup \
    --ip-url http://10.0.4.74 --seconds 60"
@@ -1695,9 +1695,9 @@ stage="$(cat dist/last-stage-path)"
 - [ ] **Step 2: Start the headless runtime on port 80**
 
 ```bash
-ssh shayne@planeradar.local \
+ssh pi@raspberrypi.local \
   "sudo systemd-run --unit=planeradar-checkpoint3 --collect \
-   --uid=shayne \
+   --uid=pi \
    --property=AmbientCapabilities=CAP_NET_BIND_SERVICE \
    --setenv=RUST_LOG=info \
    '$stage/planeradar' run --headless \
@@ -1724,7 +1724,7 @@ and `journalctl -u planeradar-checkpoint3` contains no query, result label,
 coordinates, token, or response body. Stop the transient unit with:
 
 ```bash
-ssh shayne@planeradar.local \
+ssh pi@raspberrypi.local \
   'sudo systemctl stop planeradar-checkpoint3.service'
 ```
 
@@ -1868,9 +1868,9 @@ mise run verify
 mise run build-pi
 mise run deploy-pi
 stage="$(cat dist/last-stage-path)"
-ssh shayne@planeradar.local \
+ssh pi@raspberrypi.local \
   "sudo systemd-run --unit=planeradar-checkpoint4 --collect \
-   --uid=shayne \
+   --uid=pi \
    --property=AmbientCapabilities=CAP_NET_BIND_SERVICE \
    --setenv=SDL_VIDEODRIVER=kmsdrm \
    --setenv=RUST_LOG=info \
@@ -1899,7 +1899,7 @@ the display changes to waiting/radar without restarting.
 Before disabling networking, schedule restoration:
 
 ```bash
-ssh shayne@planeradar.local \
+ssh pi@raspberrypi.local \
   'sudo systemd-run --unit=planeradar-network-restore \
      --on-active=45s /usr/bin/nmcli networking on && \
    sudo nmcli networking off'
@@ -1916,8 +1916,8 @@ and inspect at original size. Confirm the capture orientation and layout match
 the physical panel and approved golden:
 
 ```bash
-scp "shayne@planeradar.local:$stage/debug.png" /tmp/planeradar-debug.png
-ssh shayne@planeradar.local \
+scp "pi@raspberrypi.local:$stage/debug.png" /tmp/planeradar-debug.png
+ssh pi@raspberrypi.local \
   'sudo systemctl stop planeradar-checkpoint4.service'
 ```
 
@@ -2057,7 +2057,7 @@ but commit rpi-port -m "feat: install Plane Radar system service"
 mise run build-pi
 mise run deploy-pi
 stage="$(cat dist/last-stage-path)"
-ssh -t shayne@planeradar.local \
+ssh -t pi@raspberrypi.local \
   "sudo '$stage/planeradar' install \
    --artifact '$stage/planeradar' \
    --checksum-file '$stage/planeradar.sha256' \
@@ -2067,7 +2067,7 @@ ssh -t shayne@planeradar.local \
 Reboot only if reported. Then:
 
 ```bash
-ssh shayne@planeradar.local \
+ssh pi@raspberrypi.local \
   'systemctl is-enabled planeradar; \
    systemctl is-active planeradar; \
    systemctl show planeradar \
@@ -2194,7 +2194,7 @@ Run the Task 17 installer from the new stage. Assert:
 ```bash
 git rev-parse rpi-port
 cat dist/planeradar.revision
-ssh shayne@planeradar.local \
+ssh pi@raspberrypi.local \
   'cat /opt/planeradar/REVISION; \
    sha256sum /opt/planeradar/bin/planeradar; \
    systemctl is-active planeradar'
@@ -2238,7 +2238,7 @@ but diff
 mise run verify
 git rev-parse rpi-port
 cat dist/planeradar.revision
-ssh shayne@planeradar.local \
+ssh pi@raspberrypi.local \
   'cat /opt/planeradar/REVISION; systemctl is-active planeradar'
 ```
 

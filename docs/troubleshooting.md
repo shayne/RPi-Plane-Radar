@@ -1,46 +1,99 @@
 # Troubleshooting
 
-Start with the service, health, and current-boot logs:
+Start from the Mac:
 
 ```sh
-systemctl is-enabled planeradar
-systemctl is-active planeradar
-systemctl status planeradar --no-pager --full
-curl --fail -H 'Host: planeradar.local' http://127.0.0.1/healthz
-sudo journalctl -b -u planeradar --no-pager
-systemctl --failed
+mise run status -- user@host
+mise run doctor -- user@host
+mise run doctor -- user@host --json
 ```
 
-Normal logs intentionally omit location, place searches, aircraft responses,
-form bodies, session values, and CSRF tokens. Treat settings files and debug
-frames as private data when collecting diagnostics.
+`status` is concise. `doctor` is deliberately picky: the app revision and
+hash, driver release, kernel, module, overlay, service, renderer, touch, HTTP,
+and mDNS all need to describe the same accepted installation. "Most of it is
+green" is how boot drift gets promoted into normal state.
 
-## Build cannot reach Docker or OrbStack
+If installation or a lifecycle command stopped halfway through, rerun the same
+command before doing manual repair. See [Recovery](recovery.md).
 
-`mise run build-pi` needs a running Docker-compatible Buildx engine:
+## The controller cannot reach the Pi
+
+Confirm that the target text is the account you created in Raspberry Pi
+Imager, followed by the current hostname or IP:
 
 ```sh
+mise run status -- pi@raspberrypi.local
+```
+
+Plane Radar accepts `user@hostname` or `user@IPv4`, uses batch-mode OpenSSH for
+probes, and requires the existing public-key login. It does not accept a URL,
+password, or an SSH option disguised as a hostname.
+
+If the installer already changed the hostname, try the desired `.local` name.
+During resume the controller probes both the original and desired names, then
+accepts only the host whose key, model, and serial match its durable record.
+
+For a changed host key, stop and confirm the physical Pi before editing
+`known_hosts`. A reimaged SD card is a new target, not a continuation of the
+old transaction.
+
+## Preflight rejects the Mac
+
+The supported host is macOS 14 or newer with Git, mise, OpenSSH, GitHub CLI,
+and a Docker Buildx engine. Check the tools:
+
+```sh
+mise install
+gh auth status
 docker info
 docker buildx ls
+```
+
+OrbStack users can also check:
+
+```sh
 orbctl status
 orbctl start
 ```
 
-The build also refuses a dirty tracked workspace because its revision must
-identify the exact source archive:
+The controller needs 16 GiB of free Mac disk for verified downloads, extracted
+payloads, target kernel context, and a fallback driver build. Its private cache
+is `~/.cache/planeradar`.
+
+## Preflight rejects the Pi
+
+The accepted target is Raspberry Pi Zero 2 W, 64-bit Raspberry Pi OS Lite
+Trixie, ARM64, `multi-user.target`, `/boot/firmware`, working tryboot, correct
+system time, reachable package repositories, port 80 free, matching kernel
+headers, 2 GiB free on `/`, and 128 MiB free on `/boot/firmware`.
+
+A desktop image fails because its display manager competes for the same DRM
+device. Debian 12 fails because it is not the accepted OS. A different Pi may
+be perfectly capable and still outside the tested recovery contract.
+
+The installer adds required runtime and build packages, but it does not run
+`apt full-upgrade`. If the installed headers do not match the running kernel,
+reboot into the already installed kernel first or install the matching headers
+through normal Raspberry Pi OS administration.
+
+## The display is blank or corrupted
+
+Run:
 
 ```sh
-but status
-git diff --check
+mise run doctor -- user@host
 ```
 
-Install the pinned tools with `mise install`. On Linux, install
-`libsdl2-dev` and `pkg-config` before native checks. Do not copy a host-native
-binary to the Pi; the verified artifact must report `ARM aarch64`.
+Look for a kernel mismatch, module mismatch, overlay mismatch, wrong DRM
+device, wrong mode, or wrong renderer. The accepted runtime is one DPI
+connector at 480×480, SDL `KMSDRM`, and renderer `opengles2`.
 
-## Display is blank or wrongly rotated
+When SSH still works, these read-only target probes can separate scanout from
+application failure. Start a Pi shell, then run the probes there:
 
-Check the KMS connector and service renderer:
+```sh
+ssh user@host
+```
 
 ```sh
 for status in /sys/class/drm/*/status; do
@@ -51,57 +104,61 @@ for modes in /sys/class/drm/*/modes; do
   printf '%s:\n' "$modes"
   cat "$modes"
 done
-sudo journalctl -b -u planeradar --no-pager |
-  grep -E 'SDL display ready|SDL failure|kmsdrm|opengles2'
+systemctl show planeradar -p ActiveState -p SubState -p NRestarts
+sudo journalctl -b -u planeradar --no-pager
 ```
 
-The accepted result is one connected DPI connector with a 480×480 mode and a
-readiness line containing `video_driver=KMSDRM` (case may vary) and
-`render_driver=opengles2`.
+Do not edit the normal boot configuration to experiment. The external driver
+uses revisioned artifacts and one-shot tryboot precisely so an incorrect
+candidate does not become the default. Use
+[driver recovery](https://github.com/shayne/hyperpixel2r-kms/blob/main/docs/operations.md).
 
-Do not experiment directly in the normal boot configuration. The custom panel
-driver uses revisioned overlays and a one-shot tryboot acceptance flow. Follow
-[the HyperPixel runbook](hardware/hyperpixel2r-driver.md) for rotation,
-driver rebuilds, kernel upgrades, commit, or rollback. Supported calibration
-parameters are `rotate=0|90|180|270`, `touchscreen-inverted-x`,
-`touchscreen-inverted-y`, and `touchscreen-swapped-x-y`; test one change at a
-time.
+## Touch does not respond or points the wrong way
 
-## Touch does not respond or axes are wrong
+`doctor` reports whether the expected touch device exists. For lower-level
+inspection, start a Pi shell:
 
-Identify the bound FT5x06 input device:
+```sh
+ssh user@host
+```
+
+Then run:
 
 ```sh
 cat /proc/bus/input/devices
-readlink -f /sys/class/input/event0/device
 udevadm info --query=property --name=/dev/input/event0
 sudo evtest /dev/input/event0
 ```
 
-The device ancestry should descend from the bound `hyperpixel2r-kms` platform
-device, whose Device Tree `compatible` value is
-`shayne,hyperpixel2r-kms`, and its X/Y axes should span the native 0–479
-surface. Confirm the service account and device policy:
+The FT5x06 device should descend from the bound `hyperpixel2r-kms` platform
+device and span native coordinates 0–479. The service account needs the
+`input` supplementary group and its systemd device policy must allow
+`char-input r`.
+
+If raw coordinates are right but a gesture is ignored, motion beyond 18 pixels
+cancels a tap. A long press must remain continuous for three seconds, and its
+release is consumed. That last rule prevents one hold from also changing
+range.
+
+## The local URL does not resolve
+
+The installed hostname determines the `.local` URL. With the default:
 
 ```sh
-id planeradar
-systemctl show planeradar \
-  -p User -p SupplementaryGroups -p DevicePolicy -p DeviceAllow
+open http://planeradar.local
 ```
 
-The unit should use `video render input`, `DevicePolicy=closed`,
-`DeviceAllow=char-drm rw`, and `DeviceAllow=char-input r`. Device-path
-wildcards are not valid systemd device allow rules.
+The Mac and Pi must share a multicast-capable LAN. The installer enables
+Avahi, but it does not change Wi-Fi or router policy. Use the numeric
+`http://<ip-address>` printed on the round display when mDNS is unavailable.
 
-If raw coordinates are correct but the UI action is not, remember that motion
-beyond 18 pixels cancels a tap and a long press must remain continuous for
-three seconds. Releasing a completed long press intentionally causes no second
-tap.
+Start a Pi shell:
 
-## `planeradar.local` does not resolve
+```sh
+ssh user@host
+```
 
-The installer enables Avahi, but the client and Pi must be on the same
-multicast-capable LAN:
+Then check hostname, Avahi, and routing:
 
 ```sh
 hostname
@@ -111,33 +168,43 @@ ip route
 getent hosts planeradar.local
 ```
 
-Use the `http://<ip-address>` shown on the round display when `.local` is not
-available. Plane Radar does not repair Wi-Fi or change network configuration;
-fix networking through Raspberry Pi OS.
-
-Requests sent directly to `127.0.0.1` need an allowed Host header:
+Requests to loopback require an accepted Host header:
 
 ```sh
 curl --fail -H 'Host: planeradar.local' http://127.0.0.1/healthz
 ```
 
-## Port 80 is already in use
+## Port 80 is occupied
+
+Plane Radar binds port 80 with `CAP_NET_BIND_SERVICE`; it does not run the
+whole application as root.
+
+```sh
+ssh user@host
+```
+
+On that Pi shell:
 
 ```sh
 sudo ss -ltnp '( sport = :80 )'
-sudo systemctl status planeradar --no-pager
+systemctl status planeradar --no-pager
 ```
 
-Stop or reconfigure the conflicting service. Plane Radar binds port 80 with
-only `CAP_NET_BIND_SERVICE`; do not run the whole application as root.
+Stop or reconfigure the conflicting service, then resume the original install.
 
-## Radar says `WAITING FOR NETWORK`
+## The radar waits for network
 
-This state means a location is saved but the current location has not produced
-one successful ADS-B response since startup or a location change.
+`WAITING FOR NETWORK` means a location is saved but the current location has
+not received one successful ADS-B response since startup or the latest
+location change.
 
 ```sh
-curl --fail -H 'Host: planeradar.local' http://127.0.0.1/healthz
+ssh user@host
+```
+
+On that Pi shell:
+
+```sh
 ip route
 getent ahosts opendata.adsb.fi
 timedatectl status
@@ -145,92 +212,91 @@ sudo journalctl -b -u planeradar --no-pager
 ```
 
 Check routing, DNS, system time, CA certificates, and upstream availability.
-The client uses HTTPS-only bounded requests. It retries with backoff and wakes
-immediately after a settings change.
+The ADS-B client uses HTTPS-only bounded requests. It backs failures off and
+wakes immediately after a settings change.
 
-## Radar says `DATA STALE`
-
-After 30 seconds without fresh data, the last valid aircraft remain visible
-with a stale notice. This is intentional. Check the same route/DNS/time items
-above. Fresh data automatically clears the notice; restarting or deleting
-settings is not required.
+`DATA STALE` is different. It appears after 30 seconds without fresh traffic
+and keeps the last valid aircraft visible. Fresh data clears it; deleting
+settings does not help.
 
 ## Place search fails
 
-The page keeps manual latitude/longitude entry available whenever Nominatim
-search fails. Check system time, CA certificates, DNS, and access to
+Manual latitude and longitude remain available when Nominatim is unavailable.
+Check time, CA certificates, DNS, and access to
 `nominatim.openstreetmap.org`.
 
-Search misses are rate-limited to one request start per 1.05 seconds.
-Successful results are cached privately for seven days. An empty result is not
-an application error; try a more specific place name or enter coordinates
+Search misses begin at least 1.05 seconds apart. Successful results are cached
+privately for seven days, and no more than five are returned. An empty result
+is not an application failure; use a more specific place or enter coordinates
 manually.
 
-## Settings file is invalid
+## Settings are invalid
 
-Invalid JSON, unknown fields, schema versions other than 1, out-of-range
-coordinates, and range indices outside 0–3 are rejected rather than silently
-replaced. The service may enter its restart policy until the file is repaired.
+The settings parser rejects unknown fields, unsupported schema versions,
+out-of-range coordinates, and range indices outside 0–3. Preserve a private
+copy before removing a bad file. Start a Pi shell:
 
-Preserve a private root-only copy, remove the invalid live file, and let the
-application return to mandatory setup:
+```sh
+ssh user@host
+```
+
+Then stop the service, preserve the file, and reset only settings:
 
 ```sh
 sudo systemctl stop planeradar
-sudo install -m 0600 -o root -g root \
-  /var/lib/planeradar/settings.json /root/planeradar-settings.invalid.json
+sudo install -m 0600 -o root -g root /var/lib/planeradar/settings.json /root/planeradar-settings.invalid.json
 sudo rm /var/lib/planeradar/settings.json
 sudo systemctl start planeradar
 ```
 
-Open the QR URL and save a new location. Do not paste the backup into public
-issues or logs.
+The display returns to mandatory QR setup. Do not paste the backup into a
+public issue.
 
-## Service installation or permissions fail
+## Capture the logical frame
 
-Verify the installed types, owners, modes, unit syntax, and artifact identity:
+Use the controller:
 
 ```sh
+mise run screenshot -- user@host --output planeradar-debug.png
+```
+
+It records prior metadata, asks systemd to send SIGUSR1, and waits for the
+`planeradar` service to write a new service-owned regular frame. A privileged
+helper validates that source and publishes a root-private snapshot. The
+controller rejects stale or unsafe bytes and decodes exact 480×480 8-bit RGBA
+before replacing the local destination.
+
+The capture is the logical renderer output, not a framebuffer scrape. If it is
+correct while the panel is wrong, look below the renderer at KMS, the overlay,
+or the panel driver. If both are wrong, look at application rendering.
+
+The image may contain live callsigns. Keep it private unless you have reviewed
+and redacted it.
+
+## Service restarts or permissions drift
+
+```sh
+ssh user@host
+```
+
+On that Pi shell:
+
+```sh
+systemctl show planeradar -p MainPID -p ActiveState -p SubState -p NRestarts
 sudo systemd-analyze verify /etc/systemd/system/planeradar.service
 sudo stat -c '%a %U:%G %n' \
   /opt/planeradar/bin/planeradar \
   /opt/planeradar/REVISION \
   /opt/planeradar/SHA256 \
-  /var/lib/planeradar \
-  /var/lib/planeradar/settings.json
+  /var/lib/planeradar
 sudo sha256sum /opt/planeradar/bin/planeradar
-sudo cat /opt/planeradar/REVISION
-sudo cat /opt/planeradar/SHA256
 ```
 
-Expected modes are 0755 for the binary, 0644 for provenance and the unit, 0750
-for the state directory, and 0600 for settings. The installer refuses symlink
-or special-file destinations rather than following them.
+The binary is root-owned mode 0755; provenance and the unit are mode 0644;
+application state is private; installer and lifecycle records are root-owned
+mode 0600. Symlinks and special-file destinations are refused.
 
-Re-run the exact staged installer to repair supported content or mode drift.
-It verifies all source sidecars again and reports whether anything changed.
-
-## Capture and inspect the logical frame
-
-```sh
-sudo rm -f /var/lib/planeradar/debug.png
-sudo systemctl kill --signal=SIGUSR1 planeradar
-sudo file /var/lib/planeradar/debug.png
-sudo sha256sum /var/lib/planeradar/debug.png
-```
-
-The file must be a fresh decodable 480×480 RGBA PNG. It represents the logical
-renderer output and helps separate drawing defects from physical orientation
-or scanout defects. It can contain live callsigns.
-
-## Check journal privacy and restart loops
-
-```sh
-systemctl show planeradar -p MainPID -p NRestarts -p SubState
-sudo journalctl -b -u planeradar --no-pager
-```
-
-Repeated renderer, permission, settings, or bind errors are not normal. Avoid
-sharing raw settings or frames. Before publishing a diagnostic excerpt, verify
-that it contains no coordinates, place/query text, aircraft response data,
-cookies, CSRF values, form bodies, or other local identifiers.
+Normal logs omit coordinates, place searches, aircraft payloads, form bodies,
+session values, and CSRF tokens. Still review any excerpt before sharing it.
+Private state and screenshots do not become public merely because a command
+called them diagnostics.

@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::fs;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use semver::Version;
@@ -11,6 +12,7 @@ use crate::cli::{Cli, Command, MutatingOptions, UninstallOptions};
 pub const DEFAULT_HOSTNAME: &str = "planeradar";
 pub const DRIVER_REPOSITORY: &str = "https://github.com/shayne/hyperpixel2r-kms";
 pub const DRIVER_LIFECYCLE_PROTOCOL: &str = "accepted-driver-v2";
+const MAX_PROMPT_TARGET_BYTES: usize = 255;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Environment {
@@ -167,6 +169,48 @@ impl InstallConfig {
     }
 }
 
+pub fn resolve_missing_mutating_target(
+    config: &mut InstallConfig,
+    stdin_is_terminal: bool,
+    input: &mut dyn Read,
+    output: &mut dyn Write,
+) -> Result<(), ConfigError> {
+    if config.target.is_some() {
+        return Ok(());
+    }
+    if config.non_interactive || !stdin_is_terminal {
+        return Err(ConfigError::TargetRequired);
+    }
+
+    output
+        .write_all(b"SSH target (user@host): ")
+        .and_then(|()| output.flush())
+        .map_err(|error| ConfigError::TargetPromptIo { error })?;
+    let mut bytes = Vec::with_capacity(64);
+    loop {
+        let mut byte = [0_u8; 1];
+        let read = input
+            .read(&mut byte)
+            .map_err(|error| ConfigError::TargetPromptIo { error })?;
+        if read == 0 || byte[0] == b'\n' {
+            break;
+        }
+        if bytes.len() == MAX_PROMPT_TARGET_BYTES {
+            return Err(ConfigError::TargetPromptTooLong);
+        }
+        bytes.push(byte[0]);
+    }
+    if bytes.last() == Some(&b'\r') {
+        bytes.pop();
+    }
+    let target = String::from_utf8(bytes).map_err(|_| ConfigError::TargetPromptNonUnicode)?;
+    if target.is_empty() {
+        return Err(ConfigError::TargetRequired);
+    }
+    config.target = Some(target);
+    Ok(())
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DriverLock {
     pub repository: String,
@@ -295,6 +339,17 @@ pub enum ConfigError {
     InvalidVersion { value: String },
     #[error("this command does not use install configuration")]
     NonMutatingCommand,
+    #[error("target is required as user@host or PLANERADAR_PI_TARGET")]
+    TargetRequired,
+    #[error("could not read or write the target prompt")]
+    TargetPromptIo {
+        #[source]
+        error: std::io::Error,
+    },
+    #[error("target prompt exceeds 255 bytes")]
+    TargetPromptTooLong,
+    #[error("target prompt is not valid Unicode")]
+    TargetPromptNonUnicode,
 }
 
 #[derive(Debug, Error)]

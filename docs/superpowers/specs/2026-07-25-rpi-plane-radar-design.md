@@ -244,7 +244,7 @@ dynamic dependencies with `readelf`, and writes the artifact and checksum under
 
 The cross-build task refuses to produce a deployable artifact from an
 uncommitted workspace. `mise run deploy-pi` transfers the checksummed artifact,
-installer payload, and recorded revision to `shayne@planeradar.local`. The Pi
+installer payload, and recorded revision to `pi@raspberrypi.local`. The Pi
 does not need `mise`, Cargo, Rust, Docker, or build headers in production.
 
 Real-target validation is incremental rather than deferred until the end. The

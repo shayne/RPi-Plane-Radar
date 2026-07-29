@@ -35,12 +35,11 @@ run = './scripts/package-release.sh "$@"'
 [tasks.validate-release-metadata]
 run = './scripts/validate-release-metadata.sh "$@"'
 
+[tasks.docs-check]
+run = "cargo test --locked --test docs_contract"
+
 [tasks.readme-commands]
-run = '''
-set -euo pipefail
-test -f README.md
-grep -q 'mise install' README.md
-'''
+depends = ["docs-check"]
 
 [tasks.install]
 run = 'cargo run --locked -p planeradarctl -- install "$@"'

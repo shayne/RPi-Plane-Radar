@@ -212,7 +212,7 @@ Using the stage path recorded in Step 9, run:
 
 ```bash
 stage="$(cat dist/last-stage-path)"
-ssh shayne@planeradar.local "'${stage}/planeradar' demo radar --seconds 60"
+ssh pi@raspberrypi.local "'${stage}/planeradar' demo radar --seconds 60"
 ```
 
 Expected on the HyperPixel: true black edge-to-edge background, unchanged radar diameter and projected positions, visibly lighter whole-pixel text/symbols/strokes, and no blank frame. Acceptance requires the user's physical visual review.

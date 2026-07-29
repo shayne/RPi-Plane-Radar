@@ -26,7 +26,7 @@ Raspberry Pi `tryboot`, systemd, mise, and GitButler.
 - The approved design in
   `docs/superpowers/specs/2026-07-26-hyperpixel-kms-touch-driver-design.md`
   is authoritative.
-- The initial hardware target is `shayne@planeradar.local`, Raspberry Pi Zero
+- The initial hardware target is `pi@raspberrypi.local`, Raspberry Pi Zero
   2 W, AArch64 kernel `6.18.34+rpt-rpi-v8`; every build must rediscover and
   compare the live release instead of assuming it remained unchanged.
 - Preserve the currently working normal boot declaration
@@ -542,7 +542,7 @@ Expected: FAIL because no driver artifact bundle exists.
 - [ ] **Step 2: Implement exact target export**
 
 `scripts/export-pi-kernel-build.sh` uses
-`${PLANERADAR_PI_TARGET:-shayne@planeradar.local}` and:
+`${PLANERADAR_PI_TARGET:-pi@raspberrypi.local}` and:
 
 1. reads `uname -r` and requires `uname -m` to equal `aarch64`;
 2. resolves `/lib/modules/<release>/build`;
@@ -813,7 +813,7 @@ Run:
 ```bash
 mise run export-pi-kernel-build
 mise run build-hyperpixel-driver
-release="$(ssh shayne@planeradar.local uname -r)"
+release="$(ssh pi@raspberrypi.local uname -r)"
 PLANERADAR_DRIVER_ARTIFACT_DIR="dist/hyperpixel/$release" \
   mise exec -- cargo test --test driver_artifacts
 mise run check-hyperpixel-artifacts
@@ -869,7 +869,7 @@ applied DTB exists.
 Run:
 
 ```bash
-release="$(ssh shayne@planeradar.local uname -r)"
+release="$(ssh pi@raspberrypi.local uname -r)"
 PLANERADAR_DRIVER_ARTIFACT_DIR="dist/hyperpixel/$release" \
   mise exec -- cargo test --test driver_artifacts
 ```
@@ -989,7 +989,7 @@ Add overlay checksum, filename, and applied-DTB filename to the manifest, then:
 ```bash
 mise run build-hyperpixel-driver
 mise run check-hyperpixel-artifacts
-release="$(ssh shayne@planeradar.local uname -r)"
+release="$(ssh pi@raspberrypi.local uname -r)"
 PLANERADAR_DRIVER_ARTIFACT_DIR="dist/hyperpixel/$release" \
   mise exec -- cargo test --test driver_artifacts
 ```
@@ -1233,7 +1233,7 @@ The verification script starts the staged app with:
 sudo systemd-run \
   --unit=planeradar-hyperpixel-checkpoint \
   --collect \
-  --uid=shayne \
+  --uid=pi \
   --property=AmbientCapabilities=CAP_NET_BIND_SERVICE \
   --setenv=SDL_VIDEODRIVER=kmsdrm \
   --setenv=SDL_RENDER_DRIVER=opengles2 \
@@ -1332,7 +1332,7 @@ but commit rpi-port -m "feat: stage HyperPixel driver with tryboot"
 - [ ] **Step 1: Capture the recoverable baseline**
 
 ```bash
-ssh shayne@planeradar.local '
+ssh pi@raspberrypi.local '
   set -eu
   test "$(uname -m)" = aarch64
   grep -Fx "dtoverlay=vc4-kms-dpi-hyperpixel2r" /boot/firmware/config.txt
@@ -1364,7 +1364,7 @@ same source revision, and the module targets the live kernel release.
 
 ```bash
 mise run stage-hyperpixel-tryboot
-ssh shayne@planeradar.local '
+ssh pi@raspberrypi.local '
   set -eu
   grep -Fx "dtoverlay=vc4-kms-dpi-hyperpixel2r" /boot/firmware/config.txt
   grep -E "^dtoverlay=planeradar-hyperpixel2r-[0-9a-f]{12}$" \
@@ -1378,7 +1378,7 @@ custom overlay.
 - [ ] **Step 4: Enter one-shot tryboot**
 
 ```bash
-ssh shayne@planeradar.local "sudo reboot '0 tryboot'" || true
+ssh pi@raspberrypi.local "sudo reboot '0 tryboot'" || true
 ```
 
 Poll SSH with three-second connection timeouts. If SSH never returns or the
@@ -1398,7 +1398,7 @@ input present, SDL accelerated, app healthy, and bounded shutdown.
 Identify the input device:
 
 ```bash
-ssh shayne@planeradar.local '
+ssh pi@raspberrypi.local '
   for name in /sys/class/input/event*/device/name; do
     if grep -Eiq "EDT|FT5" "$name"; then
       basename "$(dirname "$(dirname "$name")")"
@@ -1483,7 +1483,7 @@ accepts display appearance, tap, long press, and touch orientation.
 
 ```bash
 mise run commit-hyperpixel-boot
-ssh shayne@planeradar.local '
+ssh pi@raspberrypi.local '
   set -eu
   grep -E "^dtoverlay=planeradar-hyperpixel2r-[0-9a-f]{12}$" \
     /boot/firmware/config.txt
@@ -1499,7 +1499,7 @@ stock declaration.
 - [ ] **Step 2: Reboot normally and repeat automated verification**
 
 ```bash
-ssh shayne@planeradar.local 'sudo reboot' || true
+ssh pi@raspberrypi.local 'sudo reboot' || true
 ./scripts/verify-hyperpixel-boot.sh --expect-normal
 ```
 
@@ -1518,7 +1518,7 @@ Ask the user to remove and restore power once. After boot:
 
 ```bash
 ./scripts/verify-hyperpixel-boot.sh --expect-normal
-ssh shayne@planeradar.local 'systemctl --failed --no-legend'
+ssh pi@raspberrypi.local 'systemctl --failed --no-legend'
 ```
 
 Expected: SSH, 480×480 KMS, V3D, touch input, HTTP, and Plane Radar all return
@@ -1536,7 +1536,7 @@ operator command remains:
 
 ```bash
 mise run rollback-hyperpixel-boot
-ssh shayne@planeradar.local 'sudo reboot'
+ssh pi@raspberrypi.local 'sudo reboot'
 ```
 
 - [ ] **Step 6: Finalize documentation and Task 16 evidence**

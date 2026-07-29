@@ -11,10 +11,11 @@ use jsonschema::Draft;
 use planeradarctl::{
     DriverLock,
     release::{
-        APP_REPOSITORY, Architecture, Artifact, ArtifactKind, DownloadRequest, GhReleaseSource,
-        Platform, ReleaseClient, ReleaseError, ReleaseInput, ReleaseManifest, ReleaseSource,
-        ReleaseSourceError, ResolvedArtifact, ResolvedRelease, StreamingCommandRunner,
-        SupportedTarget, SystemStreamingCommandRunner, Verifier,
+        APP_REPOSITORY, Architecture, Artifact, ArtifactKind, DownloadRequest,
+        GhLatestStableReleaseResolver, GhReleaseSource, Platform, ReleaseClient, ReleaseError,
+        ReleaseInput, ReleaseManifest, ReleaseSource, ReleaseSourceError, ResolvedArtifact,
+        ResolvedRelease, StreamingCommandRunner, SupportedTarget, SystemStreamingCommandRunner,
+        Verifier,
     },
     transport::{CommandOutput, CommandRunner, Invocation, RunnerError},
 };
@@ -33,6 +34,140 @@ fn lock() -> DriverLock {
 
 fn requested(version: &str) -> Version {
     Version::parse(version).expect("test version")
+}
+
+struct ReleaseViewRunner {
+    output: Mutex<Option<Result<CommandOutput, RunnerError>>>,
+    invocations: Mutex<Vec<Invocation>>,
+}
+
+impl ReleaseViewRunner {
+    fn output(status: i32, stdout: impl Into<Vec<u8>>) -> Self {
+        Self {
+            output: Mutex::new(Some(Ok(CommandOutput::new(
+                status,
+                stdout.into(),
+                Vec::new(),
+            )))),
+            invocations: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn runner_error() -> Self {
+        Self {
+            output: Mutex::new(Some(Err(RunnerError::Failed))),
+            invocations: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+impl CommandRunner for &ReleaseViewRunner {
+    fn run(&self, invocation: Invocation) -> Result<CommandOutput, RunnerError> {
+        self.invocations
+            .lock()
+            .expect("release view invocations")
+            .push(invocation);
+        self.output
+            .lock()
+            .expect("release view output")
+            .take()
+            .expect("one release view invocation")
+    }
+}
+
+#[test]
+fn latest_stable_resolver_uses_one_exact_bounded_release_view() {
+    let runner = ReleaseViewRunner::output(
+        0,
+        br#"{"tagName":"v1.2.3","isDraft":false,"isPrerelease":false}"#.as_slice(),
+    );
+
+    let resolved = GhLatestStableReleaseResolver::new(&runner)
+        .resolve()
+        .expect("latest stable release");
+
+    assert_eq!(resolved, requested("1.2.3"));
+    let invocations = runner.invocations.lock().expect("release view invocations");
+    let [invocation] = invocations.as_slice() else {
+        panic!("expected one release view invocation");
+    };
+    assert_eq!(invocation.program(), "gh");
+    assert_eq!(
+        invocation.arguments(),
+        [
+            "release",
+            "view",
+            "-R",
+            "shayne/RPi-Plane-Radar",
+            "--json",
+            "tagName,isDraft,isPrerelease",
+        ]
+    );
+    assert_eq!(
+        invocation.timeout(),
+        Some(std::time::Duration::from_secs(15))
+    );
+    assert_eq!(invocation.stdout_limit(), Some(1024));
+}
+
+#[test]
+fn latest_stable_resolver_rejects_nonstable_noncanonical_and_unbounded_output() {
+    let oversized = vec![b'x'; 1025];
+    let cases = [
+        (
+            "draft",
+            ReleaseViewRunner::output(
+                0,
+                br#"{"tagName":"v1.2.3","isDraft":true,"isPrerelease":false}"#.as_slice(),
+            ),
+        ),
+        (
+            "prerelease",
+            ReleaseViewRunner::output(
+                0,
+                br#"{"tagName":"v1.2.3-rc.1","isDraft":false,"isPrerelease":true}"#.as_slice(),
+            ),
+        ),
+        (
+            "malformed tag",
+            ReleaseViewRunner::output(
+                0,
+                br#"{"tagName":"1.2.3","isDraft":false,"isPrerelease":false}"#.as_slice(),
+            ),
+        ),
+        (
+            "noncanonical tag",
+            ReleaseViewRunner::output(
+                0,
+                br#"{"tagName":"v01.2.3","isDraft":false,"isPrerelease":false}"#.as_slice(),
+            ),
+        ),
+        (
+            "trailing JSON",
+            ReleaseViewRunner::output(
+                0,
+                br#"{"tagName":"v1.2.3","isDraft":false,"isPrerelease":false}{}"#.as_slice(),
+            ),
+        ),
+        ("oversized output", ReleaseViewRunner::output(0, oversized)),
+        (
+            "nonzero command",
+            ReleaseViewRunner::output(
+                1,
+                br#"{"tagName":"v1.2.3","isDraft":false,"isPrerelease":false}"#.as_slice(),
+            ),
+        ),
+        ("runner error", ReleaseViewRunner::runner_error()),
+    ];
+
+    for (name, runner) in cases {
+        assert!(
+            GhLatestStableReleaseResolver::new(&runner)
+                .resolve()
+                .is_err(),
+            "{name} must be rejected"
+        );
+    }
 }
 
 fn valid_value() -> Value {

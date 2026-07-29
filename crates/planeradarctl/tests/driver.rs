@@ -695,7 +695,7 @@ fn resolved_driver_plan_drives_the_exact_prebuilt_and_crossbuild_command_sequenc
             prebuilt_runner.clone(),
             &probe("6.18.34+rpt-rpi-v8"),
             DriverContext {
-                target: "shayne@planeradar.local".into(),
+                target: "pi@raspberrypi.local".into(),
                 kernel_release: "6.18.34+rpt-rpi-v8".into(),
                 kernel_export: PathBuf::from("/cache/kernel"),
                 artifacts: PathBuf::from("/cache/artifacts"),
@@ -736,7 +736,7 @@ fn resolved_driver_plan_drives_the_exact_prebuilt_and_crossbuild_command_sequenc
             crossbuild_runner.clone(),
             &probe(new_kernel),
             DriverContext {
-                target: "shayne@planeradar.local".into(),
+                target: "pi@raspberrypi.local".into(),
                 kernel_release: new_kernel.into(),
                 kernel_export: PathBuf::from("/cache/kernel"),
                 artifacts: PathBuf::from("/cache/artifacts"),
@@ -1317,7 +1317,7 @@ fn release_verification_preserves_bounded_nonzero_and_spawn_diagnostics() {
 #[test]
 fn lifecycle_tools_preserve_bounded_nonzero_and_spawn_diagnostics() {
     let context = DriverContext {
-        target: "shayne@planeradar.local".into(),
+        target: "pi@raspberrypi.local".into(),
         kernel_release: "6.18.34+rpt-rpi-v8".into(),
         kernel_export: PathBuf::from("/cache/kernel"),
         artifacts: PathBuf::from("/cache/artifacts"),
@@ -1442,7 +1442,7 @@ fn typed_actions_invoke_only_the_exact_external_driver_scripts_and_parse_verific
             source: PathBuf::from("/cache/source"),
         },
         DriverContext {
-            target: "shayne@planeradar.local".into(),
+            target: "pi@raspberrypi.local".into(),
             kernel_release: "6.18.34+rpt-rpi-v8".into(),
             kernel_export: PathBuf::from("/cache/kernel"),
             artifacts: PathBuf::from("/cache/artifacts"),
@@ -1503,7 +1503,7 @@ fn typed_actions_invoke_only_the_exact_external_driver_scripts_and_parse_verific
             invocation
                 .arguments()
                 .windows(2)
-                .any(|pair| pair == ["--target", "shayne@planeradar.local"]),
+                .any(|pair| pair == ["--target", "pi@raspberrypi.local"]),
             "target was not passed as a separate argument"
         );
     }
@@ -1528,7 +1528,7 @@ fn typed_actions_invoke_only_the_exact_external_driver_scripts_and_parse_verific
         [
             "/cache/source/scripts/verify-boot.sh",
             "--target",
-            "shayne@planeradar.local",
+            "pi@raspberrypi.local",
             "--expect-tryboot",
             "--expect-driver-version",
             "0.1.0",
@@ -1549,7 +1549,7 @@ fn accepted_driver_protocol_actions_are_typed_exact_and_bounded() {
             source: PathBuf::from("/cache/source"),
         },
         DriverContext {
-            target: "shayne@planeradar.local".into(),
+            target: "pi@raspberrypi.local".into(),
             kernel_release: "6.18.34+rpt-rpi-v8".into(),
             kernel_export: PathBuf::from("/cache/kernel"),
             artifacts: PathBuf::from("/cache/artifacts"),
@@ -1606,7 +1606,7 @@ fn accepted_driver_protocol_actions_are_typed_exact_and_bounded() {
             invocation
                 .arguments()
                 .windows(2)
-                .any(|pair| pair == ["--target", "shayne@planeradar.local"])
+                .any(|pair| pair == ["--target", "pi@raspberrypi.local"])
         );
     }
     assert!(
@@ -1650,7 +1650,7 @@ fn verify_boot_rejects_json_for_a_different_locked_driver_version() {
             source: PathBuf::from("/cache/source"),
         },
         DriverContext {
-            target: "shayne@planeradar.local".into(),
+            target: "pi@raspberrypi.local".into(),
             kernel_release: "6.18.34+rpt-rpi-v8".into(),
             kernel_export: PathBuf::from("/cache/kernel"),
             artifacts: PathBuf::from("/cache/artifacts"),
@@ -1670,7 +1670,7 @@ fn verify_boot_rejects_json_for_a_different_locked_driver_version() {
         [
             "/cache/source/scripts/verify-boot.sh",
             "--target",
-            "shayne@planeradar.local",
+            "pi@raspberrypi.local",
             "--expect-tryboot",
             "--expect-driver-version",
             "0.1.0",
@@ -1691,7 +1691,7 @@ fn normal_boot_verification_keeps_the_same_locked_candidate_identity() {
             source: PathBuf::from("/cache/source"),
         },
         DriverContext {
-            target: "shayne@planeradar.local".into(),
+            target: "pi@raspberrypi.local".into(),
             kernel_release: "6.18.34+rpt-rpi-v8".into(),
             kernel_export: PathBuf::from("/cache/kernel"),
             artifacts: PathBuf::from("/cache/artifacts"),
@@ -1709,7 +1709,7 @@ fn normal_boot_verification_keeps_the_same_locked_candidate_identity() {
         [
             "/cache/source/scripts/verify-boot.sh",
             "--target",
-            "shayne@planeradar.local",
+            "pi@raspberrypi.local",
             "--expect-normal",
             "--expect-driver-version",
             "0.1.0",
@@ -1730,7 +1730,7 @@ fn legacy_cleanup_uses_the_locked_overlay_through_the_existing_uninstall_action(
             source: PathBuf::from("/cache/source"),
         },
         DriverContext {
-            target: "shayne@planeradar.local".into(),
+            target: "pi@raspberrypi.local".into(),
             kernel_release: "6.18.34+rpt-rpi-v8".into(),
             kernel_export: PathBuf::from("/cache/kernel"),
             artifacts: PathBuf::from("/cache/artifacts"),
@@ -1749,7 +1749,7 @@ fn legacy_cleanup_uses_the_locked_overlay_through_the_existing_uninstall_action(
         [
             "/cache/source/scripts/uninstall.sh",
             "--target",
-            "shayne@planeradar.local",
+            "pi@raspberrypi.local",
             "--cleanup-legacy-planeradar",
             "--expect-overlay-file",
             "hyperpixel2r-kms-ca95ffeb30b3.dtbo",

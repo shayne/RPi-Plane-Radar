@@ -18,7 +18,7 @@
 - All tool and build commands run through mise where the repository defines a mise task or tool.
 - All version-control writes use GitButler on `rpi-port`; do not use `git commit`.
 - Do not push, commit the permanent boot configuration, or weaken the recovery path in this plan.
-- The Pi target is `shayne@planeradar.local`, AArch64 release `6.18.34+rpt-rpi-v8`.
+- The Pi target is `pi@raspberrypi.local`, AArch64 release `6.18.34+rpt-rpi-v8`.
 - `/boot/firmware/config.txt` must remain byte-identical to `/boot/firmware/config.txt.task6-baseline.20260727T003128Z.bak` at SHA-256 `d237a211ad67b941f2c36e08917984143d256793f1aaf348cf7ee4249df7dbeb`.
 
 ---
@@ -334,7 +334,7 @@ build or touch the Pi until both reviews approve the exact commit.
 Run:
 
 ```bash
-ssh -o BatchMode=yes -o ConnectTimeout=8 shayne@planeradar.local '
+ssh -o BatchMode=yes -o ConnectTimeout=8 pi@raspberrypi.local '
   set -eu
   sudo systemctl stop planeradar-gesture-acceptance.service 2>/dev/null || true
   test "$(sha256sum /boot/firmware/config.txt | cut -d" " -f1)" = \
@@ -393,7 +393,7 @@ Then run:
 ```bash
 revision="$(git rev-parse HEAD)"
 prefix="${revision:0:12}"
-ssh -o BatchMode=yes -o ConnectTimeout=8 shayne@planeradar.local "
+ssh -o BatchMode=yes -o ConnectTimeout=8 pi@raspberrypi.local "
   set -eu
   cmp -s \
     /boot/firmware/config.txt \
@@ -416,7 +416,7 @@ Run:
 
 ```bash
 ssh -o BatchMode=yes -o ConnectTimeout=8 \
-  shayne@planeradar.local "sudo reboot '0 tryboot'"
+  pi@raspberrypi.local "sudo reboot '0 tryboot'"
 ```
 
 Poll in the same terminal until SSH returns:
@@ -424,7 +424,7 @@ Poll in the same terminal until SSH returns:
 ```bash
 for attempt in $(seq 1 80); do
   if ssh -o BatchMode=yes -o ConnectTimeout=3 -o ConnectionAttempts=1 \
-    shayne@planeradar.local 'cat /proc/sys/kernel/random/boot_id'
+    pi@raspberrypi.local 'cat /proc/sys/kernel/random/boot_id'
   then
     break
   fi
@@ -443,13 +443,13 @@ Run:
 
 ```bash
 revision="$(git rev-parse HEAD)"
-ssh -o BatchMode=yes -o ConnectTimeout=8 shayne@planeradar.local "
+ssh -o BatchMode=yes -o ConnectTimeout=8 pi@raspberrypi.local "
   set -eu
   sudo rm -f /var/lib/planeradar/debug.png
   sudo systemd-run \
     --unit=planeradar-gesture-acceptance \
     --collect \
-    --uid=shayne \
+    --uid=pi \
     --property=StateDirectory=planeradar \
     --property=StateDirectoryMode=0750 \
     --property=AmbientCapabilities=CAP_NET_BIND_SERVICE \
@@ -471,7 +471,7 @@ Poll `/healthz` until it reports the exact revision and `RADAR`.
 Run:
 
 ```bash
-ssh -o BatchMode=yes -o ConnectTimeout=8 shayne@planeradar.local '
+ssh -o BatchMode=yes -o ConnectTimeout=8 pi@raspberrypi.local '
   sudo systemctl kill \
     --kill-whom=main \
     --signal=SIGUSR1 \
@@ -483,7 +483,7 @@ ssh -o BatchMode=yes -o ConnectTimeout=8 shayne@planeradar.local '
   exit 1
 '
 scp -q -o BatchMode=yes -o ConnectTimeout=8 \
-  shayne@planeradar.local:/var/lib/planeradar/debug.png \
+  pi@raspberrypi.local:/var/lib/planeradar/debug.png \
   .superpowers/sdd/2026-07-26-hyperpixel-kms-touch-driver/live-radar-transparent-text.png
 ```
 

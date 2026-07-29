@@ -35,6 +35,71 @@ pub const MAX_CONTROL_ARTIFACT_SIZE: u64 = 16 * 1024 * 1024;
 pub const MAX_ARTIFACTS: usize = 64;
 pub const MAX_ARTIFACT_NAME_BYTES: usize = 128;
 
+const LATEST_STABLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+const MAX_LATEST_STABLE_BYTES: usize = 1024;
+
+pub struct GhLatestStableReleaseResolver<R> {
+    runner: R,
+}
+
+impl<R> GhLatestStableReleaseResolver<R> {
+    pub fn new(runner: R) -> Self {
+        Self { runner }
+    }
+}
+
+impl<R: CommandRunner> GhLatestStableReleaseResolver<R> {
+    pub fn resolve(&self) -> Result<Version, ReleaseError> {
+        let output = self
+            .runner
+            .run(
+                Invocation::new(
+                    "gh",
+                    vec![
+                        "release".into(),
+                        "view".into(),
+                        "-R".into(),
+                        APP_REPOSITORY.into(),
+                        "--json".into(),
+                        "tagName,isDraft,isPrerelease".into(),
+                    ],
+                )
+                .with_timeout(LATEST_STABLE_TIMEOUT)
+                .with_stdout_limit(MAX_LATEST_STABLE_BYTES),
+            )
+            .map_err(|_| ReleaseError::LatestStableResolutionFailed)?;
+        if output.status() != 0 || output.stdout().len() > MAX_LATEST_STABLE_BYTES {
+            return Err(ReleaseError::LatestStableResolutionFailed);
+        }
+        let release: LatestStableRelease = serde_json::from_slice(output.stdout())
+            .map_err(|_| ReleaseError::LatestStableResolutionFailed)?;
+        if release.is_draft || release.is_prerelease {
+            return Err(ReleaseError::LatestStableResolutionFailed);
+        }
+        let version_text = release
+            .tag_name
+            .strip_prefix('v')
+            .ok_or(ReleaseError::LatestStableResolutionFailed)?;
+        let version =
+            Version::parse(version_text).map_err(|_| ReleaseError::LatestStableResolutionFailed)?;
+        if !version.pre.is_empty() || format!("v{version}") != release.tag_name {
+            return Err(ReleaseError::LatestStableResolutionFailed);
+        }
+        Ok(version)
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LatestStableRelease {
+    #[serde(rename = "tagName")]
+    tag_name: String,
+    #[serde(rename = "isDraft")]
+    is_draft: bool,
+    #[serde(rename = "isPrerelease")]
+    is_prerelease: bool,
+}
+
 const SUPPORTED_MODEL: &str = "Raspberry Pi Zero 2 W";
 const SUPPORTED_DISPLAY: &str = "HyperPixel 2.1 Round";
 const SUPPORTED_OS: &str = "Raspberry Pi OS Lite Trixie (64-bit)";
@@ -825,6 +890,8 @@ pub enum ReleaseError {
     ArtifactDigestMismatch,
     #[error("release verification failed")]
     VerificationFailed,
+    #[error("latest stable release resolution failed")]
+    LatestStableResolutionFailed,
     #[error("release source failed")]
     Source(#[source] ReleaseSourceError),
     #[error("release filesystem operation failed")]

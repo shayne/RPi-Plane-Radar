@@ -2,7 +2,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::io;
-use std::io::{Read, Write};
+use std::io::{IsTerminal, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
@@ -24,7 +24,7 @@ use nix::{
 use planeradarctl::{
     DriverLock,
     cli::{Cli, Command, DriverCommand},
-    config::{Environment, InstallConfig},
+    config::{Environment, InstallConfig, resolve_missing_mutating_target},
     driver::{
         DriverAction, DriverContext, DriverManager, DriverTool, GhDriverReleaseSource,
         GhDriverReleaseVerifier, TargetProbe as DriverTargetProbe,
@@ -50,9 +50,9 @@ use planeradarctl::{
     },
     target::{SshTarget, TargetIdentity},
     transport::{
-        Clock, CommandRunner as TransportCommandRunner, Invocation, OpenSshTransport,
-        ReconnectPolicy, RemoteCommand, SystemClock, SystemCommandRunner, Transport,
-        TransportConfig, TransportError,
+        Clock, CommandRunner as TransportCommandRunner, OpenSshTransport, ReconnectPolicy,
+        RemoteCommand, SystemClock, SystemCommandRunner, Transport, TransportConfig,
+        TransportError,
     },
 };
 use semver::Version;
@@ -146,7 +146,15 @@ fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
     }
     if cli.command.is_mutating() {
         let command = cli.command.clone();
-        let config = InstallConfig::resolve(cli, environment)?;
+        let mut config = InstallConfig::resolve(cli, environment)?;
+        let stdin = io::stdin();
+        let stdin_is_terminal = stdin.is_terminal();
+        resolve_missing_mutating_target(
+            &mut config,
+            stdin_is_terminal,
+            &mut stdin.lock(),
+            &mut io::stderr(),
+        )?;
         match command {
             Command::Install(_) => run_install(config),
             Command::Upgrade(_) => run_lifecycle_target(config, "upgrade"),
@@ -816,42 +824,9 @@ impl<R: TransportCommandRunner, C: Clock> SystemLifecycleBackend<R, C> {
     }
 
     fn latest_release_version(&self) -> Result<Version, LifecycleError> {
-        let output = TransportCommandRunner::run(
-            &SystemCommandRunner,
-            Invocation::new(
-                "gh",
-                vec![
-                    "release".into(),
-                    "list".into(),
-                    "-R".into(),
-                    planeradarctl::release::APP_REPOSITORY.into(),
-                    "--limit".into(),
-                    "100".into(),
-                    "--json".into(),
-                    "tagName,isDraft".into(),
-                ],
-            ),
-        )
-        .map_err(|_| LifecycleError::Backend)?;
-        if output.status() != 0 || output.stdout().len() > 64 * 1024 {
-            return Err(LifecycleError::Backend);
-        }
-        #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct ReleaseRow {
-            #[serde(rename = "tagName")]
-            tag_name: String,
-            #[serde(rename = "isDraft")]
-            is_draft: bool,
-        }
-        let rows: Vec<ReleaseRow> =
-            serde_json::from_slice(output.stdout()).map_err(|_| LifecycleError::Backend)?;
-        rows.into_iter()
-            .filter(|row| !row.is_draft)
-            .filter_map(|row| row.tag_name.strip_prefix('v').map(str::to_owned))
-            .filter_map(|version| Version::parse(&version).ok())
-            .max()
-            .ok_or(LifecycleError::Backend)
+        planeradarctl::release::GhLatestStableReleaseResolver::new(SystemCommandRunner)
+            .resolve()
+            .map_err(|_| LifecycleError::Backend)
     }
 
     fn release_version(&self, requested: Option<&Version>) -> Result<Version, LifecycleError> {
@@ -1933,7 +1908,7 @@ fn run_install(config: InstallConfig) -> Result<(), Box<dyn std::error::Error>> 
         })?;
     let cache_root = home.join(".cache").join("planeradar");
     ensure_private_cache_root(&cache_root)?;
-    let version = requested_version(&config)?;
+    let version = requested_version(&config, SystemCommandRunner)?;
     let release_input = config
         .release_dir
         .as_deref()
@@ -2179,16 +2154,16 @@ fn resume_state_matches(
             == (persisted.phase >= InstallPhase::DriverReady).then(|| driver.clone())
 }
 
-fn requested_version(config: &InstallConfig) -> Result<Version, Box<dyn std::error::Error>> {
+fn requested_version<R: TransportCommandRunner>(
+    config: &InstallConfig,
+    runner: R,
+) -> Result<Version, Box<dyn std::error::Error>> {
     if let Some(version) = &config.version {
         return Ok(version.clone());
     }
-    let release_directory = config.release_dir.as_deref().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "an exact --version or verified --release-dir is required",
-        )
-    })?;
+    let Some(release_directory) = config.release_dir.as_deref() else {
+        return Ok(planeradarctl::release::GhLatestStableReleaseResolver::new(runner).resolve()?);
+    };
     let manifest_bytes = fs::read(release_directory.join(MANIFEST_NAME))?;
     let manifest_value: serde_json::Value = serde_json::from_slice(&manifest_bytes)?;
     let version_text = manifest_value
@@ -2362,7 +2337,7 @@ mod tests {
     use std::process::Command as SystemCommand;
     use std::rc::Rc;
 
-    use planeradarctl::config::DriverLock;
+    use planeradarctl::config::{DriverLock, InstallConfig};
     use planeradarctl::install::{ApplicationPayload, BackendFailure};
     use planeradarctl::operations::{ManagementHelper, ReleasePair};
     use planeradarctl::state::{
@@ -2377,15 +2352,16 @@ mod tests {
     use planeradarctl::transport::{
         CommandOutput, CommandRunner, Invocation, OpenSshTransport, RunnerError, TransportConfig,
     };
+    use semver::Version;
     use sha2::{Digest, Sha256};
 
     use super::{
-        DriverProtocolActions, InstallCandidateState, InstallPhase, InstallState,
+        DriverProtocolActions, InstallCandidateState, InstallPhase, InstallState, MANIFEST_NAME,
         SystemLifecycleBackend, TargetIdentity, TransportError, deploy_helper_command,
         final_reboot_command, finalize_lifecycle_uninstall_command,
-        preserve_lifecycle_helper_command, private_state_read_command, resume_state_matches,
-        retire_lifecycle_helper_command, select_candidate_index, tryboot_reboot_command,
-        worker_exit_code,
+        preserve_lifecycle_helper_command, private_state_read_command, requested_version,
+        resume_state_matches, retire_lifecycle_helper_command, select_candidate_index,
+        tryboot_reboot_command, worker_exit_code,
     };
 
     #[test]
@@ -2445,6 +2421,47 @@ mod tests {
                 .pop_front()
                 .ok_or(RunnerError::Failed)
         }
+    }
+
+    fn requested_version_config(
+        version: Option<Version>,
+        release_dir: Option<PathBuf>,
+    ) -> InstallConfig {
+        InstallConfig {
+            target: Some("pi@raspberrypi.local".into()),
+            hostname: "planeradar".into(),
+            version,
+            release_dir,
+            docker_context: None,
+            non_interactive: true,
+            purge_settings: false,
+        }
+    }
+
+    #[test]
+    fn exact_version_and_local_release_selectors_bypass_latest_stable_resolution() {
+        let runner = RecordingLifecycleRunner::default();
+        let explicit = requested_version_config(Some(Version::new(2, 3, 4)), None);
+        assert_eq!(
+            requested_version(&explicit, &runner).expect("explicit version"),
+            Version::new(2, 3, 4)
+        );
+
+        let temporary = tempfile::tempdir().expect("local release");
+        fs::write(
+            temporary.path().join(MANIFEST_NAME),
+            br#"{"version":"3.4.5"}"#,
+        )
+        .expect("local release manifest");
+        let local = requested_version_config(None, Some(temporary.path().into()));
+        assert_eq!(
+            requested_version(&local, &runner).expect("local version"),
+            Version::new(3, 4, 5)
+        );
+        assert!(
+            runner.invocations.borrow().is_empty(),
+            "explicit selectors invoked latest-stable resolution"
+        );
     }
 
     fn application_payload(root: &Path, bytes: &[u8]) -> ApplicationPayload {

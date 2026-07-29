@@ -1,24 +1,84 @@
 # Architecture
 
-Plane Radar is a single Rust process with explicit ownership boundaries around
-display I/O, mutable settings, network workers, and published state. The
-application is designed for a Raspberry Pi Zero 2 W, where predictable memory
-use, bounded work, and recoverable boot behavior matter more than framework
-flexibility.
+Plane Radar has three moving parts: a Mac control tool, a Raspberry Pi
+application, and a separately released HyperPixel kernel driver. Keeping them
+separate looks fussy until one of them fails. Then the boundary tells you
+whether you are repairing a download, a service, or a boot.
 
-## Runtime shape
+## The installation path
 
 ```mermaid
 flowchart LR
-    touch["Kernel touch input"] --> main["Main thread\nSDL events and rendering"]
+    mac["Mac<br/>mise + planeradarctl"] -->|"OpenSSH and scp"| pi["Pi Zero 2 W<br/>Raspberry Pi OS Lite"]
+    release["Attested Plane Radar release"] --> mac
+    driver["Locked hyperpixel2r-kms release"] --> mac
+    mac --> state["Mac transaction state"]
+    pi --> target["Target transaction and lifecycle state"]
+    pi --> app["planeradar.service"]
+    pi --> kms["DRM/KMS + touch driver"]
+    kms --> panel["HyperPixel 2.1 Round"]
+```
+
+`planeradarctl` resolves one application release and the exact driver identity
+in `driver.lock.toml`. Every source install checks checksums, manifests,
+repositories, commits, architectures, and release identity before copying
+anything to the Pi. Stable source installs additionally verify the GitHub
+release and runnable artifact attestations. Explicit source release candidates
+stop at the strict manifest, checksum, and identity boundary; the separate
+release bootstrap verifies release-candidate attestations before it executes
+the controller. OpenSSH receives argument vectors rather than an interpolated
+local shell command.
+
+The installer then advances through durable, verified phases:
+
+1. discover and bind the Pi's SSH host key, model, and serial;
+2. pass Mac and target preflight;
+3. acquire the application and driver;
+4. stage, boot, and verify the driver through one-shot tryboot;
+5. commit the accepted driver;
+6. install the application and service;
+7. change the hostname when requested;
+8. reboot and verify the complete system; and
+9. mark the transaction complete.
+
+A phase is written only after its postcondition succeeds. If the Mac process
+dies, the next run reads both sides and resumes only when target identity and
+artifact identity still agree. This is why removing a state file to "unstick"
+an install is usually the wrong move: the file is not debris. It is the proof
+of what already happened.
+
+## State and ownership
+
+| State | Location | Durability | Owner |
+| --- | --- | --- | --- |
+| Mac install transaction | `${XDG_STATE_HOME}/planeradar/installer/<host-key-sha256>/state.json`, otherwise `~/.local/state/planeradar/installer/<host-key-sha256>/state.json` | Until the transaction is superseded | Local user, mode 0600 |
+| Verified release and payload cache | `~/.cache/planeradar/` | Reusable, content-addressed | Local user, private directory |
+| Driver source cache for maintainers | `.cache/driver/` | Rebuildable and ignored | Local checkout |
+| Target install transaction | `/var/lib/planeradar-installer/state.json` | Through initial install | root, mode 0600 |
+| Target lifecycle history | `/var/lib/planeradar-installer/lifecycle.json` | Through upgrades, rollback, and uninstall | root, mode 0600 |
+| Management helpers and captures | `/var/lib/planeradar-installer/helpers/` and `/var/lib/planeradar-installer/captures/` | Transactional or diagnostic | root, private directories |
+| Accepted application payloads | `/opt/planeradar/releases/<version>/<sha256>/planeradar` | Current plus previous accepted pairs | root |
+| Active application | `/opt/planeradar/bin/planeradar` plus `REVISION` and `SHA256` | Until upgrade or uninstall | root |
+| Settings and geocode cache | `/var/lib/planeradar/settings.json` and `geocode-cache.json` | Preserved by default | `planeradar` service |
+| Debug frame | `/var/lib/planeradar/debug.png` | Replaced on request | `planeradar` service |
+| Driver acceptance state | `/var/lib/hyperpixel2r-kms/` and `/usr/lib/hyperpixel2r-kms/` | Kernel and driver-version specific | root |
+| Temporary uploads | `/var/tmp/planeradar-upload.*` | Disposable | SSH user creates staging; sudo consumes it |
+
+The lifecycle record contains an explicit owned-file manifest. Rollback and
+uninstall use that manifest; they do not guess with broad path globs.
+Settings are preserved unless the install originally created them and the
+user explicitly requests `--purge-settings`.
+
+## The Pi runtime
+
+```mermaid
+flowchart LR
+    touch["Kernel touch input"] --> main["Main thread<br/>SDL events and rendering"]
     kms["DRM/KMS + V3D"] <--> main
-    main --> gesture["Gesture recognizer"]
-    gesture --> settings["Serialized settings transaction"]
-    browser["LAN browser"] <--> web["Web accept thread\nbounded request workers"]
-    web --> settings
-    web --> geocoder["Serialized Nominatim client"]
+    browser["LAN browser"] <--> web["Bounded web workers"]
+    web --> settings["Serialized settings transaction"]
     settings --> file["Atomic settings.json"]
-    settings --> model["RuntimeModel\nimmutable snapshots"]
+    settings --> model["Immutable RuntimeSnapshot"]
     settings --> wake["ADS-B command channel"]
     adsb["ADS-B worker"] --> model
     wake --> adsb
@@ -26,193 +86,98 @@ flowchart LR
     model --> web
 ```
 
-The main thread owns SDL, the KMS presentation loop, both renderers, current
-frame retention, gesture recognition, and the visible application state. SDL
-objects never cross a thread boundary.
+The main thread owns SDL, rendering, gesture recognition, and visible
+application state. SDL objects never cross a thread boundary. A web accept
+thread serves settings and health, while one ADS-B worker fetches traffic.
+Web requests are bounded to 16 workers. Nominatim access is serialized because
+its rate clock and cache have one owner.
 
-`RuntimeCoordinator` creates two long-lived workers:
+`RuntimeModel` publishes a complete immutable snapshot behind an
+`Arc<RwLock<_>>`. Each snapshot contains settings, aircraft, timestamps, URLs,
+and a generation number. A renderer sees one point in time instead of half of
+one update and half of the next.
 
-- the web accept thread serves the local settings and health endpoints; and
-- the ADS-B worker fetches traffic for the current location and range.
+All browser and touch settings changes use one transaction:
 
-The web server may create up to 16 bounded per-request workers so a slow client
-cannot block health or another settings request. The Nominatim client is behind
-one mutex because its cache and request-rate clock have single-owner semantics.
+1. derive a candidate from the current snapshot;
+2. validate and atomically write it;
+3. publish the new snapshot; and
+4. wake the ADS-B worker.
 
-SIGINT and SIGTERM set a shared stop flag. The display loop coordinates worker
-shutdown and joins both long-lived workers before process exit.
+Old aircraft replies are discarded when their location or range no longer
+matches. Network errors keep the last good frame; after 30 seconds it gains a
+`DATA STALE` label.
 
-## Immutable publication
+## Display and touch
 
-`RuntimeModel` stores one `RuntimeSnapshot` behind an `Arc<RwLock<_>>`.
-Readers clone a complete snapshot containing settings, an `Arc<[Aircraft]>`,
-fetch timestamps, URLs, and a monotonically increasing generation. A renderer
-therefore sees one consistent point in time instead of fields updated
-independently.
+The external
+[hyperpixel2r-kms](https://github.com/shayne/hyperpixel2r-kms) platform driver
+owns the panel GPIO lifecycle and creates the FT5x06 input child. User space
+does not toggle panel GPIO or open raw I2C.
 
-ADS-B results and errors are conditionally published under the model write
-lock. The worker includes the location and range it queried; if settings
-changed while the request was in flight, that old result is discarded. A
-location change also clears the successful-fetch marker, while transient
-network errors retain the last good aircraft snapshot.
+SDL uses `kmsdrm` with the `opengles2` renderer and uploads a native 480×480
+RGBA frame. Static radar geometry is cached. Aircraft and text are drawn from
+bounded inputs, with transparent glyph backgrounds and a one-pixel outline on
+the range label. Integer pixel metrics keep the round display sharp.
 
-All settings updates—browser saves and touch-driven range changes—share one
-transaction mutex. The transaction:
+A tap advances range. Motion beyond 18 pixels cancels the tap. A continuous
+three-second hold opens settings, and its release is consumed so the range
+does not also change.
 
-1. derives a candidate from the latest model;
-2. validates and atomically persists it;
-3. publishes it to the model; and
-4. wakes the ADS-B worker.
+SIGUSR1 makes the unprivileged `planeradar` service write its current logical
+frame to the service-owned `/var/lib/planeradar/debug.png`. The privileged
+capture helper validates the source owner, group, mode, identity, and
+freshness, then publishes a root-private snapshot at
+`/var/lib/planeradar-installer/captures/current.png`. The controller copies
+that snapshot and decodes it locally as exact 480×480 8-bit RGBA. It does not
+scrape the framebuffer.
 
-No observer can interleave a second settings write inside that sequence.
+## Local web boundary
 
-## Application states
+The settings server listens on port 80 and accepts only the installed
+`http://<hostname>.local` authority and discovered numeric-IP authorities. The
+default hostname is `planeradar`; it is not compiled as universal truth.
 
-The visible state is derived from runtime facts plus the local settings-screen
-flag:
+Settings changes require an HttpOnly SameSite session cookie, a matching CSRF
+token, a valid Origin or Referer, the exact form content type, and a body no
+larger than 16 KiB. `/healthz` exposes only setup state, UI state, stale state,
+and application revision.
 
-| State | Condition |
-| --- | --- |
-| `SETUP_REQUIRED` | No saved location |
-| `WAITING_FOR_NETWORK` | Location exists, but the current location has no successful fetch |
-| `RADAR` | Current location has at least one successful response |
-| `SETTINGS` | A configured user opened the QR page with a long press |
+External ADS-B and geocoding requests use HTTPS with bounded DNS, connection,
+response, body, and overall timeouts. Normal logs omit coordinates, searches,
+aircraft payloads, form bodies, cookies, and CSRF values.
 
-Once radar has valid data, transient failures do not replace it with a setup
-screen. At 30 seconds the renderer adds `DATA STALE`; fresh data removes the
-notice.
+## Releases and the driver boundary
 
-## Display and rendering
+The application release contains an ARM64 Pi archive, native Apple Silicon and
+Intel control archives, `install.sh`, a strict manifest, checksums, and an SPDX
+SBOM. CI builds from an exact commit with normalized archive ownership and
+timestamps. GitHub release and artifact attestations bind the runnable files
+to that source. The source controller enforces those GitHub checks for stable
+releases; release-candidate source installs retain the manifest, checksum, and
+identity checks but skip the stable-only attestation policy. The release
+bootstrap verifies attestations for release candidates too.
 
-SDL is configured for the `kmsdrm` video backend and `opengles2` renderer. It
-uploads a native 480×480 logical RGBA frame to the KMS scanout path. The
-application redraws only when the model generation, visible state, or stale
-boundary changes, but retained frames remain presentable on every display
-tick.
+The kernel driver lives in its own GPL-2.0-only repository. Plane Radar does
+not vendor it or use a submodule. `driver.lock.toml` pins the repository,
+semantic version, full commit, release-manifest digest, and lifecycle protocol.
+An exact-kernel prebuilt archive is preferred; Docker cross-builds against the
+target kernel context when no matching archive exists.
 
-The Rust renderer uses integer pixel metrics and `tiny-skia`. Static radar
-geometry and runway labels are cached by the exact coordinate bits, range,
-units, and runway toggle. Each dynamic frame starts from that cache and draws
-aircraft, vectors, tags, and stale status. Aircraft and airport input are
-bounded before drawing. Text is painted last with transparent glyph
-backgrounds; only the range label receives a one-pixel shape outline.
-
-The setup renderer creates a medium-error-correction QR code for the URL
-derived from the installed hostname (or an explicit local-URL override). It
-uses the largest integer module scale that fits the circular safe region and
-preserves an exact four-module quiet zone.
-
-SIGUSR1 atomically saves the current logical frame to
-`/var/lib/planeradar/debug.png`; it does not scrape the physical framebuffer.
-
-## Touch boundary
-
-The custom kernel platform driver owns the HyperPixel panel GPIO lifecycle and
-creates the FT5x06 child input device. User space never toggles panel GPIO or
-opens a raw I2C bus.
-
-SDL normalizes press, motion, and release into logical 480×480 coordinates.
-The gesture recognizer accepts a tap only after a valid press/release, cancels
-after movement beyond 18 pixels, debounces releases, and emits one long press
-after a continuous three seconds. The release after a long press is consumed.
-
-## Settings schema and persistence
-
-`/var/lib/planeradar/settings.json` uses schema version 1:
-
-```json
-{
-  "schema_version": 1,
-  "location": {
-    "latitude": 40.7128,
-    "longitude": -74.006,
-    "label": "Selected place"
-  },
-  "units": "km",
-  "show_runways": true,
-  "range_index": 1
-}
-```
-
-`location` may be `null` before setup. Unknown fields, unsupported schema
-versions, non-finite or out-of-range coordinates, and range indices outside
-0–3 are rejected. Writes use a same-directory temporary file, `fsync`, atomic
-rename, and parent-directory `fsync`. The service owns the state directory at
-0750 and settings at 0600.
-
-## Network and privacy policy
-
-All external requests require HTTPS with WebPKI certificate validation and
-bounded DNS, connect, response, body, and global timeouts.
-
-The ADS-B worker:
-
-- requests the adsb.fi v3 endpoint with a radius derived from the visible
-  range;
-- accepts at most 64 aircraft;
-- starts successful requests at least three seconds apart; and
-- backs failures off through 3, 6, 12, 24, then 30 seconds.
-
-The Nominatim client:
-
-- sends the required identifying user agent;
-- starts cache misses at least 1.05 seconds apart;
-- returns no more than five results;
-- keeps successful results for seven days; and
-- atomically persists a bounded, schema-validated cache.
-
-The LAN server accepts only the current `.local` and discovered-IP authorities.
-Settings changes require a random HttpOnly, SameSite session cookie, matching
-CSRF token, valid Origin or Referer, exact form content type, and a body no
-larger than 16 KiB. `/healthz` intentionally returns only `configured`,
-`state`, `data_stale`, and `revision`.
-
-## Build and artifact provenance
-
-mise pins Rust, cargo-nextest, cargo-deny, and CMake. The application build
-requires a clean tracked source tree and archives the exact synthesized
-GitButler workspace `HEAD` into an isolated container context. Docker Buildx
-produces the ARM64 ELF, while the build script records:
-
-- the exact source revision;
-- the exact source tree;
-- a SHA-256 sidecar; and
-- dynamic-link metadata.
-
-The installer embeds the systemd unit and the same revision. Before any
-mutation it verifies the target model and OS, ELF architecture, artifact
-checksum, embedded revision, boot declaration, and input file types. Installed
-files are atomic and root-owned. Application state is preserved across
-updates.
-
-The HyperPixel module has a separate, stricter manifest binding kernel release,
-architecture, source revision/tree, base DTB, module vermagic/checksum, and
-revisioned overlay. See
-[HyperPixel driver operations](hardware/hyperpixel2r-driver.md).
+Driver activation is a boot transaction. The candidate lives in
+`tryboot.txt`, the Pi performs `reboot "0 tryboot"`, and automated probes check
+the module, overlay, DRM mode, touch, SDL driver, and renderer before the
+normal boot configuration is committed. If the trial does not return, the
+next power cycle falls back to the prior normal boot.
 
 ## Service boundary
 
-`planeradar.service` runs without a login as the `planeradar` system account.
-It receives only the `video`, `render`, and `input` supplementary groups and
-`CAP_NET_BIND_SERVICE`. The unit uses a read-only system view, private home and
-temporary directories, no new privileges, a closed device policy restricted
-to DRM and input character groups, an address-family allowlist, and one
-writable state directory. Failed processes restart after three seconds.
+`planeradar.service` runs as the `planeradar` system account with only the
+`video`, `render`, and `input` groups and `CAP_NET_BIND_SERVICE`. The unit uses
+a read-only system view, private home and temporary directories, no new
+privileges, a closed device policy limited to DRM and input character devices,
+an address-family allowlist, and one writable state directory.
 
-## Hardware acceptance gates
-
-Development used five explicit Pi checkpoints:
-
-1. **Display probe:** one connected native 480×480 KMS display with correct
-   physical orientation and a recoverable boot configuration.
-2. **Deterministic visuals:** approved radar and setup goldens reproduced on
-   the physical round panel; the setup QR scanned to the canonical local URL.
-3. **Headless runtime:** real LAN configuration, persistence, live ADS-B,
-   health privacy, and clean shutdown worked on the Pi.
-4. **Integrated application:** every UI state, tap/hold/release behavior,
-   stale-data retention, network recovery, and a real debug frame passed.
-5. **Permanent service:** verified installer idempotence, permissions,
-   unattended cold boot, hardware acceleration, and automatic crash recovery.
-
-Publication is gated on repeating final acceptance against the exact installed
-revision and checksum.
+The architecture is intentionally boring at the boundaries: verified bytes
+move forward, durable state says how far they got, and each owner removes only
+what it can prove belongs to it.

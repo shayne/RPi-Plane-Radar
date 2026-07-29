@@ -2,235 +2,197 @@
 
 [![Rust CI](https://github.com/shayne/RPi-Plane-Radar/actions/workflows/ci.yml/badge.svg)](https://github.com/shayne/RPi-Plane-Radar/actions/workflows/ci.yml)
 
-![Plane Radar showing live traffic](docs/images/radar.png)
+Plane Radar turns one very specific pile of hardware into a small, dedicated
+ADS-B radar: a Raspberry Pi Zero 2 W, a Pimoroni HyperPixel 2.1 Round, and
+64-bit Raspberry Pi OS Lite Trixie.
 
-Plane Radar turns a Raspberry Pi Zero 2 W and a Pimoroni HyperPixel 2.1 Round
-touchscreen into a dedicated, hardware-accelerated ADS-B radar. It has a native
-480×480 interface, a local settings page, touch gestures, airport runways,
-kilometre or mile ranges, and a hardened boot service.
+That narrow support statement is deliberate. This configuration has been
+tested on the physical display. Broader Pi, display, and OS support is not
+claimed. A stable release remains gated on the final history, exact-release,
+and clean-room acceptance work; until then, treat this as release-candidate
+software.
 
-The Raspberry Pi must already have working networking. Plane Radar never
-configures, resets, or manages Wi-Fi.
+Most of the implementation was built with substantial OpenAI Codex
+assistance. The commit history credits that work explicitly; maintainers still
+own the review and the hardware result.
 
-## Supported system
+![Plane Radar running on a Raspberry Pi Zero 2 W](docs/images/planeradar-radar.png)
 
-The tested product configuration is:
+## Install from a Mac
 
-- Raspberry Pi Zero 2 W;
-- Pimoroni HyperPixel 2.1 Round with touch, connected directly to the GPIO
-  header;
-- 64-bit Raspberry Pi OS based on Debian or Raspbian 12 or 13; and
-- the full KMS graphics stack with the repository's HyperPixel panel/touch
-  driver.
+The Pi must already boot, join Wi-Fi, and accept your SSH public key. Wi-Fi and SSH must already work. Plane Radar does not configure Wi-Fi.
 
-The installer deliberately rejects other boards, operating-system releases,
-non-AArch64 artifacts, mismatched checksums, and mismatched revisions. The
-accepted hardware-driver build and recovery procedure are documented in
-[the HyperPixel runbook](docs/hardware/hyperpixel2r-driver.md). Kernel upgrades
-must repeat that driver acceptance process before the new kernel is trusted.
-
-## What it displays
-
-- Live aircraft from the [adsb.fi open-data API](https://opendata.adsb.fi/).
-- Red heading symbols, magenta speed vectors, callsign/type/altitude labels,
-  and directional rim dots for traffic beyond the scope.
-- Nearby large-airport runways derived from
-  [OurAirports](https://ourairports.com/data/).
-- Four saved range presets, with labels in kilometres or miles.
-- A visible `DATA STALE` warning after 30 seconds without fresh traffic while
-  retaining the last good radar picture.
-
-The application polls successfully at most once every three seconds and uses
-bounded exponential backoff after failures. It does not put coordinates,
-search terms, aircraft data, form bodies, or security tokens in `/healthz` or
-normal logs.
-
-## Touch controls
-
-| Gesture | Result |
-| --- | --- |
-| Short tap on radar | Advance to the next saved range |
-| Hold for 3 seconds | Open the settings QR screen |
-| Tap the settings QR screen | Return to radar |
-| Tap before location setup | No action; setup remains mandatory |
-
-A long-press release is consumed, so it cannot also change the range.
-
-## First-run setup
-
-When no location is saved, the display shows a QR code and both available HTTP
-URLs:
-
-![First-run QR screen](docs/images/setup.png)
-
-Open `http://planeradar.local` or the displayed `http://<ip-address>` from a
-device on the same LAN. Search for a place using the OpenStreetMap Nominatim
-form, or enter latitude and longitude manually. The page also controls units,
-the runway overlay, and range. Saving writes one private settings file and the
-running display moves to radar as soon as the first ADS-B request succeeds.
-
-Browser geolocation is not requested. Search results are not saved unless the
-user selects one and submits the settings form.
-
-## Development environment
-
-The repository pins Rust and its development tools with
-[mise](https://mise.jdx.dev/). On macOS, the ARM64 build uses Docker Buildx;
-[OrbStack](https://orbstack.dev/) is a fast compatible runtime.
+On the Mac you need Git, [mise](https://mise.jdx.dev/), OpenSSH, the GitHub CLI (`gh`)
+with an active authenticated session, and Docker Desktop,
+[OrbStack](https://orbstack.dev/), or another Docker Buildx-compatible
+runtime. Check GitHub authentication with `gh auth status`. The supported
+install host is macOS.
 
 ```sh
 git clone https://github.com/shayne/RPi-Plane-Radar.git
 cd RPi-Plane-Radar
 mise install
+mise run install -- user@host
+```
+
+With no release selector, the controller resolves the latest stable release
+from GitHub and rejects drafts, prereleases, and malformed tags.
+`pi@raspberrypi.local` is a useful example, not an assumption about your Pi.
+With no command-line or `.env` target, an interactive terminal asks for one.
+`--non-interactive` fails instead of prompting. The installer asks for sudo on
+the Pi when it needs it. It verifies the Mac, the target, the application
+release, and the separately versioned display driver before changing either
+boot or service state.
+
+There is no stable release yet. While that remains true, select an immutable
+release candidate explicitly:
+
+```sh
+mise run install -- user@host --version 0.1.0-rc.N
+```
+
+The installer defaults the final hostname to `planeradar`. It may reboot once
+to test the display driver through Raspberry Pi tryboot and again after the
+hostname change. The transaction is saved after each verified phase, so rerun
+the same command if the Mac exits or a reboot outlasts the connection window.
+The boring state file is what makes that safe; guessing which step finished
+would not.
+
+Read [Installation](docs/install.md) before using a release candidate or a
+local release directory.
+
+## Configure the radar
+
+The first boot shows a QR code plus `http://planeradar.local` and the Pi's
+numeric `http://` URL. Open either URL from the same LAN, search for an address
+or enter coordinates, then choose units, runway visibility, and range.
+
+The location is stored only on the Pi. Plane Radar does not request browser
+geolocation, and it does not configure the network. A short tap advances the
+saved range. A three-second hold opens the QR screen; tapping that screen
+returns to the radar.
+
+## Operate it from the Mac
+
+These commands use the same `user@host` target and the SSH host identity saved
+during installation:
+
+```sh
+mise run status -- user@host
+mise run doctor -- user@host
+mise run doctor -- user@host --json
+mise run screenshot -- user@host --output planeradar-radar.png
+```
+
+`status` is the short answer. `doctor` compares the installed application,
+driver, kernel, display mode, renderer, touch device, service, HTTP endpoint,
+and mDNS result with the accepted release identities. `screenshot` asks the
+running renderer for a new 480×480 RGBA frame and refuses stale or unsafe
+files.
+
+The frame may contain live callsigns. Treat it as operational data, not a
+harmless decoration for an issue.
+
+## Upgrade, roll back, or remove it
+
+Choose immutable versions for changes:
+
+```sh
+mise run upgrade -- user@host --version 0.1.0-rc.N
+mise run rollback -- user@host
+mise run uninstall -- user@host
+mise run uninstall -- user@host --purge-settings
+```
+
+Application-only upgrades switch binaries atomically and do not reboot. A
+driver change uses the same one-shot tryboot, verification, and commit flow as
+the first install. Plane Radar keeps the current and previous two accepted
+application/driver pairs so a failed change has somewhere real to go back to.
+
+Plain `uninstall` removes installer-owned application and driver state but
+preserves settings. `--purge-settings` also removes the saved location and
+preferences. Both forms perform a mandatory normal reboot while removing the
+accepted display driver, then require an identity-bound reconnect before
+final cleanup. Expect SSH to disappear. If reconnect or cleanup is
+interrupted, retry the exact same uninstall command, including the original
+purge choice. Uninstall still does not own Wi-Fi, SSH, or unrelated boot
+lines.
+
+See [Upgrading](docs/upgrading.md) for version selection and
+[Recovery](docs/recovery.md) for interrupted installs, host-key changes,
+tryboot fallback, blank displays, and rollback.
+
+## Verified release bootstrap
+
+Release assets include `install.sh` for a fresh Mac that does not need a Rust
+build. Download it with GitHub CLI, then run it with a target:
+
+```sh
+gh release download v0.1.0-rc.N -R shayne/RPi-Plane-Radar --pattern install.sh --output planeradar-install.sh
+bash planeradar-install.sh --version 0.1.0-rc.N user@host
+```
+
+The bootstrap is macOS-only and requires `gh`. It resolves the immutable tag,
+checks GitHub release integrity, verifies checksums and attestations, selects
+the matching Apple Silicon or Intel control binary, and launches that verified
+binary. A curl-to-shell shortcut would skip the useful part, so this project
+does not recommend one.
+
+## What lives where
+
+The Mac keeps private controller state under
+`${XDG_STATE_HOME}/planeradar/installer` or
+`~/.local/state/planeradar/installer`, keyed by the SSH host-key fingerprint.
+Verified downloads and extracted payloads live under `~/.cache/planeradar`.
+Neither directory belongs in the repository.
+
+The Pi keeps installer transactions under `/var/lib/planeradar-installer`,
+application settings and cache under `/var/lib/planeradar`, accepted binaries
+under `/opt/planeradar`, and driver state under
+`/var/lib/hyperpixel2r-kms` and `/usr/lib/hyperpixel2r-kms`. Temporary uploads
+live under `/var/tmp` and are not authority.
+
+[Architecture](docs/architecture.md) follows those boundaries end to end.
+The exact paths, ownership rules, and recovery consequences are in
+[Installation](docs/install.md) and [Recovery](docs/recovery.md).
+
+## Development and project status
+
+```sh
+mise install
 mise run verify
-mise run test-driver-protocol
+mise run docs-check
 ```
 
-`mise run verify` runs formatting, clippy with warnings denied, the complete
-test suite, and dependency policy checks. Native SDL development libraries are
-required when running checks on Linux.
+The repository pins Rust and its development tools with mise. CI repeats the
+Rust, release, fixture, documentation, and native macOS control checks. Release
+workflows build deterministic ARM64 application and macOS control archives,
+generate an SPDX SBOM, and attest the release subjects.
 
-## Build and deploy
+The HyperPixel kernel code is not vendored or attached as a submodule. Plane
+Radar pins an immutable release from the separate
+[hyperpixel2r-kms project](https://github.com/shayne/hyperpixel2r-kms) by
+repository, version, full commit, and manifest digest. That separation matters:
+an application update is ordinary; a display driver update can decide whether
+the Pi comes back after reboot.
 
-Set the SSH target for the prepared Pi. The value is shared by the application
-and HyperPixel scripts:
+Read [Development](docs/development.md), [Troubleshooting](docs/troubleshooting.md),
+[Contributing](CONTRIBUTING.md), and [Security](SECURITY.md) before changing
+those boundaries.
 
-```sh
-export PLANERADAR_PI_TARGET=your-user@planeradar.local
-mise run build-pi
-mise run deploy-pi
-```
+## Credit, licenses, and AI disclosure
 
-The build requires a clean tracked workspace. It creates an AArch64 binary and
-four provenance files:
-
-```text
-dist/planeradar
-dist/planeradar.sha256
-dist/planeradar.revision
-dist/planeradar.tree
-dist/planeradar.readelf.txt
-```
-
-Deployment verifies the checksum on the Pi and records its temporary staging
-directory in `dist/last-stage-path`.
-
-## Install
-
-Run the staged, verified AArch64 binary as its own installer:
-
-```sh
-stage="$(cat dist/last-stage-path)"
-ssh -t "$PLANERADAR_PI_TARGET" \
-  "sudo '$stage/planeradar' install \
-    --artifact '$stage/planeradar' \
-    --checksum-file '$stage/planeradar.sha256' \
-    --revision-file '$stage/planeradar.revision'"
-```
-
-The installer:
-
-1. verifies the Pi model, OS, artifact architecture, SHA-256, embedded
-   revision, display declaration, and filesystem types before mutation;
-2. installs the SDL runtime, CA certificates, and Avahi;
-3. creates the locked-down `planeradar` service account;
-4. atomically installs the binary, provenance files, and systemd unit;
-5. preserves existing settings and the accepted display calibration; and
-6. enables and starts `planeradar.service`.
-
-It prints three machine-readable result lines. Reboot only when
-`reboot_required=true`; an application-only update does not need one. Passing
-`--reboot` allows the installer to reboot automatically when it made a boot
-configuration change.
-
-Running the same installer again is supported and should report:
-
-```text
-files_changed=false
-boot_config_changed=false
-reboot_required=false
-```
-
-## Update
-
-Pull or select the desired clean revision, then repeat build, deploy, and
-install. The installer restarts the service only when installed content or
-permissions changed. It never replaces an accepted revisioned HyperPixel
-overlay during an application-only update.
-
-## Operate and diagnose
-
-```sh
-ssh "$PLANERADAR_PI_TARGET" systemctl status planeradar
-ssh "$PLANERADAR_PI_TARGET" sudo journalctl -u planeradar -f
-curl --fail -H 'Host: planeradar.local' http://planeradar.local/healthz
-```
-
-`/healthz` reports only whether setup is complete, the current UI state,
-whether data are stale, and the exact application revision.
-
-To save the current logical 480×480 frame:
-
-```sh
-ssh "$PLANERADAR_PI_TARGET" 'sudo systemctl kill --signal=SIGUSR1 planeradar'
-ssh "$PLANERADAR_PI_TARGET" \
-  'sudo cp /var/lib/planeradar/debug.png "$HOME/planeradar-debug.png" &&
-   sudo chown "$USER:$USER" "$HOME/planeradar-debug.png"'
-scp "$PLANERADAR_PI_TARGET:planeradar-debug.png" .
-```
-
-The capture can contain live callsigns and should be treated as operational
-data. See [Troubleshooting](docs/troubleshooting.md) for display, touch,
-network, data, settings, and service checks.
-
-## Installed paths
-
-| Path | Purpose |
-| --- | --- |
-| `/opt/planeradar/bin/planeradar` | Root-owned application and installer |
-| `/opt/planeradar/REVISION` | Exact embedded source revision |
-| `/opt/planeradar/SHA256` | Installed artifact checksum sidecar |
-| `/etc/systemd/system/planeradar.service` | Hardened boot service |
-| `/var/lib/planeradar/settings.json` | Private persistent settings |
-| `/var/lib/planeradar/geocode-cache.json` | Private bounded search cache |
-| `/var/lib/planeradar/debug.png` | Latest requested logical frame |
-| `/boot/firmware/config.txt.planeradar-backup` | First installer boot backup |
-
-## Uninstall
-
-The following removes the application and service while preserving settings
-and the display driver:
-
-```sh
-sudo systemctl disable --now planeradar.service
-sudo rm /etc/systemd/system/planeradar.service
-sudo rm -r /opt/planeradar
-sudo systemctl daemon-reload
-sudo userdel planeradar
-```
-
-Remove `/var/lib/planeradar` separately only when its saved location,
-preferences, cache, and debug capture are no longer wanted. Display-driver
-rollback is a separate boot-critical operation; follow
-[the HyperPixel runbook](docs/hardware/hyperpixel2r-driver.md) instead of
-manually editing boot files.
-
-## Architecture and provenance
-
-[Architecture](docs/architecture.md) describes process ownership, immutable
-runtime snapshots, rendering, network policy, settings persistence, artifact
-verification, and hardware checkpoints.
-
-This repository is an independent Rust derivative of
+Plane Radar takes its product idea from
 [MatixYo/ESP32-Plane-Radar](https://github.com/MatixYo/ESP32-Plane-Radar).
-It preserves the upstream history and credits the original radar concept, but
-it is intentionally not a GitHub fork: the Raspberry Pi hardware, operating
-model, graphics stack, touch input, web service, installer, and implementation
-are substantially different.
+This repository is an independent Raspberry Pi implementation, not a GitHub fork.
+Its Rust application, KMS/SDL runtime, Mac control plane, installer, and web
+setup flow are separate work.
 
-Plane Radar is distributed under the [MIT License](LICENSE).
+The project was built with substantial OpenAI Codex assistance. Codex is
+credited in commit trailers. Human maintainers remain responsible for review,
+testing, releases, and what runs on real hardware.
 
-The renderer embeds DejaVu Sans Bold 2.37. DejaVu incorporates Bitstream Vera
-and Arev-derived glyphs by Tavmjong Bah; the complete notices and terms are
-preserved in
-[`src/assets/DejaVu-FONT-LICENSE.txt`](src/assets/DejaVu-FONT-LICENSE.txt).
+Plane Radar is distributed under the [MIT License](LICENSE). The external
+HyperPixel driver is GPL-2.0-only and carries its own upstream provenance.
+The bundled DejaVu Sans Bold font retains its
+[DejaVu, Bitstream Vera, and Arev notices](src/assets/DejaVu-FONT-LICENSE.txt).

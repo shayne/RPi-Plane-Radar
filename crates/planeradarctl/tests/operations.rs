@@ -1109,7 +1109,7 @@ fn doctor_json_process_exit_and_stream_contract_covers_healthy_and_unhealthy_tar
 
     let run = || {
         Command::new(env!("CARGO_BIN_EXE_planeradarctl"))
-            .args(["doctor", "shayne@planeradar.local", "--json"])
+            .args(["doctor", "pi@raspberrypi.local", "--json"])
             .current_dir(&root)
             .env("HOME", &home)
             .env(
@@ -1170,7 +1170,7 @@ fn production_doctor_observes_driver_artifact_hashes_and_strict_running_health()
     ]);
     let backend = SshOperationsBackend::new(
         &transport,
-        "shayne@planeradar.local".parse().expect("target"),
+        "pi@raspberrypi.local".parse().expect("target"),
         DriverLock::checked_in().expect("driver lock"),
     );
 
@@ -1200,7 +1200,7 @@ fn production_doctor_rejects_persisted_manifest_digest_that_disagrees_with_obser
     ]);
     let backend = SshOperationsBackend::new(
         &transport,
-        "shayne@planeradar.local".parse().expect("target"),
+        "pi@raspberrypi.local".parse().expect("target"),
         DriverLock::checked_in().expect("driver lock"),
     );
 
@@ -1237,7 +1237,7 @@ fn production_doctor_rejects_malformed_health_and_flags_a_stale_running_revision
     ]);
     let backend = SshOperationsBackend::new(
         &transport,
-        "shayne@planeradar.local".parse().expect("target"),
+        "pi@raspberrypi.local".parse().expect("target"),
         DriverLock::checked_in().expect("driver lock"),
     );
     let report = OperationsClient::new(&backend, FakeClock::default())
@@ -1267,7 +1267,7 @@ fn production_doctor_rejects_malformed_health_and_flags_a_stale_running_revision
     ]);
     let malformed_backend = SshOperationsBackend::new(
         &malformed_transport,
-        "shayne@planeradar.local".parse().expect("target"),
+        "pi@raspberrypi.local".parse().expect("target"),
         DriverLock::checked_in().expect("driver lock"),
     );
     assert_eq!(
@@ -1285,7 +1285,7 @@ fn production_backend_collects_strict_fixed_diagnostics_without_mutating_target(
         Ok(Output::success(target_state_json(), Vec::new())),
         Ok(Output::success(diagnostic_probe_json(), Vec::new())),
     ]);
-    let target: SshTarget = "shayne@planeradar.local".parse().expect("target");
+    let target: SshTarget = "pi@raspberrypi.local".parse().expect("target");
     let backend = SshOperationsBackend::new(
         &transport,
         target,
@@ -1339,7 +1339,7 @@ fn production_backend_rejects_unknown_or_oversized_probe_output() {
         ]);
         let backend = SshOperationsBackend::new(
             &transport,
-            "shayne@planeradar.local".parse().expect("target"),
+            "pi@raspberrypi.local".parse().expect("target"),
             DriverLock::checked_in().expect("driver lock"),
         );
         assert_eq!(
@@ -1390,7 +1390,7 @@ fn production_capture_adapter_uses_only_systemd_and_fixed_remote_paths() {
     ]);
     let backend = SshOperationsBackend::new(
         &transport,
-        "shayne@planeradar.local".parse().expect("target"),
+        "pi@raspberrypi.local".parse().expect("target"),
         DriverLock::checked_in().expect("driver lock"),
     );
     let observed = backend
@@ -1448,7 +1448,7 @@ fn production_capture_parser_rejects_truncated_trailing_and_unknown_protocol_dat
             .push_back(Ok(Output::success(protocol, Vec::new())));
         let backend = SshOperationsBackend::new(
             &transport,
-            "shayne@planeradar.local".parse().expect("target"),
+            "pi@raspberrypi.local".parse().expect("target"),
             DriverLock::checked_in().expect("driver lock"),
         );
         assert!(

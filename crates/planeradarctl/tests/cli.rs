@@ -4,7 +4,7 @@ use clap::Parser;
 use planeradarctl::{
     DriverLock,
     cli::{Cli, Command, DriverCommand},
-    config::{DEFAULT_HOSTNAME, Environment, InstallConfig},
+    config::{DEFAULT_HOSTNAME, Environment, InstallConfig, resolve_missing_mutating_target},
 };
 
 const LOCK: &str = include_str!("../../../driver.lock.toml");
@@ -45,6 +45,64 @@ fn absent_dotenv_and_no_cli_overrides_leave_target_promptable() {
     assert_eq!(config.target, None);
     assert_eq!(config.hostname, DEFAULT_HOSTNAME);
     assert_eq!(config.docker_context, None);
+}
+
+#[test]
+fn every_mutating_command_prompts_for_only_a_missing_target_on_a_terminal() {
+    for command in ["install", "upgrade", "rollback", "uninstall"] {
+        let cli = Cli::try_parse_from(["planeradarctl", command]).expect("parse mutating command");
+        let mut config =
+            InstallConfig::resolve(cli, Environment::default()).expect("resolve config");
+        let mut input = std::io::Cursor::new(b"pi@raspberrypi.local\n".to_vec());
+        let mut output = Vec::new();
+
+        resolve_missing_mutating_target(&mut config, true, &mut input, &mut output)
+            .expect("interactive target");
+
+        assert_eq!(
+            config.target.as_deref(),
+            Some("pi@raspberrypi.local"),
+            "{command}"
+        );
+        assert_eq!(config.hostname, DEFAULT_HOSTNAME, "{command}");
+        assert_eq!(output, b"SSH target (user@host): ", "{command}");
+    }
+}
+
+#[test]
+fn target_prompt_is_bounded_and_never_runs_for_noninteractive_or_non_tty_input() {
+    for (name, non_interactive, terminal) in [
+        ("explicit non-interactive", true, true),
+        ("redirected stdin", false, false),
+    ] {
+        let cli = Cli::try_parse_from(if non_interactive {
+            vec!["planeradarctl", "install", "--non-interactive"]
+        } else {
+            vec!["planeradarctl", "install"]
+        })
+        .expect("parse install");
+        let mut config =
+            InstallConfig::resolve(cli, Environment::default()).expect("resolve config");
+        let mut input = std::io::Cursor::new(b"pi@raspberrypi.local\n".to_vec());
+        let mut output = Vec::new();
+
+        assert!(
+            resolve_missing_mutating_target(&mut config, terminal, &mut input, &mut output)
+                .is_err(),
+            "{name}"
+        );
+        assert_eq!(config.target, None, "{name}");
+        assert!(output.is_empty(), "{name} wrote a prompt");
+        assert_eq!(input.position(), 0, "{name} consumed redirected input");
+    }
+
+    let cli = Cli::try_parse_from(["planeradarctl", "install"]).expect("parse install");
+    let mut config = InstallConfig::resolve(cli, Environment::default()).expect("resolve config");
+    let mut input = std::io::Cursor::new(vec![b'x'; 257]);
+    let mut output = Vec::new();
+    assert!(resolve_missing_mutating_target(&mut config, true, &mut input, &mut output).is_err());
+    assert_eq!(config.target, None);
+    assert!(input.position() <= 257);
 }
 
 #[test]
