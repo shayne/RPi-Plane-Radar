@@ -17,7 +17,7 @@ pub enum Command {
     Doctor(DoctorOptions),
     Screenshot(ScreenshotOptions),
     Rollback(MutatingOptions),
-    Uninstall(MutatingOptions),
+    Uninstall(UninstallOptions),
     Driver {
         #[command(subcommand)]
         command: DriverCommand,
@@ -25,16 +25,6 @@ pub enum Command {
 }
 
 impl Command {
-    pub fn into_mutating_options(self) -> Option<MutatingOptions> {
-        match self {
-            Self::Install(options)
-            | Self::Upgrade(options)
-            | Self::Rollback(options)
-            | Self::Uninstall(options) => Some(options),
-            Self::Status(_) | Self::Doctor(_) | Self::Screenshot(_) | Self::Driver { .. } => None,
-        }
-    }
-
     pub fn is_mutating(&self) -> bool {
         matches!(
             self,
@@ -61,6 +51,14 @@ pub struct MutatingOptions {
     pub release_dir: Option<PathBuf>,
     #[arg(long)]
     pub docker_context: Option<String>,
+    #[arg(long)]
+    pub non_interactive: bool,
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct UninstallOptions {
+    #[arg(value_name = "target")]
+    pub target: Option<String>,
     #[arg(long)]
     pub non_interactive: bool,
     #[arg(long)]

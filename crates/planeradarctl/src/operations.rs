@@ -1246,7 +1246,7 @@ fn is_lower_hex(value: &str, length: usize) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
-pub const LIFECYCLE_SCHEMA_VERSION: u32 = 1;
+pub const LIFECYCLE_SCHEMA_VERSION: u32 = 2;
 pub const MAX_ACCEPTED_PAIRS: usize = 3;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1285,6 +1285,23 @@ pub struct LifecycleTransaction {
     pub phase: LifecyclePhase,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UninstallPhase {
+    Prepared,
+    ApplicationRemoved,
+    DriverRemoved,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct UninstallTransaction {
+    pub accepted: AcceptedPair,
+    pub purge_settings: bool,
+    pub recovery_helper: OwnedFile,
+    pub phase: UninstallPhase,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct LifecycleState {
@@ -1292,6 +1309,8 @@ pub struct LifecycleState {
     hardware: TargetHardwareIdentity,
     accepted: Vec<AcceptedPair>,
     transaction: Option<LifecycleTransaction>,
+    #[serde(default)]
+    uninstall: Option<UninstallTransaction>,
 }
 
 impl LifecycleState {
@@ -1308,6 +1327,7 @@ impl LifecycleState {
             hardware,
             accepted,
             transaction: None,
+            uninstall: None,
         };
         state.validate()?;
         Ok(state)
@@ -1347,6 +1367,10 @@ impl LifecycleState {
         &self.accepted
     }
 
+    pub fn uninstall_transaction(&self) -> Option<&UninstallTransaction> {
+        self.uninstall.as_ref()
+    }
+
     pub fn to_json(&self) -> Result<String, LifecycleError> {
         self.validate()?;
         serde_json::to_string(self).map_err(|_| LifecycleError::InvalidState)
@@ -1357,11 +1381,14 @@ impl LifecycleState {
             return Err(LifecycleError::InvalidState);
         }
         let mut deserializer = serde_json::Deserializer::from_slice(contents);
-        let state =
+        let mut state =
             Self::deserialize(&mut deserializer).map_err(|_| LifecycleError::InvalidState)?;
         deserializer
             .end()
             .map_err(|_| LifecycleError::InvalidState)?;
+        if state.schema_version == 1 && state.uninstall.is_none() {
+            state.schema_version = LIFECYCLE_SCHEMA_VERSION;
+        }
         state.validate()?;
         Ok(state)
     }
@@ -1393,6 +1420,16 @@ impl LifecycleState {
                     .iter()
                     .any(|other| other.pair == accepted.pair)
             })
+            || self.uninstall.as_ref().is_some_and(|uninstall| {
+                !valid_owned_file(&uninstall.recovery_helper)
+                    || uninstall.recovery_helper.target_path
+                        != format!(
+                            "/var/lib/planeradar-installer/helpers/{}/planeradar",
+                            uninstall.accepted.pair.application.sha256
+                        )
+                    || self.accepted.first() != Some(&uninstall.accepted)
+                    || self.transaction.is_some()
+            })
         {
             return Err(LifecycleError::InvalidState);
         }
@@ -1414,6 +1451,9 @@ impl LifecycleState {
 
     fn begin(&mut self, candidate: ReleasePair) -> Result<(), LifecycleError> {
         self.validate()?;
+        if self.uninstall.is_some() {
+            return Err(LifecycleError::UninstallInProgress);
+        }
         self.transaction = Some(LifecycleTransaction {
             prior: self.current()?.clone(),
             candidate,
@@ -1459,6 +1499,33 @@ impl LifecycleState {
         self.transaction = None;
         self.validate()
     }
+
+    fn begin_uninstall(
+        &mut self,
+        accepted: AcceptedPair,
+        purge_settings: bool,
+        recovery_helper: OwnedFile,
+    ) -> Result<(), LifecycleError> {
+        self.validate()?;
+        if self.transaction.is_some() || self.uninstall.is_some() || self.current()? != &accepted {
+            return Err(LifecycleError::InvalidState);
+        }
+        self.uninstall = Some(UninstallTransaction {
+            accepted,
+            purge_settings,
+            recovery_helper,
+            phase: UninstallPhase::Prepared,
+        });
+        self.validate()
+    }
+
+    fn set_uninstall_phase(&mut self, phase: UninstallPhase) -> Result<(), LifecycleError> {
+        self.uninstall
+            .as_mut()
+            .ok_or(LifecycleError::InvalidState)?
+            .phase = phase;
+        self.validate()
+    }
 }
 
 fn valid_release_pair(pair: &ReleasePair) -> bool {
@@ -1502,13 +1569,20 @@ pub trait LifecycleBackend {
     fn verify_pair(&self, pair: &ReleasePair) -> Result<(), LifecycleError>;
     fn restore_application(&self, prior: &AcceptedPair) -> Result<(), LifecycleError>;
     fn restore_driver(&self, prior: &AcceptedPair) -> Result<(), LifecycleError>;
+    fn prepare_uninstall(&self, accepted: &AcceptedPair) -> Result<OwnedFile, LifecycleError>;
     fn uninstall_application(
         &self,
         owned_files: &[OwnedFile],
         purge_settings: bool,
     ) -> Result<(), LifecycleError>;
-    fn uninstall_driver(&self, driver: &ArtifactIdentity) -> Result<(), LifecycleError>;
+    fn uninstall_driver(&self, drivers: &[ArtifactIdentity]) -> Result<(), LifecycleError>;
     fn finalize_uninstall(&self, state: &LifecycleState) -> Result<(), LifecycleError>;
+    fn retire_recovery_helper(
+        &self,
+        _application: &ArtifactIdentity,
+    ) -> Result<(), LifecycleError> {
+        Ok(())
+    }
 }
 
 pub struct LifecycleManager<'a, B> {
@@ -1544,17 +1618,25 @@ impl<'a, B: LifecycleBackend> LifecycleManager<'a, B> {
                 .cloned()
                 .ok_or(LifecycleError::NoPriorAcceptedPair)?,
             Some(version) => {
-                let matches = state
+                let resolved = self.backend.resolve_release(Some(version))?;
+                if !valid_release_pair(&resolved) {
+                    return Err(LifecycleError::ImmutableReleaseMismatch);
+                }
+                let accepted_version = state
                     .accepted
                     .iter()
                     .skip(1)
-                    .filter(|accepted| accepted.pair.application.version == version.to_string())
-                    .collect::<Vec<_>>();
-                match matches.as_slice() {
-                    [accepted] => (*accepted).clone(),
-                    [] => return Err(LifecycleError::RequestedVersionNotAccepted),
-                    _ => return Err(LifecycleError::AmbiguousAcceptedVersion),
+                    .any(|accepted| accepted.pair.application.version == version.to_string());
+                if !accepted_version {
+                    return Err(LifecycleError::RequestedVersionNotAccepted);
                 }
+                state
+                    .accepted
+                    .iter()
+                    .skip(1)
+                    .find(|accepted| accepted.pair == resolved)
+                    .cloned()
+                    .ok_or(LifecycleError::ImmutableReleaseMismatch)?
             }
         };
         if candidate.pair == current.pair {
@@ -1564,13 +1646,44 @@ impl<'a, B: LifecycleBackend> LifecycleManager<'a, B> {
     }
 
     pub fn uninstall(&self, purge_settings: bool) -> Result<LifecycleOutcome, LifecycleError> {
-        let state = self.load_recovered_state()?;
-        let Some(current) = state.accepted.first().cloned() else {
+        let mut state = self.load_recovered_state()?;
+        if state.uninstall.is_none() && state.accepted.is_empty() {
             return Ok(LifecycleOutcome::AlreadyUninstalled);
-        };
-        self.backend
-            .uninstall_application(&current.owned_files, purge_settings)?;
-        self.backend.uninstall_driver(&current.pair.driver)?;
+        }
+        if state.uninstall.is_none() {
+            let current = state.current()?.clone();
+            let helper = self.backend.prepare_uninstall(&current)?;
+            state.begin_uninstall(current, purge_settings, helper)?;
+            self.backend.save_lifecycle_state(&state)?;
+        }
+        let uninstall = state
+            .uninstall
+            .clone()
+            .ok_or(LifecycleError::InvalidState)?;
+        if uninstall.purge_settings != purge_settings {
+            return Err(LifecycleError::UninstallOptionsMismatch);
+        }
+        if uninstall.phase == UninstallPhase::Prepared {
+            self.backend
+                .uninstall_application(&uninstall.accepted.owned_files, uninstall.purge_settings)?;
+            state.set_uninstall_phase(UninstallPhase::ApplicationRemoved)?;
+            self.backend.save_lifecycle_state(&state)?;
+        }
+        if state
+            .uninstall
+            .as_ref()
+            .is_some_and(|transaction| transaction.phase == UninstallPhase::ApplicationRemoved)
+        {
+            let mut drivers = Vec::new();
+            for driver in state.accepted.iter().map(|accepted| &accepted.pair.driver) {
+                if !drivers.contains(driver) {
+                    drivers.push(driver.clone());
+                }
+            }
+            self.backend.uninstall_driver(&drivers)?;
+            state.set_uninstall_phase(UninstallPhase::DriverRemoved)?;
+            self.backend.save_lifecycle_state(&state)?;
+        }
         self.backend.finalize_uninstall(&state)?;
         Ok(LifecycleOutcome::Uninstalled)
     }
@@ -1579,6 +1692,7 @@ impl<'a, B: LifecycleBackend> LifecycleManager<'a, B> {
         let mut state = self.load_recovered_state()?;
         let prior = state.current()?.clone();
         if pair == prior.pair {
+            let _ = self.backend.retire_recovery_helper(&pair.application);
             return Ok(LifecycleOutcome::AlreadyAccepted {
                 version: semver::Version::parse(&pair.application.version)
                     .map_err(|_| LifecycleError::InvalidState)?,
@@ -1604,6 +1718,7 @@ impl<'a, B: LifecycleBackend> LifecycleManager<'a, B> {
         };
         state.accept(pair.clone(), owned_files)?;
         self.backend.save_lifecycle_state(&state)?;
+        let _ = self.backend.retire_recovery_helper(&pair.application);
         Ok(LifecycleOutcome::Accepted {
             version: semver::Version::parse(&pair.application.version)
                 .map_err(|_| LifecycleError::InvalidState)?,
@@ -1650,6 +1765,9 @@ impl<'a, B: LifecycleBackend> LifecycleManager<'a, B> {
     fn load_recovered_state(&self) -> Result<LifecycleState, LifecycleError> {
         let mut state = self.backend.load_lifecycle_state()?;
         state.validate()?;
+        if state.uninstall.is_some() {
+            return Ok(state);
+        }
         if let Some(transaction) = state.transaction.clone() {
             let driver_changed = transaction.prior.pair.driver != transaction.candidate.driver;
             self.recover(&transaction.prior, driver_changed)?;
@@ -1730,6 +1848,10 @@ pub enum LifecycleError {
     RequestedVersionNotAccepted,
     #[error("the requested rollback version is ambiguous")]
     AmbiguousAcceptedVersion,
+    #[error("an uninstall transaction is already in progress")]
+    UninstallInProgress,
+    #[error("uninstall retry options do not match the durable transaction")]
+    UninstallOptionsMismatch,
     #[error("the resolved release identity is not immutable and valid")]
     ImmutableReleaseMismatch,
     #[error("the target returned an invalid ownership manifest")]

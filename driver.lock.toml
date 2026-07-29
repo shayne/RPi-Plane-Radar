@@ -1,4 +1,5 @@
 repository = "https://github.com/shayne/hyperpixel2r-kms"
-version = "0.1.0-rc.14"
-commit = "f6213007a8e780309e34b220351fc229e3c7d554"
-manifest_sha256 = "5f0cd1deba54c740e58b8aee588b3a4b43143e58bc2ad342c9f81cba2cb402e1"
+version = "0.1.0-rc.15"
+commit = "ab3f88c7f106df9fbfd70afa43bab1b24ca6dd8d"
+manifest_sha256 = "77a6efdd0afdb8cffce7737b7244f9cc902aca4623769272cd5b9dcd485d85b0"
+lifecycle_protocol = "accepted-driver-v1"

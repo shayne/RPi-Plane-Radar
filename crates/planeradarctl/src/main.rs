@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::io;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -23,7 +23,7 @@ use planeradarctl::{
     },
     operations::{
         AcceptedPair, LifecycleBackend, LifecycleError, LifecycleManager, LifecycleState,
-        OperationsClient, ReleasePair, SshOperationsBackend, SystemCaptureClock,
+        OperationsClient, ReleasePair, SshOperationsBackend, SystemCaptureClock, UninstallPhase,
     },
     preflight::{HostPreflight, SystemUnixClock, TargetPreflight},
     release::{GhReleaseSource, MANIFEST_NAME, ReleaseClient, ReleaseInput, Verifier},
@@ -129,6 +129,9 @@ fn run_lifecycle_target(
         staged_helper: RefCell::new(None),
         last_owned_files: RefCell::new(None),
         driver_tool: RefCell::new(None),
+        protocol_tool: RefCell::new(None),
+        retained_driver_transition: Cell::new(false),
+        driver_transition_active: Cell::new(false),
     };
     let manager = LifecycleManager::new(&backend);
     let outcome = match operation {
@@ -153,6 +156,9 @@ struct SystemLifecycleBackend {
     staged_helper: RefCell<Option<String>>,
     last_owned_files: RefCell<Option<Vec<OwnedFile>>>,
     driver_tool: RefCell<Option<(ArtifactIdentity, DriverTool<SystemCommandRunner>)>>,
+    protocol_tool: RefCell<Option<DriverTool<SystemCommandRunner>>>,
+    retained_driver_transition: Cell<bool>,
+    driver_transition_active: Cell<bool>,
 }
 
 impl SystemLifecycleBackend {
@@ -174,6 +180,45 @@ impl SystemLifecycleBackend {
             .borrow()
             .clone()
             .unwrap_or_else(|| "/opt/planeradar/bin/planeradar".into())
+    }
+
+    fn read_private_state_file(&self, path: &str) -> Result<Option<Vec<u8>>, LifecycleError> {
+        let command = private_state_read_command(path)?;
+        let output = self.run_remote(command)?;
+        if matches!(output.stdout(), b"null" | b"null\n") {
+            return Ok(None);
+        }
+        Ok(Some(output.stdout().to_vec()))
+    }
+
+    fn read_private_lifecycle_state(&self) -> Result<Option<LifecycleState>, LifecycleError> {
+        let Some(bytes) =
+            self.read_private_state_file("/var/lib/planeradar-installer/lifecycle.json")?
+        else {
+            return Ok(None);
+        };
+        let state = LifecycleState::from_json(&bytes)?;
+        if state.hardware().model != self.expected_identity.model
+            || state.hardware().serial != self.expected_identity.serial
+        {
+            return Err(LifecycleError::InvalidState);
+        }
+        Ok(Some(state))
+    }
+
+    fn verify_recovery_helper(&self, helper: &OwnedFile) -> Result<(), LifecycleError> {
+        let command = RemoteCommand::interactive_sudo([
+            "sudo",
+            "sh",
+            "-c",
+            "set -eu; p=$1; expected=$2; test ! -L \"$p\" && test -f \"$p\" && test \"$(stat -c '%u:%g:%a:%h' -- \"$p\")\" = '0:0:700:1' && test \"$(sha256sum -- \"$p\" | awk '{print $1}')\" = \"$expected\"",
+            "planeradar-recovery-helper",
+            helper.target_path.as_str(),
+            helper.sha256.as_str(),
+        ])
+        .map_err(|_| LifecycleError::Backend)?;
+        self.run_remote(command)?;
+        Ok(())
     }
 
     fn latest_release_version(&self) -> Result<Version, LifecycleError> {
@@ -283,6 +328,59 @@ impl SystemLifecycleBackend {
         Ok(())
     }
 
+    fn ensure_protocol_tool(&self) -> Result<(), LifecycleError> {
+        if self.protocol_tool.borrow().is_some() {
+            return Ok(());
+        }
+        let facts = TargetPreflight::new(&self.transport, SystemUnixClock)
+            .facts(&self.target())
+            .map_err(|_| LifecycleError::Backend)?;
+        let probe = DriverTargetProbe::new(facts.kernel_release.clone(), facts.kernel_vermagic)
+            .map_err(|_| LifecycleError::Backend)?;
+        let synced = DriverManager::new(
+            GhDriverReleaseSource::system(),
+            GhDriverReleaseVerifier::system(),
+            self.cache_root.join("driver-protocol"),
+        )
+        .sync(&self.lock)
+        .map_err(|_| LifecycleError::Backend)?;
+        let tool = synced
+            .tool(
+                SystemCommandRunner,
+                &probe,
+                DriverContext {
+                    target: self.target().ssh_destination(),
+                    kernel_release: facts.kernel_release.clone(),
+                    kernel_export: self
+                        .cache_root
+                        .join("kernel-export")
+                        .join(&facts.kernel_release),
+                    artifacts: self.cache_root.join("driver-artifacts"),
+                    replace_overlay: "vc4-kms-dpi-hyperpixel2r".into(),
+                },
+            )
+            .map_err(|_| LifecycleError::Backend)?;
+        *self.protocol_tool.borrow_mut() = Some(tool);
+        Ok(())
+    }
+
+    fn run_driver_protocol(
+        &self,
+        action: DriverAction,
+        identity: Option<&ArtifactIdentity>,
+    ) -> Result<(), LifecycleError> {
+        self.ensure_protocol_tool()?;
+        self.protocol_tool
+            .borrow()
+            .as_ref()
+            .ok_or(LifecycleError::Backend)?
+            .run_accepted_protocol(
+                action,
+                identity.map(|identity| identity.source_commit.as_str()),
+            )
+            .map_err(|_| LifecycleError::Backend)
+    }
+
     fn reboot_and_reconnect(&self, tryboot: bool) -> Result<(), LifecycleError> {
         let original = self.target();
         let command = if tryboot {
@@ -291,7 +389,13 @@ impl SystemLifecycleBackend {
             final_reboot_command()
         }
         .map_err(|_| LifecycleError::Backend)?;
-        let _ = self.transport.run(&original, command);
+        match self
+            .transport
+            .run_bounded(&original, command, Duration::from_secs(30), 4 * 1024)
+        {
+            Ok(_) | Err(TransportError::CommandFailed) => {}
+            Err(_) => return Err(LifecycleError::Backend),
+        }
         let policy = ReconnectPolicy::new(
             Duration::from_secs(30),
             Duration::from_secs(300),
@@ -310,6 +414,7 @@ impl SystemLifecycleBackend {
             .map_err(|_| LifecycleError::Backend)?;
         *self.target.borrow_mut() = target;
         *self.driver_tool.borrow_mut() = None;
+        *self.protocol_tool.borrow_mut() = None;
         Ok(())
     }
 
@@ -393,6 +498,55 @@ impl SystemLifecycleBackend {
         self.activate_artifact(pair, current_owned, &artifact)
     }
 
+    fn deploy_candidate_helper(&self, pair: &ReleasePair) -> Result<String, LifecycleError> {
+        if self.candidate.borrow().as_ref() != Some(pair) {
+            return Err(LifecycleError::ImmutableReleaseMismatch);
+        }
+        let payload = self.application_payload.borrow();
+        let payload = payload.as_ref().ok_or(LifecycleError::Backend)?;
+        let create = RemoteCommand::ordinary([
+            "sh",
+            "-c",
+            "umask 077; mktemp -d /var/tmp/planeradar-upload.XXXXXXXXXX",
+        ])
+        .map_err(|_| LifecycleError::Backend)?;
+        let output = self.run_remote(create)?;
+        let directory = std::str::from_utf8(output.stdout())
+            .ok()
+            .map(str::trim)
+            .filter(|path| path.starts_with("/var/tmp/planeradar-upload."))
+            .ok_or(LifecycleError::Backend)?
+            .to_owned();
+        let upload = format!("{directory}/payload");
+        self.transport
+            .copy_to(&self.target(), payload.path(), Path::new(&upload))
+            .map_err(|_| LifecycleError::Backend)?;
+        let helper = format!(
+            "/var/lib/planeradar-installer/helpers/{}/planeradar",
+            pair.application.sha256
+        );
+        let deploy = deploy_helper_command(
+            &upload,
+            &helper,
+            &pair.application.sha256,
+            &pair.application.source_commit,
+        )
+        .map_err(|_| LifecycleError::Backend)?;
+        let deployed = self.run_remote(deploy);
+        let cleanup = RemoteCommand::ordinary(["rm", "-rf", "--", directory.as_str()])
+            .map_err(|_| LifecycleError::Backend)?;
+        let cleaned = self.run_remote(cleanup);
+        deployed?;
+        cleaned?;
+        let owned = OwnedFile {
+            target_path: helper.clone(),
+            sha256: pair.application.sha256.clone(),
+        };
+        self.verify_recovery_helper(&owned)?;
+        *self.staged_helper.borrow_mut() = Some(helper.clone());
+        Ok(helper)
+    }
+
     fn activate_artifact(
         &self,
         pair: &ReleasePair,
@@ -438,50 +592,61 @@ impl SystemLifecycleBackend {
 
 impl LifecycleBackend for SystemLifecycleBackend {
     fn load_lifecycle_state(&self) -> Result<LifecycleState, LifecycleError> {
-        let command = RemoteCommand::interactive_sudo([
-            "sudo",
-            "/opt/planeradar/bin/planeradar",
-            "lifecycle-state",
-            "read",
-        ])
-        .map_err(|_| LifecycleError::Backend)?;
-        if let Ok(output) = self.run_remote(command)
-            && output.stdout() != b"null\n"
-            && output.stdout() != b"null"
-        {
-            let state = LifecycleState::from_json(output.stdout())?;
-            if state.hardware().model != self.expected_identity.model
-                || state.hardware().serial != self.expected_identity.serial
-            {
-                return Err(LifecycleError::InvalidState);
+        if let Some(state) = self.read_private_lifecycle_state()? {
+            if let Some(uninstall) = state.uninstall_transaction() {
+                if uninstall.phase != UninstallPhase::DriverRemoved {
+                    self.verify_recovery_helper(&uninstall.recovery_helper)?;
+                }
+                *self.staged_helper.borrow_mut() =
+                    Some(uninstall.recovery_helper.target_path.clone());
+            } else if state.uninstall_transaction().is_none() {
+                for accepted in state.accepted() {
+                    self.retire_recovery_helper(&accepted.pair.application)?;
+                }
             }
             return Ok(state);
         }
 
-        let command = RemoteCommand::interactive_sudo([
-            "sudo",
-            "/opt/planeradar/bin/planeradar",
-            "installer-state",
-            "read",
-        ])
-        .map_err(|_| LifecycleError::Backend)?;
-        if let Ok(output) = self.run_remote(command) {
-            let mut deserializer = serde_json::Deserializer::from_slice(output.stdout());
-            let state = Option::<TargetInstallState>::deserialize(&mut deserializer)
-                .map_err(|_| LifecycleError::InvalidState)?;
-            deserializer
-                .end()
-                .map_err(|_| LifecycleError::InvalidState)?;
-            if let Some(state) = state {
-                let migrated = LifecycleState::migrate_task14(&state)?;
-                if migrated.hardware().model != self.expected_identity.model
-                    || migrated.hardware().serial != self.expected_identity.serial
-                {
-                    return Err(LifecycleError::InvalidState);
-                }
-                self.save_lifecycle_state(&migrated)?;
-                return Ok(migrated);
+        let legacy = self.read_private_state_file("/var/lib/planeradar-installer/state.json")?;
+        let mut deserializer =
+            serde_json::Deserializer::from_slice(legacy.as_deref().unwrap_or(b"null"));
+        let state = Option::<TargetInstallState>::deserialize(&mut deserializer)
+            .map_err(|_| LifecycleError::InvalidState)?;
+        deserializer
+            .end()
+            .map_err(|_| LifecycleError::InvalidState)?;
+        if let Some(state) = state {
+            let migrated = LifecycleState::migrate_task14(&state)?;
+            if migrated.hardware().model != self.expected_identity.model
+                || migrated.hardware().serial != self.expected_identity.serial
+            {
+                return Err(LifecycleError::InvalidState);
             }
+            let version = Version::parse(
+                &migrated
+                    .accepted()
+                    .first()
+                    .ok_or(LifecycleError::InvalidState)?
+                    .pair
+                    .application
+                    .version,
+            )
+            .map_err(|_| LifecycleError::InvalidState)?;
+            let verified = self.resolve_release(Some(&version))?;
+            if migrated
+                .accepted()
+                .first()
+                .is_none_or(|accepted| accepted.pair != verified)
+            {
+                return Err(LifecycleError::ImmutableReleaseMismatch);
+            }
+            self.deploy_candidate_helper(&verified)?;
+            self.run_driver_protocol(
+                DriverAction::RecordAccepted,
+                Some(&migrated.accepted()[0].pair.driver),
+            )?;
+            self.save_lifecycle_state(&migrated)?;
+            return Ok(migrated);
         }
         LifecycleState::empty(TargetHardwareIdentity {
             model: self.expected_identity.model.clone(),
@@ -602,45 +767,27 @@ impl LifecycleBackend for SystemLifecycleBackend {
             "/opt/planeradar/bin/planeradar",
         )?;
         *self.last_owned_files.borrow_mut() = Some(preserved);
-        let payload = self.application_payload.borrow();
-        let payload = payload.as_ref().ok_or(LifecycleError::Backend)?;
-        let create = RemoteCommand::ordinary([
-            "sh",
-            "-c",
-            "umask 077; mktemp -d /var/tmp/planeradar-upload.XXXXXXXXXX",
-        ])
-        .map_err(|_| LifecycleError::Backend)?;
-        let output = self.run_remote(create)?;
-        let directory = std::str::from_utf8(output.stdout())
-            .ok()
-            .map(str::trim)
-            .filter(|path| path.starts_with("/var/tmp/planeradar-upload."))
-            .ok_or(LifecycleError::Backend)?
-            .to_owned();
-        let upload = format!("{directory}/payload");
-        self.transport
-            .copy_to(&self.target(), payload.path(), Path::new(&upload))
-            .map_err(|_| LifecycleError::Backend)?;
-        let helper = format!(
-            "/var/lib/planeradar-installer/helpers/{}/planeradar",
-            pair.application.sha256
-        );
-        let command = deploy_helper_command(
-            &upload,
-            &helper,
-            &pair.application.sha256,
-            &pair.application.source_commit,
-        )
-        .map_err(|_| LifecycleError::Backend)?;
-        self.run_remote(command)?;
-        let cleanup = RemoteCommand::ordinary(["rm", "-rf", "--", directory.as_str()])
-            .map_err(|_| LifecycleError::Backend)?;
-        self.run_remote(cleanup)?;
-        *self.staged_helper.borrow_mut() = Some(helper);
+        self.deploy_candidate_helper(pair)?;
         Ok(())
     }
 
     fn stage_driver(&self, pair: &ReleasePair) -> Result<(), LifecycleError> {
+        let state = self.load_lifecycle_state()?;
+        let current = state
+            .accepted()
+            .first()
+            .ok_or(LifecycleError::NoAcceptedPair)?;
+        self.run_driver_protocol(DriverAction::RecordAccepted, Some(&current.pair.driver))?;
+        let retained = state
+            .accepted()
+            .iter()
+            .skip(1)
+            .any(|accepted| accepted.pair.driver == pair.driver);
+        self.retained_driver_transition.set(retained);
+        self.driver_transition_active.set(true);
+        if retained {
+            return self.run_driver_protocol(DriverAction::StageRetained, Some(&pair.driver));
+        }
         self.ensure_driver_tool(&pair.driver)?;
         self.driver_tool
             .borrow()
@@ -648,7 +795,8 @@ impl LifecycleBackend for SystemLifecycleBackend {
             .ok_or(LifecycleError::Backend)?
             .1
             .prepare_and_stage()
-            .map_err(|_| LifecycleError::Backend)
+            .map_err(|_| LifecycleError::Backend)?;
+        self.run_driver_protocol(DriverAction::BindStagedAccepted, None)
     }
 
     fn tryboot_driver(&self, _pair: &ReleasePair) -> Result<(), LifecycleError> {
@@ -668,6 +816,9 @@ impl LifecycleBackend for SystemLifecycleBackend {
     }
 
     fn commit_driver(&self, pair: &ReleasePair) -> Result<(), LifecycleError> {
+        if self.retained_driver_transition.get() {
+            return self.run_driver_protocol(DriverAction::CommitRetained, None);
+        }
         self.ensure_driver_tool(&pair.driver)?;
         self.driver_tool
             .borrow()
@@ -676,7 +827,8 @@ impl LifecycleBackend for SystemLifecycleBackend {
             .1
             .run(DriverAction::CommitBoot)
             .map(|_| ())
-            .map_err(|_| LifecycleError::Backend)
+            .map_err(|_| LifecycleError::Backend)?;
+        self.run_driver_protocol(DriverAction::MarkCommittedAccepted, None)
     }
 
     fn reboot_normal(&self, _pair: &ReleasePair) -> Result<(), LifecycleError> {
@@ -716,7 +868,12 @@ impl LifecycleBackend for SystemLifecycleBackend {
             .1
             .verify_normal_boot()
             .map_err(|_| LifecycleError::Backend)?;
-        self.verify_application(pair)
+        self.verify_application(pair)?;
+        if self.driver_transition_active.get() {
+            self.run_driver_protocol(DriverAction::AcceptRetained, None)?;
+            self.driver_transition_active.set(false);
+        }
+        Ok(())
     }
 
     fn restore_application(&self, prior: &AcceptedPair) -> Result<(), LifecycleError> {
@@ -733,9 +890,11 @@ impl LifecycleBackend for SystemLifecycleBackend {
     }
 
     fn restore_driver(&self, prior: &AcceptedPair) -> Result<(), LifecycleError> {
-        if let Some((_, tool)) = self.driver_tool.borrow().as_ref() {
-            tool.run(DriverAction::RollbackBoot)
-                .map_err(|_| LifecycleError::Backend)?;
+        if self
+            .run_driver_protocol(DriverAction::RecoverAccepted, None)
+            .is_ok()
+        {
+            self.driver_transition_active.set(false);
         }
         self.ensure_driver_tool(&prior.pair.driver)?;
         if self
@@ -747,6 +906,7 @@ impl LifecycleBackend for SystemLifecycleBackend {
             .verify_normal_boot()
             .is_ok()
         {
+            self.driver_transition_active.set(false);
             return Ok(());
         }
         self.stage_driver(&prior.pair)?;
@@ -756,12 +916,9 @@ impl LifecycleBackend for SystemLifecycleBackend {
         self.reboot_normal(&prior.pair)
     }
 
-    fn uninstall_application(
-        &self,
-        owned_files: &[OwnedFile],
-        purge_settings: bool,
-    ) -> Result<(), LifecycleError> {
-        let live_digests = owned_files
+    fn prepare_uninstall(&self, accepted: &AcceptedPair) -> Result<OwnedFile, LifecycleError> {
+        let live_digests = accepted
+            .owned_files
             .iter()
             .filter(|file| file.target_path == "/opt/planeradar/bin/planeradar")
             .map(|file| file.sha256.as_str())
@@ -773,8 +930,18 @@ impl LifecycleBackend for SystemLifecycleBackend {
         let preserve = preserve_lifecycle_helper_command(&helper, digest)
             .map_err(|_| LifecycleError::Backend)?;
         self.run_remote(preserve)?;
-        *self.staged_helper.borrow_mut() = Some(helper);
+        *self.staged_helper.borrow_mut() = Some(helper.clone());
+        Ok(OwnedFile {
+            target_path: helper,
+            sha256: (*digest).to_owned(),
+        })
+    }
 
+    fn uninstall_application(
+        &self,
+        owned_files: &[OwnedFile],
+        purge_settings: bool,
+    ) -> Result<(), LifecycleError> {
         let helper = self.state_helper();
         let json = Self::ownership_json(owned_files)?;
         let mut arguments = vec![
@@ -793,33 +960,39 @@ impl LifecycleBackend for SystemLifecycleBackend {
         Ok(())
     }
 
-    fn uninstall_driver(&self, driver: &ArtifactIdentity) -> Result<(), LifecycleError> {
-        self.ensure_driver_tool(driver)?;
-        self.driver_tool
-            .borrow()
-            .as_ref()
-            .ok_or(LifecycleError::Backend)?
-            .1
-            .run(DriverAction::Uninstall)
-            .map(|_| ())
-            .map_err(|_| LifecycleError::Backend)
+    fn uninstall_driver(&self, drivers: &[ArtifactIdentity]) -> Result<(), LifecycleError> {
+        let Some((driver, historical)) = drivers.split_first() else {
+            return Err(LifecycleError::InvalidState);
+        };
+        self.run_driver_protocol(DriverAction::UninstallAccepted, Some(driver))?;
+        self.reboot_and_reconnect(false)?;
+        let overlay = format!(
+            "/boot/firmware/overlays/hyperpixel2r-kms-{}.dtbo",
+            &driver.source_commit[..12]
+        );
+        let command = RemoteCommand::interactive_sudo([
+            "sudo",
+            "sh",
+            "-c",
+            "set -eu; test ! -e /lib/modules/$(uname -r)/extra/hyperpixel2r_kms.ko; test ! -L \"$1\" && test ! -e \"$1\"; ! awk '{ line=$0; sub(/^[[:space:]]+/, \"\", line); if (line ~ /^dtoverlay=/ && line ~ /hyperpixel2r/) found=1 } END { exit found ? 0 : 1 }' /boot/firmware/config.txt",
+            "planeradar-stock-driver",
+            overlay.as_str(),
+        ])
+        .map_err(|_| LifecycleError::Backend)?;
+        self.run_remote(command)?;
+        for inactive in historical {
+            self.run_driver_protocol(DriverAction::RetireInactive, Some(inactive))?;
+        }
+        Ok(())
     }
 
     fn finalize_uninstall(&self, state: &LifecycleState) -> Result<(), LifecycleError> {
-        let current = state
-            .accepted()
-            .first()
-            .ok_or(LifecycleError::NoAcceptedPair)?;
-        let digest = current
-            .owned_files
-            .iter()
-            .filter(|file| file.target_path == "/opt/planeradar/bin/planeradar")
-            .map(|file| file.sha256.as_str())
-            .collect::<Vec<_>>();
-        let [digest] = digest.as_slice() else {
-            return Err(LifecycleError::InvalidOwnership);
-        };
-        let expected_helper = format!("/var/lib/planeradar-installer/helpers/{digest}/planeradar");
+        let uninstall = state
+            .uninstall_transaction()
+            .ok_or(LifecycleError::InvalidState)?;
+        let current = &uninstall.accepted;
+        let digest = current.pair.application.sha256.as_str();
+        let expected_helper = uninstall.recovery_helper.target_path.clone();
         if self.staged_helper.borrow().as_deref() != Some(expected_helper.as_str()) {
             return Err(LifecycleError::Backend);
         }
@@ -846,6 +1019,24 @@ impl LifecycleBackend for SystemLifecycleBackend {
         )
         .map_err(|_| LifecycleError::Backend)?;
         self.run_remote(command)?;
+        Ok(())
+    }
+
+    fn retire_recovery_helper(&self, application: &ArtifactIdentity) -> Result<(), LifecycleError> {
+        let helper = format!(
+            "/var/lib/planeradar-installer/helpers/{}/planeradar",
+            application.sha256
+        );
+        let command = retire_lifecycle_helper_command(
+            &helper,
+            &application.sha256,
+            &application.source_commit,
+        )
+        .map_err(|_| LifecycleError::Backend)?;
+        self.run_remote(command)?;
+        if self.staged_helper.borrow().as_deref() == Some(helper.as_str()) {
+            *self.staged_helper.borrow_mut() = None;
+        }
         Ok(())
     }
 }
@@ -1162,6 +1353,24 @@ fn select_candidate_index(
         })
 }
 
+fn private_state_read_command(path: &str) -> Result<RemoteCommand, LifecycleError> {
+    if !matches!(
+        path,
+        "/var/lib/planeradar-installer/lifecycle.json" | "/var/lib/planeradar-installer/state.json"
+    ) {
+        return Err(LifecycleError::InvalidState);
+    }
+    RemoteCommand::interactive_sudo([
+        "sudo",
+        "sh",
+        "-c",
+        "set -eu; p=$1; d=${p%/*}; if test ! -e \"$d\"; then printf 'null'; exit 0; fi; test ! -L \"$d\" && test -d \"$d\" && test \"$(stat -c '%u:%g:%a' -- \"$d\")\" = '0:0:700'; if test ! -e \"$p\"; then printf 'null'; exit 0; fi; test ! -L \"$p\" && test -f \"$p\" && test \"$(stat -c '%u:%g:%a:%h' -- \"$p\")\" = '0:0:600:1'; cat -- \"$p\"",
+        "planeradar-private-state",
+        path,
+    ])
+    .map_err(|_| LifecycleError::Backend)
+}
+
 fn resume_state_matches(
     persisted: &InstallState,
     observed: &TargetIdentity,
@@ -1306,6 +1515,23 @@ fn preserve_lifecycle_helper_command(
     ])
 }
 
+fn retire_lifecycle_helper_command(
+    helper_path: &str,
+    sha256: &str,
+    revision: &str,
+) -> Result<RemoteCommand, TransportError> {
+    RemoteCommand::interactive_sudo([
+        "sudo",
+        "sh",
+        "-c",
+        r#"set -eu; helper=$1; digest=$2; revision=$3; case "$helper" in /var/lib/planeradar-installer/helpers/"$digest"/planeradar) ;; *) exit 64 ;; esac; regular() { test ! -L "$1" && test -f "$1" && test "$(stat -c '%u:%g:%a:%h' -- "$1")" = "0:0:$2:1"; }; if test -e "$helper"; then regular "$helper" 700; test "$(sha256sum -- "$helper" | awk '{print $1}')" = "$digest"; else test ! -L "$helper"; fi; checksum="$helper.sha256"; if test -e "$checksum"; then regular "$checksum" 600; test "$(cat -- "$checksum")" = "$digest  planeradar"; else test ! -L "$checksum"; fi; revision_file="$helper.revision"; if test -e "$revision_file"; then regular "$revision_file" 600; test "$(cat -- "$revision_file")" = "$revision"; else test ! -L "$revision_file"; fi; rm -f -- "$checksum" "$revision_file" "$helper"; rmdir -- "${helper%/planeradar}" 2>/dev/null || true; rmdir -- /var/lib/planeradar-installer/helpers 2>/dev/null || true"#,
+        "planeradar-helper-retire",
+        helper_path,
+        sha256,
+        revision,
+    ])
+}
+
 fn finalize_lifecycle_uninstall_command(
     helper_path: &str,
     sha256: &str,
@@ -1317,7 +1543,7 @@ fn finalize_lifecycle_uninstall_command(
         "sudo",
         "sh",
         "-c",
-        r#"set -eu; helper=$1; digest=$2; revision=$3; lifecycle_digest=$4; installer_digest=$5; case "$helper" in /var/lib/planeradar-installer/helpers/"$digest"/planeradar) ;; *) exit 64 ;; esac; regular() { test ! -L "$1" && test -f "$1" && test "$(stat -c '%u:%g:%a:%h' -- "$1")" = "0:0:$2:1"; }; matches() { test "$(sha256sum -- "$1" | awk '{print $1}')" = "$2"; }; lifecycle=/var/lib/planeradar-installer/lifecycle.json; installer=/var/lib/planeradar-installer/state.json; regular "$helper" 700 && matches "$helper" "$digest"; regular "$lifecycle" 600 && matches "$lifecycle" "$lifecycle_digest"; installer_exists=false; if test -e "$installer"; then regular "$installer" 600 && matches "$installer" "$installer_digest"; installer_exists=true; fi; checksum="$helper.sha256"; checksum_exists=false; if test -e "$checksum"; then regular "$checksum" 600 && test "$(cat -- "$checksum")" = "$digest  planeradar"; checksum_exists=true; fi; revision_file="$helper.revision"; revision_exists=false; if test -e "$revision_file"; then regular "$revision_file" 600 && test "$(cat -- "$revision_file")" = "$revision"; revision_exists=true; fi; if test "$installer_exists" = true; then rm -- "$installer"; fi; rm -- "$lifecycle"; if test "$checksum_exists" = true; then rm -- "$checksum"; fi; if test "$revision_exists" = true; then rm -- "$revision_file"; fi; rm -- "$helper"; sync -f /var/lib/planeradar-installer; rmdir -- "${helper%/planeradar}" 2>/dev/null || true; rmdir -- /var/lib/planeradar-installer/helpers 2>/dev/null || true; rmdir -- /var/lib/planeradar-installer 2>/dev/null || true"#,
+        r#"set -eu; helper=$1; digest=$2; revision=$3; lifecycle_digest=$4; installer_digest=$5; case "$helper" in /var/lib/planeradar-installer/helpers/"$digest"/planeradar) ;; *) exit 64 ;; esac; regular() { test ! -L "$1" && test -f "$1" && test "$(stat -c '%u:%g:%a:%h' -- "$1")" = "0:0:$2:1"; }; matches() { test "$(sha256sum -- "$1" | awk '{print $1}')" = "$2"; }; exact_or_absent() { if test -e "$1"; then regular "$1" "$2" && matches "$1" "$3"; else test ! -L "$1"; fi; }; lifecycle=/var/lib/planeradar-installer/lifecycle.json; installer=/var/lib/planeradar-installer/state.json; checksum="$helper.sha256"; revision_file="$helper.revision"; regular "$lifecycle" 600 && matches "$lifecycle" "$lifecycle_digest"; exact_or_absent "$helper" 700 "$digest"; if test -e "$installer"; then regular "$installer" 600 && matches "$installer" "$installer_digest"; else test ! -L "$installer"; fi; if test -e "$checksum"; then regular "$checksum" 600 && test "$(cat -- "$checksum")" = "$digest  planeradar"; else test ! -L "$checksum"; fi; if test -e "$revision_file"; then regular "$revision_file" 600 && test "$(cat -- "$revision_file")" = "$revision"; else test ! -L "$revision_file"; fi; rm -f -- "$checksum" "$revision_file" "$helper"; rmdir -- "${helper%/planeradar}" 2>/dev/null || true; rmdir -- /var/lib/planeradar-installer/helpers 2>/dev/null || true; rm -f -- "$installer"; sync -f /var/lib/planeradar-installer; rm -- "$lifecycle"; sync -f /var/lib/planeradar-installer; rmdir -- /var/lib/planeradar-installer 2>/dev/null || true"#,
         "planeradar-uninstall-finalize",
         helper_path,
         sha256,
@@ -1998,9 +2224,10 @@ mod tests {
         ArtifactIdentity, BackendFailure, InstallCandidateState, InstallPhase, InstallState,
         TargetIdentity, TransportError, committed_driver_command, deploy_helper_command,
         final_reboot_command, finalize_lifecycle_uninstall_command, hostname_command,
-        preserve_lifecycle_helper_command, resume_state_matches, select_candidate_index,
-        staged_driver_transaction_command, target_install_command,
-        target_install_ownership_command, tryboot_reboot_command, tryboot_wait_failure,
+        preserve_lifecycle_helper_command, private_state_read_command, resume_state_matches,
+        retire_lifecycle_helper_command, select_candidate_index, staged_driver_transaction_command,
+        target_install_command, target_install_ownership_command, tryboot_reboot_command,
+        tryboot_wait_failure,
     };
 
     #[test]
@@ -2019,6 +2246,29 @@ mod tests {
         let final_reboot = final_reboot_command().expect("final reboot command");
         assert!(final_reboot.is_interactive_sudo());
         assert_eq!(final_reboot.arguments(), ["sudo", "systemctl", "reboot"]);
+    }
+
+    #[test]
+    fn task14_migration_reads_private_state_without_invoking_the_installed_binary() {
+        for path in [
+            "/var/lib/planeradar-installer/lifecycle.json",
+            "/var/lib/planeradar-installer/state.json",
+        ] {
+            let command = private_state_read_command(path).expect("private state read command");
+            assert!(command.is_interactive_sudo());
+            assert_eq!(command.arguments()[0..3], ["sudo", "sh", "-c"]);
+            assert_eq!(
+                &command.arguments()[4..],
+                ["planeradar-private-state", path]
+            );
+            assert!(
+                command
+                    .arguments()
+                    .iter()
+                    .all(|argument| !argument.contains("/opt/planeradar/bin/planeradar"))
+            );
+        }
+        assert!(private_state_read_command("/tmp/state.json").is_err());
     }
 
     #[test]
@@ -2236,7 +2486,7 @@ mod tests {
     fn driver_postconditions_are_bound_to_exact_transaction_and_committed_identity() {
         let expected = planeradarctl::driver::DriverPostconditions {
             driver_version: "0.1.0".into(),
-            source_revision: "f6213007a8e780309e34b220351fc229e3c7d554".into(),
+            source_revision: "ab3f88c7f106df9fbfd70afa43bab1b24ca6dd8d".into(),
             source_tree: "1111111111111111111111111111111111111111".into(),
             kernel_release: "6.12.47+rpt-rpi-v8".into(),
             module_vermagic: "6.12.47+rpt-rpi-v8 SMP preempt mod_unload aarch64".into(),
@@ -2261,7 +2511,7 @@ mod tests {
             [
                 "planeradar-driver-transaction",
                 "0.1.0",
-                "f6213007a8e780309e34b220351fc229e3c7d554",
+                "ab3f88c7f106df9fbfd70afa43bab1b24ca6dd8d",
                 "1111111111111111111111111111111111111111",
                 "6.12.47+rpt-rpi-v8",
                 "6.12.47+rpt-rpi-v8 SMP preempt mod_unload aarch64",
@@ -2283,7 +2533,7 @@ mod tests {
             [
                 "planeradar-driver-committed",
                 "0.1.0",
-                "f6213007a8e780309e34b220351fc229e3c7d554",
+                "ab3f88c7f106df9fbfd70afa43bab1b24ca6dd8d",
                 "1111111111111111111111111111111111111111",
                 "6.12.47+rpt-rpi-v8",
                 "6.12.47+rpt-rpi-v8 SMP preempt mod_unload aarch64",
@@ -2389,5 +2639,41 @@ mod tests {
                 installer_digest.as_str(),
             ]
         );
+
+        let retired = retire_lifecycle_helper_command(&helper, &digest, &revision_identity)
+            .expect("retire helper command");
+        assert!(retired.is_interactive_sudo());
+        assert_eq!(retired.arguments()[0..3], ["sudo", "sh", "-c"]);
+        assert_eq!(
+            &retired.arguments()[4..],
+            [
+                "planeradar-helper-retire",
+                helper.as_str(),
+                digest.as_str(),
+                revision_identity.as_str(),
+            ]
+        );
+
+        let retire_script = &retired.arguments()[3];
+        assert!(!retire_script.contains("find "));
+        assert!(retire_script.contains(
+            "case \"$helper\" in /var/lib/planeradar-installer/helpers/\"$digest\"/planeradar)"
+        ));
+        assert!(retire_script.contains("rm -f -- \"$checksum\" \"$revision_file\" \"$helper\""));
+
+        let finalize_script = &finalized.arguments()[3];
+        assert!(finalize_script.contains("exact_or_absent \"$helper\""));
+        assert!(!finalize_script.contains("find "));
+        let helper_delete = finalize_script
+            .find("rm -f -- \"$checksum\" \"$revision_file\" \"$helper\"")
+            .expect("helper deletion");
+        let installer_delete = finalize_script
+            .find("rm -f -- \"$installer\"")
+            .expect("installer state deletion");
+        let lifecycle_delete = finalize_script
+            .find("rm -- \"$lifecycle\"")
+            .expect("lifecycle state deletion");
+        assert!(helper_delete < installer_delete);
+        assert!(installer_delete < lifecycle_delete);
     }
 }

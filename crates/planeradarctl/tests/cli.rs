@@ -125,6 +125,21 @@ fn command_surface_accepts_all_public_command_names() {
 }
 
 #[test]
+fn purge_settings_is_an_uninstall_only_option() {
+    for command in ["install", "upgrade", "rollback"] {
+        assert!(
+            Cli::try_parse_from(["planeradarctl", command, "--purge-settings"]).is_err(),
+            "{command} must reject uninstall-only settings purge"
+        );
+    }
+    let uninstall = Cli::try_parse_from(["planeradarctl", "uninstall", "--purge-settings"])
+        .expect("uninstall purge");
+    let config =
+        InstallConfig::resolve(uninstall, Environment::default()).expect("uninstall config");
+    assert!(config.purge_settings);
+}
+
+#[test]
 fn diagnostic_and_screenshot_options_are_explicit() {
     let doctor = Cli::try_parse_from(["planeradarctl", "doctor", "pi@planeradar.local", "--json"])
         .expect("doctor options");
@@ -160,29 +175,29 @@ fn maintainer_driver_commands_parse_exact_sync_and_update_forms() {
         }
     ));
 
-    let update = Cli::try_parse_from(["planeradarctl", "driver", "update", "0.1.0-rc.14"])
+    let update = Cli::try_parse_from(["planeradarctl", "driver", "update", "0.1.0-rc.15"])
         .expect("driver update");
     assert!(matches!(
         update.command,
         Command::Driver {
             command: DriverCommand::Update { version }
-        } if version == "0.1.0-rc.14"
+        } if version == "0.1.0-rc.15"
     ));
 }
 
 #[test]
-fn driver_lock_matches_the_published_release_candidate() {
+fn driver_lock_matches_the_next_release_candidate_gate() {
     let lock = DriverLock::parse(LOCK).expect("parse driver lock");
 
     assert_eq!(
         lock.repository,
         "https://github.com/shayne/hyperpixel2r-kms"
     );
-    assert_eq!(lock.version.to_string(), "0.1.0-rc.14");
-    assert_eq!(lock.commit, "f6213007a8e780309e34b220351fc229e3c7d554");
+    assert_eq!(lock.version.to_string(), "0.1.0-rc.15");
+    assert_eq!(lock.commit, "ab3f88c7f106df9fbfd70afa43bab1b24ca6dd8d");
     assert_eq!(
         lock.manifest_sha256,
-        "5f0cd1deba54c740e58b8aee588b3a4b43143e58bc2ad342c9f81cba2cb402e1"
+        "77a6efdd0afdb8cffce7737b7244f9cc902aca4623769272cd5b9dcd485d85b0"
     );
 }
 
@@ -225,6 +240,14 @@ fn driver_lock_rejects_invalid_or_ambiguous_identity_fields() {
         (
             "uppercase manifest digest",
             replace_current(&lock.manifest_sha256, &lock.manifest_sha256.to_uppercase()),
+        ),
+        (
+            "missing lifecycle protocol",
+            LOCK.replace("lifecycle_protocol = \"accepted-driver-v1\"\n", ""),
+        ),
+        (
+            "wrong lifecycle protocol",
+            replace_current("accepted-driver-v1", "unsupported-driver-v1"),
         ),
         ("unknown field", format!("{LOCK}unexpected = \"value\"\n")),
         (

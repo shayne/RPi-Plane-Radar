@@ -54,6 +54,7 @@ enum Call {
     VerifyPair,
     RestoreApplication,
     RestoreDriver,
+    PrepareUninstall,
     UninstallApplication,
     UninstallDriver,
     FinalizeUninstall,
@@ -65,7 +66,10 @@ struct FakeBackend {
     owned: RefCell<Vec<OwnedFile>>,
     calls: RefCell<Vec<Call>>,
     fail: Cell<Option<Call>>,
+    fail_save: Cell<Option<u32>>,
+    save_count: Cell<u32>,
     requested: RefCell<Vec<Option<Version>>>,
+    uninstall_drivers: RefCell<Vec<ArtifactIdentity>>,
 }
 
 impl FakeBackend {
@@ -88,7 +92,10 @@ impl FakeBackend {
             }]),
             calls: RefCell::new(Vec::new()),
             fail: Cell::new(None),
+            fail_save: Cell::new(None),
+            save_count: Cell::new(0),
             requested: RefCell::new(Vec::new()),
+            uninstall_drivers: RefCell::new(Vec::new()),
         }
     }
 
@@ -108,6 +115,11 @@ impl LifecycleBackend for FakeBackend {
     }
 
     fn save_lifecycle_state(&self, state: &LifecycleState) -> Result<(), LifecycleError> {
+        let count = self.save_count.get() + 1;
+        self.save_count.set(count);
+        if self.fail_save.get() == Some(count) {
+            return Err(LifecycleError::Backend);
+        }
         *self.state.borrow_mut() = state.clone();
         Ok(())
     }
@@ -163,6 +175,17 @@ impl LifecycleBackend for FakeBackend {
         self.call(Call::RestoreDriver)
     }
 
+    fn prepare_uninstall(&self, accepted: &AcceptedPair) -> Result<OwnedFile, LifecycleError> {
+        self.call(Call::PrepareUninstall)?;
+        Ok(OwnedFile {
+            target_path: format!(
+                "/var/lib/planeradar-installer/helpers/{}/planeradar",
+                accepted.pair.application.sha256
+            ),
+            sha256: accepted.pair.application.sha256.clone(),
+        })
+    }
+
     fn uninstall_application(
         &self,
         _owned_files: &[OwnedFile],
@@ -171,7 +194,8 @@ impl LifecycleBackend for FakeBackend {
         self.call(Call::UninstallApplication)
     }
 
-    fn uninstall_driver(&self, _driver: &ArtifactIdentity) -> Result<(), LifecycleError> {
+    fn uninstall_driver(&self, drivers: &[ArtifactIdentity]) -> Result<(), LifecycleError> {
+        *self.uninstall_drivers.borrow_mut() = drivers.to_vec();
         self.call(Call::UninstallDriver)
     }
 
@@ -352,6 +376,9 @@ fn rollback_chooses_newest_prior_or_an_explicit_accepted_version() {
         history,
     )
     .unwrap();
+    *backend.release.borrow_mut() = pair("1.0.0", '1', 'a');
+    backend.calls.borrow_mut().clear();
+    backend.requested.borrow_mut().clear();
     LifecycleManager::new(&backend)
         .rollback(Some(&Version::parse("1.0.0").unwrap()))
         .expect("explicit rollback");
@@ -361,6 +388,11 @@ fn rollback_chooses_newest_prior_or_an_explicit_accepted_version() {
             .application
             .version,
         "1.0.0"
+    );
+    assert_eq!(backend.calls.borrow().first(), Some(&Call::Resolve));
+    assert_eq!(
+        backend.requested.borrow().as_slice(),
+        [Some(Version::parse("1.0.0").unwrap())]
     );
 }
 
@@ -405,7 +437,7 @@ fn a_task14_complete_state_migrates_deterministically_without_losing_owned_hashe
 
     let migrated = LifecycleState::migrate_task14(&task14).expect("migration");
 
-    assert_eq!(migrated.schema_version(), 1);
+    assert_eq!(migrated.schema_version(), 2);
     assert_eq!(migrated.accepted().len(), 1);
     assert_eq!(migrated.accepted()[0].sequence, 1);
     assert_eq!(migrated.accepted()[0].owned_files, task14.owned_files);
@@ -425,6 +457,7 @@ fn uninstall_uses_recorded_ownership_then_driver_and_is_idempotent() {
     assert_eq!(
         backend.calls.borrow().as_slice(),
         [
+            Call::PrepareUninstall,
             Call::UninstallApplication,
             Call::UninstallDriver,
             Call::FinalizeUninstall,
@@ -438,6 +471,86 @@ fn uninstall_uses_recorded_ownership_then_driver_and_is_idempotent() {
             .uninstall(false)
             .expect("repeat uninstall"),
         LifecycleOutcome::AlreadyUninstalled
+    );
+    assert!(backend.calls.borrow().is_empty());
+}
+
+#[test]
+fn uninstall_removes_each_unique_accepted_driver_in_current_first_order() {
+    let current = accepted("1.2.0", '3', 'b', 12);
+    let duplicate_current_driver = accepted("1.1.0", '2', 'b', 11);
+    let prior_driver = accepted("1.0.0", '1', 'a', 10);
+    let backend = FakeBackend::installed(
+        vec![
+            current.clone(),
+            duplicate_current_driver,
+            prior_driver.clone(),
+        ],
+        pair("2.0.0", '4', 'c'),
+    );
+
+    LifecycleManager::new(&backend)
+        .uninstall(false)
+        .expect("uninstall accepted driver history");
+
+    assert_eq!(
+        backend.uninstall_drivers.borrow().as_slice(),
+        [current.pair.driver, prior_driver.pair.driver,]
+    );
+}
+
+#[test]
+fn uninstall_resumes_after_every_destructive_and_persistence_boundary() {
+    enum Boundary {
+        Action(Call),
+        Save(u32),
+    }
+    for boundary in [
+        Boundary::Action(Call::UninstallApplication),
+        Boundary::Save(2),
+        Boundary::Action(Call::UninstallDriver),
+        Boundary::Save(3),
+        Boundary::Action(Call::FinalizeUninstall),
+    ] {
+        let current = accepted("1.0.0", '1', 'a', 7);
+        let backend = FakeBackend::installed(vec![current], pair("2.0.0", '2', 'a'));
+        match boundary {
+            Boundary::Action(call) => backend.fail.set(Some(call)),
+            Boundary::Save(save) => backend.fail_save.set(Some(save)),
+        }
+        assert_eq!(
+            LifecycleManager::new(&backend).uninstall(false),
+            Err(LifecycleError::Backend)
+        );
+
+        backend.fail.set(None);
+        backend.fail_save.set(None);
+        backend.calls.borrow_mut().clear();
+        assert_eq!(
+            LifecycleManager::new(&backend)
+                .uninstall(false)
+                .expect("resume uninstall"),
+            LifecycleOutcome::Uninstalled
+        );
+        assert!(backend.state.borrow().accepted().is_empty());
+    }
+}
+
+#[test]
+fn uninstall_retry_rejects_changed_purge_intent_before_more_deletion() {
+    let current = accepted("1.0.0", '1', 'a', 7);
+    let backend = FakeBackend::installed(vec![current], pair("2.0.0", '2', 'a'));
+    backend.fail.set(Some(Call::UninstallApplication));
+    assert_eq!(
+        LifecycleManager::new(&backend).uninstall(false),
+        Err(LifecycleError::Backend)
+    );
+    backend.fail.set(None);
+    backend.calls.borrow_mut().clear();
+
+    assert_eq!(
+        LifecycleManager::new(&backend).uninstall(true),
+        Err(LifecycleError::UninstallOptionsMismatch)
     );
     assert!(backend.calls.borrow().is_empty());
 }
@@ -497,6 +610,10 @@ fn purge_settings_is_passed_only_when_explicitly_requested() {
         fn restore_driver(&self, prior: &AcceptedPair) -> Result<(), LifecycleError> {
             self.inner.restore_driver(prior)
         }
+
+        fn prepare_uninstall(&self, accepted: &AcceptedPair) -> Result<OwnedFile, LifecycleError> {
+            self.inner.prepare_uninstall(accepted)
+        }
         fn uninstall_application(
             &self,
             owned_files: &[OwnedFile],
@@ -506,8 +623,8 @@ fn purge_settings_is_passed_only_when_explicitly_requested() {
             self.inner
                 .uninstall_application(owned_files, purge_settings)
         }
-        fn uninstall_driver(&self, driver: &ArtifactIdentity) -> Result<(), LifecycleError> {
-            self.inner.uninstall_driver(driver)
+        fn uninstall_driver(&self, drivers: &[ArtifactIdentity]) -> Result<(), LifecycleError> {
+            self.inner.uninstall_driver(drivers)
         }
         fn finalize_uninstall(&self, state: &LifecycleState) -> Result<(), LifecycleError> {
             self.inner.finalize_uninstall(state)
@@ -630,19 +747,19 @@ fn malformed_release_identity_is_rejected_before_any_target_mutation() {
 }
 
 #[test]
-fn explicit_rollback_rejects_two_distinct_accepted_identities_with_one_version() {
+fn explicit_rollback_rejects_a_verified_release_that_does_not_match_accepted_identity() {
     let backend = FakeBackend::installed(
         vec![
             accepted("2.0.0", '4', 'a', 4),
             accepted("1.0.0", '3', 'a', 3),
             accepted("1.0.0", '2', 'a', 2),
         ],
-        pair("9.0.0", '9', 'a'),
+        pair("1.0.0", '9', 'a'),
     );
 
     assert_eq!(
         LifecycleManager::new(&backend).rollback(Some(&Version::parse("1.0.0").unwrap())),
-        Err(LifecycleError::AmbiguousAcceptedVersion)
+        Err(LifecycleError::ImmutableReleaseMismatch)
     );
-    assert!(backend.calls.borrow().is_empty());
+    assert_eq!(backend.calls.borrow().as_slice(), [Call::Resolve]);
 }

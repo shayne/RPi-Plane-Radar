@@ -4,6 +4,7 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
     path::{Component, Path, PathBuf},
+    time::Duration,
 };
 
 #[cfg(unix)]
@@ -1330,8 +1331,12 @@ fn atomic_write_lock(path: &Path, lock: &DriverLock) -> Result<(), DriverError> 
         return Err(DriverError::InvalidPath);
     }
     let contents = format!(
-        "repository = \"{}\"\nversion = \"{}\"\ncommit = \"{}\"\nmanifest_sha256 = \"{}\"\n",
-        lock.repository, lock.version, lock.commit, lock.manifest_sha256
+        "repository = \"{}\"\nversion = \"{}\"\ncommit = \"{}\"\nmanifest_sha256 = \"{}\"\nlifecycle_protocol = \"{}\"\n",
+        lock.repository,
+        lock.version,
+        lock.commit,
+        lock.manifest_sha256,
+        crate::config::DRIVER_LIFECYCLE_PROTOCOL
     );
     let mut temporary = NamedTempFile::new_in(parent).map_err(DriverError::Io)?;
     set_private_file(temporary.as_file())?;
@@ -1378,6 +1383,15 @@ pub enum DriverAction {
     VerifyBoot,
     CommitBoot,
     RollbackBoot,
+    RecordAccepted,
+    BindStagedAccepted,
+    MarkCommittedAccepted,
+    StageRetained,
+    CommitRetained,
+    RecoverAccepted,
+    AcceptRetained,
+    UninstallAccepted,
+    RetireInactive,
     Uninstall,
 }
 
@@ -1588,6 +1602,73 @@ impl<R> DriverTool<R> {
 }
 
 impl<R: CommandRunner> DriverTool<R> {
+    pub fn run_accepted_protocol(
+        &self,
+        action: DriverAction,
+        source_revision: Option<&str>,
+    ) -> Result<(), DriverError> {
+        if !matches!(
+            action,
+            DriverAction::RecordAccepted
+                | DriverAction::BindStagedAccepted
+                | DriverAction::MarkCommittedAccepted
+                | DriverAction::StageRetained
+                | DriverAction::CommitRetained
+                | DriverAction::RecoverAccepted
+                | DriverAction::AcceptRetained
+                | DriverAction::UninstallAccepted
+                | DriverAction::RetireInactive
+        ) {
+            return Err(DriverError::InvalidContext);
+        }
+        let requires_identity = matches!(
+            action,
+            DriverAction::RecordAccepted
+                | DriverAction::StageRetained
+                | DriverAction::UninstallAccepted
+                | DriverAction::RetireInactive
+        );
+        if requires_identity != source_revision.is_some()
+            || source_revision.is_some_and(|revision| !is_lower_hex(revision, 40))
+        {
+            return Err(DriverError::InvalidContext);
+        }
+        let action_name = match action {
+            DriverAction::RecordAccepted => "record",
+            DriverAction::BindStagedAccepted => "bind-staged",
+            DriverAction::MarkCommittedAccepted => "mark-committed",
+            DriverAction::StageRetained => "stage-retained",
+            DriverAction::CommitRetained => "commit-retained",
+            DriverAction::RecoverAccepted => "recover",
+            DriverAction::AcceptRetained => "accept-retained",
+            DriverAction::UninstallAccepted => "uninstall",
+            DriverAction::RetireInactive => "retire-inactive",
+            _ => unreachable!("accepted protocol action was validated"),
+        };
+        let mut arguments = vec![
+            self.source
+                .join("scripts/accepted-lifecycle.sh")
+                .to_string_lossy()
+                .into_owned(),
+            "--target".into(),
+            self.context.target.clone(),
+            "--action".into(),
+            action_name.into(),
+        ];
+        if let Some(revision) = source_revision {
+            arguments.extend([
+                "--driver-version".into(),
+                self.driver_version.clone(),
+                "--source-revision".into(),
+                revision.to_owned(),
+                "--kernel-release".into(),
+                self.context.kernel_release.clone(),
+            ]);
+        }
+        self.execute(action, arguments)?;
+        Ok(())
+    }
+
     pub fn prepare_and_stage(&self) -> Result<(), DriverError> {
         match self.plan {
             DriverPlan::Prebuilt { .. } => {
@@ -1646,6 +1727,15 @@ impl<R: CommandRunner> DriverTool<R> {
             DriverAction::VerifyBoot => "verify-boot.sh",
             DriverAction::CommitBoot => "commit-boot.sh",
             DriverAction::RollbackBoot => "rollback-boot.sh",
+            DriverAction::RecordAccepted
+            | DriverAction::BindStagedAccepted
+            | DriverAction::MarkCommittedAccepted
+            | DriverAction::StageRetained
+            | DriverAction::CommitRetained
+            | DriverAction::RecoverAccepted
+            | DriverAction::AcceptRetained
+            | DriverAction::UninstallAccepted => "accepted-lifecycle.sh",
+            DriverAction::RetireInactive => "accepted-lifecycle.sh",
             DriverAction::Uninstall => "uninstall.sh",
         };
         let script = self.source.join("scripts").join(script);
@@ -1701,6 +1791,45 @@ impl<R: CommandRunner> DriverTool<R> {
                     "--json".into(),
                 ]);
             }
+            DriverAction::RecordAccepted
+            | DriverAction::BindStagedAccepted
+            | DriverAction::MarkCommittedAccepted
+            | DriverAction::StageRetained
+            | DriverAction::CommitRetained
+            | DriverAction::RecoverAccepted
+            | DriverAction::AcceptRetained
+            | DriverAction::UninstallAccepted
+            | DriverAction::RetireInactive => {
+                let action_name = match action {
+                    DriverAction::RecordAccepted => "record",
+                    DriverAction::BindStagedAccepted => "bind-staged",
+                    DriverAction::MarkCommittedAccepted => "mark-committed",
+                    DriverAction::StageRetained => "stage-retained",
+                    DriverAction::CommitRetained => "commit-retained",
+                    DriverAction::RecoverAccepted => "recover",
+                    DriverAction::AcceptRetained => "accept-retained",
+                    DriverAction::UninstallAccepted => "uninstall",
+                    DriverAction::RetireInactive => "retire-inactive",
+                    _ => unreachable!("accepted driver action classification"),
+                };
+                arguments.extend(["--action".into(), action_name.into()]);
+                if matches!(
+                    action,
+                    DriverAction::RecordAccepted
+                        | DriverAction::StageRetained
+                        | DriverAction::UninstallAccepted
+                        | DriverAction::RetireInactive
+                ) {
+                    arguments.extend([
+                        "--driver-version".into(),
+                        self.driver_version.clone(),
+                        "--source-revision".into(),
+                        self.source_revision.clone(),
+                        "--kernel-release".into(),
+                        self.context.kernel_release.clone(),
+                    ]);
+                }
+            }
             DriverAction::CommitBoot | DriverAction::RollbackBoot | DriverAction::Uninstall => {}
         }
         let output = self.execute(action, arguments)?;
@@ -1724,7 +1853,11 @@ impl<R: CommandRunner> DriverTool<R> {
     ) -> Result<CommandOutput, DriverError> {
         let output = self
             .runner
-            .run(Invocation::new("bash", arguments))
+            .run(
+                Invocation::new("bash", arguments)
+                    .with_timeout(Duration::from_secs(15 * 60))
+                    .with_stdout_limit(64 * 1024),
+            )
             .map_err(|source| DriverError::ToolCommandSpawn {
                 action,
                 program: "bash".into(),

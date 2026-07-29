@@ -6,10 +6,11 @@ use semver::Version;
 use serde::Deserialize;
 use thiserror::Error;
 
-use crate::cli::{Cli, Command, MutatingOptions};
+use crate::cli::{Cli, Command, MutatingOptions, UninstallOptions};
 
 pub const DEFAULT_HOSTNAME: &str = "planeradar";
 pub const DRIVER_REPOSITORY: &str = "https://github.com/shayne/hyperpixel2r-kms";
+pub const DRIVER_LIFECYCLE_PROTOCOL: &str = "accepted-driver-v1";
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Environment {
@@ -95,14 +96,13 @@ pub struct InstallConfig {
 
 impl InstallConfig {
     pub fn resolve(cli: Cli, environment: Environment) -> Result<Self, ConfigError> {
-        let (Command::Install(options)
-        | Command::Upgrade(options)
-        | Command::Rollback(options)
-        | Command::Uninstall(options)) = cli.command
-        else {
-            return Err(ConfigError::NonMutatingCommand);
-        };
-        Self::from_options(options, environment)
+        match cli.command {
+            Command::Install(options) | Command::Upgrade(options) | Command::Rollback(options) => {
+                Self::from_options(options, environment)
+            }
+            Command::Uninstall(options) => Self::from_uninstall_options(options, environment),
+            _ => Err(ConfigError::NonMutatingCommand),
+        }
     }
 
     fn from_options(
@@ -145,6 +145,23 @@ impl InstallConfig {
             release_dir,
             docker_context,
             non_interactive: options.non_interactive,
+            purge_settings: false,
+        })
+    }
+
+    fn from_uninstall_options(
+        options: UninstallOptions,
+        environment: Environment,
+    ) -> Result<Self, ConfigError> {
+        Ok(Self {
+            target: select_cli_value(options.target, environment.target, "target")?,
+            hostname: environment
+                .hostname
+                .unwrap_or_else(|| DEFAULT_HOSTNAME.to_owned()),
+            version: None,
+            release_dir: None,
+            docker_context: environment.docker_context,
+            non_interactive: options.non_interactive,
             purge_settings: options.purge_settings,
         })
     }
@@ -165,6 +182,9 @@ impl DriverLock {
             Version::parse(&raw.version).map_err(|_| DriverLockError::InvalidVersion {
                 version: raw.version,
             })?;
+        if raw.lifecycle_protocol != DRIVER_LIFECYCLE_PROTOCOL {
+            return Err(DriverLockError::InvalidLifecycleProtocol);
+        }
         let lock = Self {
             repository: raw.repository,
             version,
@@ -212,6 +232,7 @@ struct RawDriverLock {
     version: String,
     commit: String,
     manifest_sha256: String,
+    lifecycle_protocol: String,
 }
 
 fn required_dotenv_value(key: &str, value: &str) -> Result<String, ConfigError> {
@@ -290,4 +311,6 @@ pub enum DriverLockError {
     InvalidCommit { commit: String },
     #[error("driver lock manifest SHA-256 must be lowercase hexadecimal: {digest}")]
     InvalidManifestSha256 { digest: String },
+    #[error("driver lock does not name the accepted driver lifecycle protocol")]
+    InvalidLifecycleProtocol,
 }
