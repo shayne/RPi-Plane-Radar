@@ -73,6 +73,8 @@ pub enum Command {
         command: InstallerStateCommand,
     },
     #[command(hide = true)]
+    LifecycleProtocol,
+    #[command(hide = true)]
     LifecycleState {
         #[command(subcommand)]
         command: InstallerStateCommand,

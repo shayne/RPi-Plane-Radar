@@ -144,6 +144,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 ))?
             );
         }
+        Command::LifecycleProtocol => {
+            println!("lifecycle-v3");
+        }
         Command::LifecycleState {
             command: InstallerStateCommand::Read,
         } => {

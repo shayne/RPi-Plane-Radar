@@ -517,10 +517,34 @@ struct LifecycleTransactionDocument {
     prior: LifecycleAcceptedPair,
     candidate: LifecycleReleasePair,
     #[serde(default)]
+    management_helper: LifecycleManagementHelperDocument,
+    #[serde(default)]
     candidate_owned_files: Vec<InstalledFile>,
     #[serde(default)]
     restored_owned_files: Option<Vec<InstalledFile>>,
     phase: LifecyclePhaseDocument,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct LifecycleManagementHelperDocument {
+    application: InstallerArtifactIdentity,
+    target_path: String,
+    protocol: String,
+}
+
+impl Default for LifecycleManagementHelperDocument {
+    fn default() -> Self {
+        Self {
+            application: InstallerArtifactIdentity {
+                version: String::new(),
+                source_commit: String::new(),
+                sha256: String::new(),
+            },
+            target_path: String::new(),
+            protocol: String::new(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -722,16 +746,21 @@ fn parse_lifecycle_state(contents: &[u8]) -> Result<LifecycleStateDocument, Inst
         });
     if matches!(state.schema_version, 1 | 2) {
         state.schema_version = 3;
-        if let Some(transaction) = state.transaction.as_mut()
-            && transaction.candidate_owned_files.is_empty()
-        {
-            transaction.candidate_owned_files =
-                installer_candidate_owned_files(&transaction.candidate);
+        if let Some(transaction) = state.transaction.as_mut() {
+            if transaction.management_helper == LifecycleManagementHelperDocument::default() {
+                transaction.management_helper =
+                    installer_management_helper(&transaction.candidate.application);
+            }
+            if transaction.candidate_owned_files.is_empty() {
+                transaction.candidate_owned_files =
+                    installer_candidate_owned_files(&transaction.candidate);
+            }
         }
     }
     let transaction_valid = state.transaction.as_ref().is_none_or(|transaction| {
         valid_installer_artifact(&transaction.candidate.application)
             && valid_installer_artifact(&transaction.candidate.driver)
+            && valid_installer_management_helper(transaction)
             && transaction.candidate_owned_files
                 == installer_candidate_owned_files(&transaction.candidate)
             && transaction
@@ -778,22 +807,39 @@ fn parse_lifecycle_state(contents: &[u8]) -> Result<LifecycleStateDocument, Inst
 }
 
 fn installer_candidate_owned_files(candidate: &LifecycleReleasePair) -> Vec<InstalledFile> {
-    vec![
-        InstalledFile {
-            target_path: format!(
-                "/opt/planeradar/releases/{}/{}/planeradar",
-                candidate.application.version, candidate.application.sha256
-            ),
-            sha256: candidate.application.sha256.clone(),
-        },
-        InstalledFile {
-            target_path: format!(
+    vec![InstalledFile {
+        target_path: format!(
+            "/opt/planeradar/releases/{}/{}/planeradar",
+            candidate.application.version, candidate.application.sha256
+        ),
+        sha256: candidate.application.sha256.clone(),
+    }]
+}
+
+fn installer_management_helper(
+    application: &InstallerArtifactIdentity,
+) -> LifecycleManagementHelperDocument {
+    LifecycleManagementHelperDocument {
+        application: application.clone(),
+        target_path: format!(
+            "/var/lib/planeradar-installer/helpers/{}/planeradar",
+            application.sha256
+        ),
+        protocol: "lifecycle-v3".into(),
+    }
+}
+
+fn valid_installer_management_helper(transaction: &LifecycleTransactionDocument) -> bool {
+    let helper = &transaction.management_helper;
+    valid_installer_artifact(&helper.application)
+        && helper.protocol == "lifecycle-v3"
+        && helper.target_path
+            == format!(
                 "/var/lib/planeradar-installer/helpers/{}/planeradar",
-                candidate.application.sha256
-            ),
-            sha256: candidate.application.sha256.clone(),
-        },
-    ]
+                helper.application.sha256
+            )
+        && (helper.application == transaction.prior.pair.application
+            || helper.application == transaction.candidate.application)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

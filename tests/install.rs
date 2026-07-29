@@ -2,6 +2,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Mutex;
 
 use clap::Parser;
@@ -1323,6 +1324,121 @@ fn target_lifecycle_state_round_trips_strict_bounded_json_atomically() {
 }
 
 #[test]
+fn target_lifecycle_state_requires_the_exact_current_protocol_management_helper() {
+    let directory = tempfile::tempdir().expect("temporary state directory");
+    let state_directory = directory
+        .path()
+        .canonicalize()
+        .expect("canonical temporary directory")
+        .join("lifecycle-helper");
+    fs::create_dir(&state_directory).expect("state directory");
+    fs::set_permissions(&state_directory, fs::Permissions::from_mode(0o700))
+        .expect("private state directory");
+    let path = state_directory.join("state.json");
+    let prior_application = serde_json::json!({
+        "version": "1.0.0",
+        "source_commit": "1".repeat(40),
+        "sha256": "1".repeat(64)
+    });
+    let candidate_application = serde_json::json!({
+        "version": "2.0.0",
+        "source_commit": "2".repeat(40),
+        "sha256": "2".repeat(64)
+    });
+    let prior_driver = serde_json::json!({
+        "version": "0.1.0",
+        "source_commit": "a".repeat(40),
+        "sha256": "a".repeat(64)
+    });
+    let candidate_driver = serde_json::json!({
+        "version": "0.1.0",
+        "source_commit": "b".repeat(40),
+        "sha256": "b".repeat(64)
+    });
+    let prior = serde_json::json!({
+        "pair": {
+            "application": prior_application,
+            "driver": prior_driver
+        },
+        "sequence": 1,
+        "owned_files": [{
+            "target_path": "/opt/planeradar/bin/planeradar",
+            "sha256": "1".repeat(64)
+        }]
+    });
+    let helper_path = format!(
+        "/var/lib/planeradar-installer/helpers/{}/planeradar",
+        "2".repeat(64)
+    );
+    let state = serde_json::json!({
+        "schema_version": 3,
+        "hardware": {
+            "model": "Raspberry Pi Zero 2 W",
+            "serial": "0123456789abcdef"
+        },
+        "accepted": [prior.clone()],
+        "transaction": {
+            "prior": prior,
+            "candidate": {
+                "application": candidate_application.clone(),
+                "driver": candidate_driver
+            },
+            "management_helper": {
+                "application": candidate_application,
+                "target_path": helper_path,
+                "protocol": "lifecycle-v3"
+            },
+            "candidate_owned_files": [{
+                "target_path": format!(
+                    "/opt/planeradar/releases/2.0.0/{}/planeradar",
+                    "2".repeat(64)
+                ),
+                "sha256": "2".repeat(64)
+            }],
+            "restored_owned_files": null,
+            "phase": "prepared"
+        },
+        "uninstall": null
+    });
+    let encoded = serde_json::to_vec(&state).expect("lifecycle JSON");
+
+    write_lifecycle_state_json(&path, &encoded).expect("write lifecycle helper state");
+    let returned: serde_json::Value = serde_json::from_str(
+        &read_lifecycle_state_json(&path).expect("read lifecycle helper state"),
+    )
+    .expect("returned lifecycle JSON");
+    assert_eq!(
+        returned["transaction"]["management_helper"]["target_path"],
+        helper_path
+    );
+    assert_eq!(
+        returned["transaction"]["management_helper"]["protocol"],
+        "lifecycle-v3"
+    );
+
+    let mut wrong_protocol = state.clone();
+    wrong_protocol["transaction"]["management_helper"]["protocol"] = "lifecycle-v2".into();
+    let mut wrong_path = state.clone();
+    wrong_path["transaction"]["management_helper"]["target_path"] =
+        "/opt/planeradar/bin/planeradar".into();
+    let mut wrong_identity = state;
+    wrong_identity["transaction"]["management_helper"]["application"]["sha256"] =
+        "9".repeat(64).into();
+
+    for hostile in [wrong_protocol, wrong_path, wrong_identity] {
+        let hostile = serde_json::to_vec(&hostile).expect("hostile lifecycle JSON");
+        assert!(write_lifecycle_state_json(&path, &hostile).is_err());
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(
+                &read_lifecycle_state_json(&path).expect("preserved lifecycle helper state"),
+            )
+            .expect("preserved lifecycle helper JSON"),
+            returned
+        );
+    }
+}
+
+#[test]
 fn target_lifecycle_state_rejects_wrong_mode_and_hardlinks() {
     let directory = tempfile::tempdir().expect("temporary state directory");
     let state_directory = directory
@@ -1360,6 +1476,10 @@ fn target_application_ownership_protocol_round_trips_exactly() {
 
 #[test]
 fn target_lifecycle_cli_exposes_only_typed_state_activation_and_uninstall_arguments() {
+    let protocol =
+        Cli::try_parse_from(["planeradar", "lifecycle-protocol"]).expect("lifecycle protocol");
+    assert!(matches!(protocol.command, CliCommand::LifecycleProtocol));
+
     let state =
         Cli::try_parse_from(["planeradar", "lifecycle-state", "read"]).expect("lifecycle state");
     assert!(matches!(state.command, CliCommand::LifecycleState { .. }));
@@ -1408,6 +1528,18 @@ fn target_lifecycle_cli_exposes_only_typed_state_activation_and_uninstall_argume
     ])
     .expect("lifecycle retire");
     assert!(matches!(retire.command, CliCommand::LifecycleRetire { .. }));
+}
+
+#[test]
+fn target_lifecycle_protocol_reports_the_exact_management_contract() {
+    let output = Command::new(env!("CARGO_BIN_EXE_planeradar"))
+        .arg("lifecycle-protocol")
+        .output()
+        .expect("run target lifecycle protocol");
+
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"lifecycle-v3\n");
+    assert!(output.stderr.is_empty());
 }
 
 #[test]

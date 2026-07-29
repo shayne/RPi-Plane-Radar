@@ -1248,6 +1248,7 @@ fn is_lower_hex(value: &str, length: usize) -> bool {
 
 pub const LIFECYCLE_SCHEMA_VERSION: u32 = 3;
 pub const MAX_ACCEPTED_PAIRS: usize = 3;
+pub const MANAGEMENT_HELPER_PROTOCOL: &str = "lifecycle-v3";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -1262,6 +1263,28 @@ pub struct AcceptedPair {
     pub pair: ReleasePair,
     pub sequence: u64,
     pub owned_files: Vec<OwnedFile>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagementHelper {
+    pub application: ArtifactIdentity,
+    pub target_path: String,
+    pub protocol: String,
+}
+
+impl Default for ManagementHelper {
+    fn default() -> Self {
+        Self {
+            application: ArtifactIdentity {
+                version: String::new(),
+                source_commit: String::new(),
+                sha256: String::new(),
+            },
+            target_path: String::new(),
+            protocol: String::new(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -1286,6 +1309,8 @@ pub enum LifecyclePhase {
 pub struct LifecycleTransaction {
     pub prior: AcceptedPair,
     pub candidate: ReleasePair,
+    #[serde(default)]
+    pub management_helper: ManagementHelper,
     #[serde(default)]
     pub candidate_owned_files: Vec<OwnedFile>,
     #[serde(default)]
@@ -1379,6 +1404,10 @@ impl LifecycleState {
         self.uninstall.as_ref()
     }
 
+    pub fn transaction(&self) -> Option<&LifecycleTransaction> {
+        self.transaction.as_ref()
+    }
+
     pub fn to_json(&self) -> Result<String, LifecycleError> {
         self.validate()?;
         serde_json::to_string(self).map_err(|_| LifecycleError::InvalidState)
@@ -1396,10 +1425,15 @@ impl LifecycleState {
             .map_err(|_| LifecycleError::InvalidState)?;
         if matches!(state.schema_version, 1 | 2) {
             state.schema_version = LIFECYCLE_SCHEMA_VERSION;
-            if let Some(transaction) = state.transaction.as_mut()
-                && transaction.candidate_owned_files.is_empty()
-            {
-                transaction.candidate_owned_files = candidate_owned_files(&transaction.candidate);
+            if let Some(transaction) = state.transaction.as_mut() {
+                if transaction.management_helper == ManagementHelper::default() {
+                    transaction.management_helper =
+                        management_helper(&transaction.candidate.application);
+                }
+                if transaction.candidate_owned_files.is_empty() {
+                    transaction.candidate_owned_files =
+                        candidate_owned_files(&transaction.candidate);
+                }
             }
         }
         state.validate()?;
@@ -1448,6 +1482,7 @@ impl LifecycleState {
         }
         if let Some(transaction) = &self.transaction
             && (!valid_release_pair(&transaction.candidate)
+                || !valid_management_helper(transaction)
                 || transaction.candidate_owned_files
                     != candidate_owned_files(&transaction.candidate)
                 || transaction
@@ -1483,7 +1518,11 @@ impl LifecycleState {
         self.accepted.first().ok_or(LifecycleError::NoAcceptedPair)
     }
 
-    fn begin(&mut self, candidate: ReleasePair) -> Result<(), LifecycleError> {
+    fn begin(
+        &mut self,
+        candidate: ReleasePair,
+        management_helper: ManagementHelper,
+    ) -> Result<(), LifecycleError> {
         self.validate()?;
         if self.uninstall.is_some() {
             return Err(LifecycleError::UninstallInProgress);
@@ -1492,6 +1531,7 @@ impl LifecycleState {
             prior: self.current()?.clone(),
             candidate_owned_files: candidate_owned_files(&candidate),
             candidate,
+            management_helper,
             restored_owned_files: None,
             phase: LifecyclePhase::Prepared,
         });
@@ -1606,23 +1646,45 @@ fn valid_owned_file(file: &OwnedFile) -> bool {
         && is_lower_hex(&file.sha256, 64)
 }
 
-fn candidate_owned_files(pair: &ReleasePair) -> Vec<OwnedFile> {
-    vec![
-        OwnedFile {
-            target_path: format!(
-                "/opt/planeradar/releases/{}/{}/planeradar",
-                pair.application.version, pair.application.sha256
-            ),
-            sha256: pair.application.sha256.clone(),
-        },
-        OwnedFile {
-            target_path: format!(
+fn management_helper(application: &ArtifactIdentity) -> ManagementHelper {
+    ManagementHelper {
+        application: application.clone(),
+        target_path: format!(
+            "/var/lib/planeradar-installer/helpers/{}/planeradar",
+            application.sha256
+        ),
+        protocol: MANAGEMENT_HELPER_PROTOCOL.into(),
+    }
+}
+
+fn valid_management_helper(transaction: &LifecycleTransaction) -> bool {
+    let helper = &transaction.management_helper;
+    valid_release_artifact(&helper.application)
+        && helper.protocol == MANAGEMENT_HELPER_PROTOCOL
+        && helper.target_path
+            == format!(
                 "/var/lib/planeradar-installer/helpers/{}/planeradar",
-                pair.application.sha256
-            ),
-            sha256: pair.application.sha256.clone(),
-        },
-    ]
+                helper.application.sha256
+            )
+        && (helper.application == transaction.prior.pair.application
+            || helper.application == transaction.candidate.application)
+}
+
+fn valid_release_artifact(artifact: &ArtifactIdentity) -> bool {
+    semver::Version::parse(&artifact.version)
+        .is_ok_and(|version| version.to_string() == artifact.version)
+        && is_lower_hex(&artifact.source_commit, 40)
+        && is_lower_hex(&artifact.sha256, 64)
+}
+
+fn candidate_owned_files(pair: &ReleasePair) -> Vec<OwnedFile> {
+    vec![OwnedFile {
+        target_path: format!(
+            "/opt/planeradar/releases/{}/{}/planeradar",
+            pair.application.version, pair.application.sha256
+        ),
+        sha256: pair.application.sha256.clone(),
+    }]
 }
 
 pub trait LifecycleBackend {
@@ -1633,6 +1695,15 @@ pub trait LifecycleBackend {
         requested: Option<&semver::Version>,
     ) -> Result<ReleasePair, LifecycleError>;
     fn verify_historical_release(&self, expected: &ReleasePair) -> Result<(), LifecycleError>;
+    fn prepare_management_helper(
+        &self,
+        pair: &ReleasePair,
+    ) -> Result<ManagementHelper, LifecycleError> {
+        Ok(management_helper(&pair.application))
+    }
+    fn retire_management_helper(&self, _helper: &ManagementHelper) -> Result<(), LifecycleError> {
+        Ok(())
+    }
     fn stage_application(&self, pair: &ReleasePair) -> Result<(), LifecycleError>;
     fn stage_driver(&self, pair: &ReleasePair) -> Result<(), LifecycleError>;
     fn tryboot_driver(&self, pair: &ReleasePair) -> Result<(), LifecycleError>;
@@ -1676,12 +1747,25 @@ impl<'a, B: LifecycleBackend> LifecycleManager<'a, B> {
         &self,
         requested: Option<&semver::Version>,
     ) -> Result<LifecycleOutcome, LifecycleError> {
-        let state = self.load_recovered_state()?;
+        let state = match self.load_recovered_state() {
+            Ok(state) => state,
+            Err(LifecycleError::ManagementHelperRequired) => {
+                let pair = self.backend.resolve_release(requested)?;
+                if !valid_release_pair(&pair) {
+                    return Err(LifecycleError::ImmutableReleaseMismatch);
+                }
+                let helper = self.backend.prepare_management_helper(&pair)?;
+                let state = self.load_recovered_state()?;
+                return self.apply_pair(state, pair, helper);
+            }
+            Err(error) => return Err(error),
+        };
         let pair = self.backend.resolve_release(requested)?;
         if !valid_release_pair(&pair) {
             return Err(LifecycleError::ImmutableReleaseMismatch);
         }
-        self.apply_pair(state, pair)
+        let helper = self.backend.prepare_management_helper(&pair)?;
+        self.apply_pair(state, pair, helper)
     }
 
     pub fn rollback(
@@ -1720,7 +1804,8 @@ impl<'a, B: LifecycleBackend> LifecycleManager<'a, B> {
         if candidate.pair == current.pair {
             return Err(LifecycleError::NoPriorAcceptedPair);
         }
-        self.apply_pair(state, candidate.pair)
+        let helper = self.backend.prepare_management_helper(&current.pair)?;
+        self.apply_pair(state, candidate.pair, helper)
     }
 
     pub fn uninstall(&self, purge_settings: bool) -> Result<LifecycleOutcome, LifecycleError> {
@@ -1777,6 +1862,7 @@ impl<'a, B: LifecycleBackend> LifecycleManager<'a, B> {
         &self,
         mut state: LifecycleState,
         pair: ReleasePair,
+        management_helper: ManagementHelper,
     ) -> Result<LifecycleOutcome, LifecycleError> {
         let prior = state.current()?.clone();
         if pair == prior.pair {
@@ -1787,7 +1873,7 @@ impl<'a, B: LifecycleBackend> LifecycleManager<'a, B> {
             });
         }
         let driver_changed = pair.driver != prior.pair.driver;
-        state.begin(pair.clone())?;
+        state.begin(pair.clone(), management_helper.clone())?;
         self.backend.save_lifecycle_state(&state)?;
 
         let result = self.apply_candidate(&mut state, &pair, driver_changed);
@@ -1816,7 +1902,7 @@ impl<'a, B: LifecycleBackend> LifecycleManager<'a, B> {
         }
         state.finish_accept()?;
         self.backend.save_lifecycle_state(&state)?;
-        let _ = self.backend.retire_recovery_helper(&pair.application);
+        let _ = self.backend.retire_management_helper(&management_helper);
         Ok(LifecycleOutcome::Accepted {
             version: semver::Version::parse(&pair.application.version)
                 .map_err(|_| LifecycleError::InvalidState)?,
@@ -1874,6 +1960,9 @@ impl<'a, B: LifecycleBackend> LifecycleManager<'a, B> {
                 }
                 state.finish_accept()?;
                 self.backend.save_lifecycle_state(&state)?;
+                let _ = self
+                    .backend
+                    .retire_management_helper(&transaction.management_helper);
                 return Ok(state);
             }
             let driver_changed = transaction.prior.pair.driver != transaction.candidate.driver;
@@ -1891,6 +1980,7 @@ impl<'a, B: LifecycleBackend> LifecycleManager<'a, B> {
             .transaction
             .clone()
             .ok_or(LifecycleError::InvalidState)?;
+        let management_helper = transaction.management_helper.clone();
         let prior = transaction.prior;
         if state
             .transaction
@@ -1960,7 +2050,9 @@ impl<'a, B: LifecycleBackend> LifecycleManager<'a, B> {
             .ok_or(LifecycleError::InvalidState)?;
         prior_entry.owned_files = restored;
         state.transaction = None;
-        self.backend.save_lifecycle_state(state)
+        self.backend.save_lifecycle_state(state)?;
+        let _ = self.backend.retire_management_helper(&management_helper);
+        Ok(())
     }
 }
 
@@ -2005,6 +2097,8 @@ impl fmt::Display for LifecycleOutcome {
 pub enum LifecycleError {
     #[error("lifecycle state is invalid or inconsistent")]
     InvalidState,
+    #[error("a verified current-protocol management helper is required")]
+    ManagementHelperRequired,
     #[error("no accepted Plane Radar installation exists")]
     NoAcceptedPair,
     #[error("no prior accepted Plane Radar release exists")]

@@ -49,8 +49,8 @@ procedures.
 
 The next accepted external lifecycle source is the pending release
 `v0.1.0-rc.16`, commit
-`e5953b27463cb531ecfd52b44deddf4e1301e2f5`, locked by manifest SHA-256
-`bddbe2c305de56427568660548f715a23c15a8dcbfeb46a9d392c6cbcfd48f88`.
+`58c42896c8829a034f42a4bc92886dd6f21775a8`, locked by manifest SHA-256
+`5494a9f7f5c4a3214fff669efa26574b7d2602bafda5992472cd94b90885573c`.
 The running driver remains the already accepted RC13-built image. RC14 through
 the pending RC16 contain migration, release-control, and crash-recovery
 improvements and were deliberately verified here without staging or rebooting

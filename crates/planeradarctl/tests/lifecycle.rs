@@ -6,7 +6,7 @@ use planeradarctl::{
     cli::{Cli, Command as CliCommand},
     operations::{
         AcceptedPair, LifecycleBackend, LifecycleError, LifecycleManager, LifecycleOutcome,
-        LifecycleState, ReleasePair,
+        LifecycleState, ManagementHelper, ReleasePair,
     },
     state::{ArtifactIdentity, OwnedFile, TargetHardwareIdentity, TargetInstallState},
 };
@@ -38,6 +38,54 @@ fn accepted(version: &str, app_seed: char, driver_seed: char, sequence: u64) -> 
             sha256: app_seed.to_string().repeat(64),
         }],
     }
+}
+
+fn durable_pair_accepted_state(prior: AcceptedPair, candidate_pair: ReleasePair) -> LifecycleState {
+    let candidate = AcceptedPair {
+        pair: candidate_pair.clone(),
+        sequence: prior.sequence + 1,
+        owned_files: vec![OwnedFile {
+            target_path: APP_PATH.into(),
+            sha256: candidate_pair.application.sha256.clone(),
+        }],
+    };
+    let release_path = format!(
+        "/opt/planeradar/releases/{}/{}/planeradar",
+        candidate_pair.application.version, candidate_pair.application.sha256
+    );
+    let helper_path = format!(
+        "/var/lib/planeradar-installer/helpers/{}/planeradar",
+        candidate_pair.application.sha256
+    );
+    LifecycleState::from_json(
+        serde_json::to_vec(&serde_json::json!({
+            "schema_version": 3,
+            "hardware": {
+                "model": "Raspberry Pi Zero 2 W",
+                "serial": "10000000abcdef01"
+            },
+            "accepted": [candidate, prior.clone()],
+            "transaction": {
+                "prior": prior,
+                "candidate": candidate_pair.clone(),
+                "management_helper": {
+                    "application": candidate_pair.application,
+                    "target_path": helper_path,
+                    "protocol": "lifecycle-v3"
+                },
+                "candidate_owned_files": [{
+                    "target_path": release_path,
+                    "sha256": candidate_pair.application.sha256
+                }],
+                "restored_owned_files": null,
+                "phase": "pair_accepted"
+            },
+            "uninstall": null
+        }))
+        .expect("serialize durable pair acceptance")
+        .as_slice(),
+    )
+    .expect("durable pair acceptance")
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -76,6 +124,7 @@ struct FakeBackend {
     historical_expected: RefCell<Vec<ReleasePair>>,
     legacy_migration_expected: RefCell<Option<ReleasePair>>,
     staged_pairs: RefCell<Vec<ReleasePair>>,
+    prepared_helpers: RefCell<Vec<ReleasePair>>,
     uninstall_drivers: RefCell<Vec<ArtifactIdentity>>,
     retired_candidates: RefCell<Vec<Vec<OwnedFile>>>,
 }
@@ -106,6 +155,7 @@ impl FakeBackend {
             historical_expected: RefCell::new(Vec::new()),
             legacy_migration_expected: RefCell::new(None),
             staged_pairs: RefCell::new(Vec::new()),
+            prepared_helpers: RefCell::new(Vec::new()),
             uninstall_drivers: RefCell::new(Vec::new()),
             retired_candidates: RefCell::new(Vec::new()),
         }
@@ -123,6 +173,11 @@ impl FakeBackend {
 
 impl LifecycleBackend for FakeBackend {
     fn load_lifecycle_state(&self) -> Result<LifecycleState, LifecycleError> {
+        if self.legacy_migration_expected.borrow().is_some()
+            && self.prepared_helpers.borrow().is_empty()
+        {
+            return Err(LifecycleError::ManagementHelperRequired);
+        }
         if let Some(expected) = self.legacy_migration_expected.borrow_mut().take() {
             self.verify_historical_release(&expected)?;
         }
@@ -148,6 +203,21 @@ impl LifecycleBackend for FakeBackend {
     fn verify_historical_release(&self, expected: &ReleasePair) -> Result<(), LifecycleError> {
         self.historical_expected.borrow_mut().push(expected.clone());
         self.call(Call::VerifyHistorical)
+    }
+
+    fn prepare_management_helper(
+        &self,
+        pair: &ReleasePair,
+    ) -> Result<ManagementHelper, LifecycleError> {
+        self.prepared_helpers.borrow_mut().push(pair.clone());
+        Ok(ManagementHelper {
+            application: pair.application.clone(),
+            target_path: format!(
+                "/var/lib/planeradar-installer/helpers/{}/planeradar",
+                pair.application.sha256
+            ),
+            protocol: "lifecycle-v3".into(),
+        })
     }
 
     fn stage_application(&self, pair: &ReleasePair) -> Result<(), LifecycleError> {
@@ -507,7 +577,76 @@ fn a_task14_complete_state_migrates_deterministically_without_losing_owned_hashe
 }
 
 #[test]
-fn first_upgrade_migrates_and_attests_the_task14_pair_before_resolving_the_rc_candidate() {
+fn schema_v3_transaction_persists_the_exact_current_protocol_management_helper() {
+    let prior = accepted("1.0.0", '1', 'a', 1);
+    let candidate = pair("2.0.0", '2', 'b');
+    let helper_path = format!(
+        "/var/lib/planeradar-installer/helpers/{}/planeradar",
+        candidate.application.sha256
+    );
+    let release_path = format!(
+        "/opt/planeradar/releases/{}/{}/planeradar",
+        candidate.application.version, candidate.application.sha256
+    );
+    let state = LifecycleState::from_json(
+        serde_json::to_vec(&serde_json::json!({
+            "schema_version": 3,
+            "hardware": {
+                "model": "Raspberry Pi Zero 2 W",
+                "serial": "10000000abcdef01"
+            },
+            "accepted": [prior.clone()],
+            "transaction": {
+                "prior": prior,
+                "candidate": candidate.clone(),
+                "management_helper": {
+                    "application": candidate.application,
+                    "target_path": helper_path,
+                    "protocol": "lifecycle-v3"
+                },
+                "candidate_owned_files": [{
+                    "target_path": release_path,
+                    "sha256": candidate.application.sha256
+                }],
+                "restored_owned_files": null,
+                "phase": "prepared"
+            },
+            "uninstall": null
+        }))
+        .expect("serialize exact management helper")
+        .as_slice(),
+    )
+    .expect("schema-v3 management helper");
+
+    let encoded = state.to_json().expect("round-trip lifecycle state");
+    assert!(encoded.contains("\"protocol\":\"lifecycle-v3\""));
+    assert!(encoded.contains(&helper_path));
+
+    let valid: serde_json::Value =
+        serde_json::from_str(&encoded).expect("valid lifecycle JSON document");
+    let mut wrong_protocol = valid.clone();
+    wrong_protocol["transaction"]["management_helper"]["protocol"] = "lifecycle-v2".into();
+    let mut wrong_path = valid.clone();
+    wrong_path["transaction"]["management_helper"]["target_path"] =
+        "/opt/planeradar/bin/planeradar".into();
+    let mut wrong_identity = valid;
+    wrong_identity["transaction"]["management_helper"]["application"]["sha256"] =
+        "9".repeat(64).into();
+
+    for hostile in [wrong_protocol, wrong_path, wrong_identity] {
+        assert_eq!(
+            LifecycleState::from_json(
+                serde_json::to_vec(&hostile)
+                    .expect("serialize hostile lifecycle state")
+                    .as_slice(),
+            ),
+            Err(LifecycleError::InvalidState)
+        );
+    }
+}
+
+#[test]
+fn first_upgrade_resolves_the_rc_candidate_before_migrating_or_attesting_task14() {
     let task14_pair = pair("1.0.0", '1', 'a');
     let rc_candidate = pair("2.0.0", '2', 'b');
     let prior = AcceptedPair {
@@ -527,11 +666,15 @@ fn first_upgrade_migrates_and_attests_the_task14_pair_before_resolving_the_rc_ca
 
     assert_eq!(
         &backend.calls.borrow()[..2],
-        [Call::VerifyHistorical, Call::Resolve]
+        [Call::Resolve, Call::VerifyHistorical]
     );
     assert_eq!(
         backend.historical_expected.borrow().as_slice(),
         &[task14_pair]
+    );
+    assert_eq!(
+        backend.prepared_helpers.borrow().as_slice(),
+        &[rc_candidate.clone()]
     );
     assert_eq!(
         backend.staged_pairs.borrow().as_slice(),
@@ -883,8 +1026,10 @@ fn explicit_old_driver_rollback_verifies_the_exact_historical_pair_without_curre
 {
     let current = accepted("2.0.0", '2', 'b', 2);
     let historical = accepted("1.0.0", '1', 'a', 1);
-    let backend =
-        FakeBackend::installed(vec![current, historical.clone()], pair("9.9.9", '9', 'f'));
+    let backend = FakeBackend::installed(
+        vec![current.clone(), historical.clone()],
+        pair("9.9.9", '9', 'f'),
+    );
 
     LifecycleManager::new(&backend)
         .rollback(Some(&Version::parse("1.0.0").unwrap()))
@@ -893,6 +1038,10 @@ fn explicit_old_driver_rollback_verifies_the_exact_historical_pair_without_curre
     assert_eq!(
         backend.historical_expected.borrow().as_slice(),
         &[historical.pair]
+    );
+    assert_eq!(
+        backend.prepared_helpers.borrow().as_slice(),
+        &[current.pair]
     );
     assert!(!backend.calls.borrow().contains(&Call::Resolve));
 }
@@ -918,22 +1067,13 @@ fn app_acceptance_save_failure_restores_prior_and_retires_exact_candidate_assets
     assert_eq!(backend.state.borrow().accepted()[0].pair, prior.pair);
     assert_eq!(
         backend.retired_candidates.borrow().last().unwrap(),
-        &vec![
-            OwnedFile {
-                target_path: format!(
-                    "/opt/planeradar/releases/{}/{}/planeradar",
-                    candidate.application.version, candidate.application.sha256
-                ),
-                sha256: candidate.application.sha256.clone(),
-            },
-            OwnedFile {
-                target_path: format!(
-                    "/var/lib/planeradar-installer/helpers/{}/planeradar",
-                    candidate.application.sha256
-                ),
-                sha256: candidate.application.sha256,
-            },
-        ]
+        &vec![OwnedFile {
+            target_path: format!(
+                "/opt/planeradar/releases/{}/{}/planeradar",
+                candidate.application.version, candidate.application.sha256
+            ),
+            sha256: candidate.application.sha256.clone(),
+        },]
     );
 }
 
@@ -941,52 +1081,7 @@ fn app_acceptance_save_failure_restores_prior_and_retires_exact_candidate_assets
 fn crash_after_durable_app_acceptance_finalizes_candidate_instead_of_rolling_back() {
     let prior = accepted("1.0.0", '1', 'a', 1);
     let candidate_pair = pair("2.0.0", '2', 'b');
-    let candidate = AcceptedPair {
-        pair: candidate_pair.clone(),
-        sequence: 2,
-        owned_files: vec![OwnedFile {
-            target_path: APP_PATH.into(),
-            sha256: "2".repeat(64),
-        }],
-    };
-    let release_path = format!(
-        "/opt/planeradar/releases/{}/{}/planeradar",
-        candidate_pair.application.version, candidate_pair.application.sha256
-    );
-    let helper_path = format!(
-        "/var/lib/planeradar-installer/helpers/{}/planeradar",
-        candidate_pair.application.sha256
-    );
-    let state = LifecycleState::from_json(
-        serde_json::to_vec(&serde_json::json!({
-            "schema_version": 3,
-            "hardware": {
-                "model": "Raspberry Pi Zero 2 W",
-                "serial": "10000000abcdef01"
-            },
-            "accepted": [candidate, prior.clone()],
-            "transaction": {
-                "prior": prior,
-                "candidate": candidate_pair.clone(),
-                "candidate_owned_files": [
-                    {
-                        "target_path": release_path,
-                        "sha256": candidate_pair.application.sha256
-                    },
-                    {
-                        "target_path": helper_path,
-                        "sha256": candidate_pair.application.sha256
-                    }
-                ],
-                "restored_owned_files": null,
-                "phase": "pair_accepted"
-            },
-            "uninstall": null
-        }))
-        .unwrap()
-        .as_slice(),
-    )
-    .expect("durable pair acceptance");
+    let state = durable_pair_accepted_state(prior, candidate_pair.clone());
     let backend = FakeBackend::installed(Vec::new(), candidate_pair);
     *backend.state.borrow_mut() = state;
 
@@ -999,6 +1094,76 @@ fn crash_after_durable_app_acceptance_finalizes_candidate_instead_of_rolling_bac
         Some(&Call::FinalizeDriverAcceptance)
     );
     assert!(!backend.calls.borrow().contains(&Call::RestoreDriver));
+}
+
+#[test]
+fn fresh_process_retries_when_driver_finalizer_was_interrupted_before_completion() {
+    let prior = accepted("1.0.0", '1', 'a', 1);
+    let candidate = pair("2.0.0", '2', 'b');
+    let persisted = durable_pair_accepted_state(prior, candidate.clone());
+    let interrupted = FakeBackend::installed(Vec::new(), candidate.clone());
+    *interrupted.state.borrow_mut() = persisted;
+    interrupted.fail.set(Some(Call::FinalizeDriverAcceptance));
+
+    assert_eq!(
+        LifecycleManager::new(&interrupted).upgrade(None),
+        Err(LifecycleError::Backend)
+    );
+    assert!(
+        interrupted
+            .state
+            .borrow()
+            .to_json()
+            .expect("durable acceptance")
+            .contains("\"phase\":\"pair_accepted\"")
+    );
+
+    let restarted = FakeBackend::installed(Vec::new(), candidate);
+    *restarted.state.borrow_mut() = interrupted.state.borrow().clone();
+    LifecycleManager::new(&restarted)
+        .upgrade(None)
+        .expect("fresh-process finalizer retry");
+    assert_eq!(
+        restarted.calls.borrow().first(),
+        Some(&Call::FinalizeDriverAcceptance)
+    );
+}
+
+#[test]
+fn fresh_process_repeats_idempotent_driver_finalizer_when_app_clear_save_was_interrupted() {
+    let prior = accepted("1.0.0", '1', 'a', 1);
+    let candidate = pair("2.0.0", '2', 'b');
+    let persisted = durable_pair_accepted_state(prior, candidate.clone());
+    let interrupted = FakeBackend::installed(Vec::new(), candidate.clone());
+    *interrupted.state.borrow_mut() = persisted;
+    interrupted.fail_save.set(Some(1));
+
+    assert_eq!(
+        LifecycleManager::new(&interrupted).upgrade(None),
+        Err(LifecycleError::Backend)
+    );
+    assert_eq!(
+        interrupted.calls.borrow().first(),
+        Some(&Call::FinalizeDriverAcceptance)
+    );
+    assert!(
+        interrupted
+            .state
+            .borrow()
+            .to_json()
+            .expect("durable acceptance")
+            .contains("\"phase\":\"pair_accepted\"")
+    );
+
+    let restarted = FakeBackend::installed(Vec::new(), candidate);
+    *restarted.state.borrow_mut() = interrupted.state.borrow().clone();
+    LifecycleManager::new(&restarted)
+        .upgrade(None)
+        .expect("fresh-process post-finalize retry");
+    assert_eq!(
+        restarted.calls.borrow().first(),
+        Some(&Call::FinalizeDriverAcceptance)
+    );
 }
 
 #[test]
@@ -1026,12 +1191,9 @@ fn repeated_failed_candidates_are_exactly_retired_and_never_expand_accepted_hist
     let retired = backend.retired_candidates.borrow();
     assert_eq!(retired.len(), 5);
     assert!(retired.iter().all(|candidate| {
-        candidate.len() == 2
+        candidate.len() == 1
             && candidate[0]
                 .target_path
                 .starts_with("/opt/planeradar/releases/")
-            && candidate[1]
-                .target_path
-                .starts_with("/var/lib/planeradar-installer/helpers/")
     }));
 }
