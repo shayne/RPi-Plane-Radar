@@ -58,6 +58,20 @@ pub fn extract_application_payload(
     expected_archive_sha256: &str,
     private_cache_root: &Path,
 ) -> Result<ApplicationPayload, ApplicationArchiveError> {
+    extract_application_payload_at_mtime(
+        archive_path,
+        expected_archive_sha256,
+        private_cache_root,
+        0,
+    )
+}
+
+pub fn extract_application_payload_at_mtime(
+    archive_path: &Path,
+    expected_archive_sha256: &str,
+    private_cache_root: &Path,
+    expected_mtime: u64,
+) -> Result<ApplicationPayload, ApplicationArchiveError> {
     let archive_metadata = fs::symlink_metadata(archive_path)?;
     if !archive_metadata.file_type().is_file()
         || archive_metadata.len() == 0
@@ -147,7 +161,7 @@ pub fn extract_application_payload(
         || header.mode().ok() != Some(0o755)
         || header.uid().ok() != Some(0)
         || header.gid().ok() != Some(0)
-        || header.mtime().ok() != Some(0)
+        || header.mtime().ok() != Some(expected_mtime)
         || header
             .size()
             .ok()
@@ -804,20 +818,33 @@ impl TargetInstallOwnership {
     }
 
     fn validate(&self) -> Result<(), &'static str> {
-        if self.schema_version != 1 || self.owned_files.len() != 4 {
+        if self.schema_version != 1 {
             return Err("invalid target install ownership");
         }
-        const EXACT_OWNED_PATHS: [&str; 4] = [
+        const MANDATORY_OWNED_PATHS: [&str; 4] = [
             "/opt/planeradar/bin/planeradar",
             "/opt/planeradar/REVISION",
             "/opt/planeradar/SHA256",
             "/etc/systemd/system/planeradar.service",
         ];
+        const OWNED_SETTINGS_PATHS: [&str; 6] = [
+            "/opt/planeradar/bin/planeradar",
+            "/opt/planeradar/REVISION",
+            "/opt/planeradar/SHA256",
+            "/etc/systemd/system/planeradar.service",
+            "/var/lib/planeradar/settings.json",
+            "/var/lib/planeradar-installer/settings-owned-v1",
+        ];
+        let expected_paths: &[&str] = match self.owned_files.len() {
+            4 => &MANDATORY_OWNED_PATHS,
+            6 => &OWNED_SETTINGS_PATHS,
+            _ => return Err("invalid target install ownership"),
+        };
         if self
             .owned_files
             .iter()
             .map(|file| file.target_path.as_str())
-            .ne(EXACT_OWNED_PATHS)
+            .ne(expected_paths.iter().copied())
             || self
                 .owned_files
                 .iter()

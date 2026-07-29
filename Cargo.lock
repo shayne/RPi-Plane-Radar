@@ -1133,6 +1133,7 @@ checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
 name = "planeradar"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "clap",
  "csv",
  "env_logger",
@@ -1142,6 +1143,7 @@ dependencies = [
  "libc",
  "log",
  "nix",
+ "planeradarctl",
  "png 0.18.1",
  "qrcode",
  "rand",
@@ -1152,12 +1154,14 @@ dependencies = [
  "sha2",
  "signal-hook",
  "subtle",
+ "tar",
  "tempfile",
  "thiserror",
  "tiny-skia",
  "tiny_http",
  "ureq",
  "url",
+ "zstd",
 ]
 
 [[package]]

@@ -1,5 +1,7 @@
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
+use std::process::Command;
 
 const PUBLIC_TARGET: &str = "pi@raspberrypi.local";
 
@@ -99,4 +101,135 @@ fn shell_scripts_contain_only_the_documented_public_ssh_target() {
             );
         }
     }
+}
+
+#[test]
+fn smoke_uses_only_typed_mise_control_tasks_and_private_doctor_json() {
+    let source =
+        fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/smoke-pi.sh"))
+            .expect("smoke script");
+    for command in [
+        r#"mise run status -- "$target""#,
+        r#"mise run doctor -- "$target" --json"#,
+        r#"mise run screenshot -- "$target" --output dist/smoke-radar.png"#,
+    ] {
+        assert!(source.contains(command), "missing typed command: {command}");
+    }
+    assert!(!source.contains("\nssh "));
+    assert!(!source.contains("| ssh "));
+    assert!(
+        source.contains("doctor_json=") && source.contains(">\"$doctor_json\""),
+        "doctor JSON must be redirected to a private file"
+    );
+}
+
+#[test]
+fn smoke_forwards_one_target_in_order_without_printing_doctor_facts() {
+    let temporary = tempfile::tempdir().expect("smoke script fixture");
+    let root = temporary.path();
+    fs::create_dir_all(root.join("scripts")).expect("scripts directory");
+    fs::create_dir_all(root.join("dist/release")).expect("release directory");
+    fs::create_dir_all(root.join("bin")).expect("fake bin");
+    fs::create_dir_all(root.join("tmp")).expect("private temp parent");
+    fs::copy(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/smoke-pi.sh"),
+        root.join("scripts/smoke-pi.sh"),
+    )
+    .expect("copy smoke script");
+    fs::set_permissions(
+        root.join("scripts/smoke-pi.sh"),
+        fs::Permissions::from_mode(0o755),
+    )
+    .expect("smoke script mode");
+
+    let png = root.join("fixture.png");
+    let file = fs::File::create(&png).expect("PNG fixture");
+    let mut encoder = png::Encoder::new(file, 480, 480);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut writer = encoder.write_header().expect("PNG header");
+    writer
+        .write_image_data(&vec![0; 480 * 480 * 4])
+        .expect("PNG pixels");
+
+    let fake_mise = root.join("bin/mise");
+    fs::write(
+        &fake_mise,
+        r#"#!/bin/sh
+set -eu
+printf '%s\n' "$*" >>"$FAKE_LOG"
+case "$1:$2" in
+  run:status)
+    printf '%s\n' 'Plane Radar healthy'
+    ;;
+  run:doctor)
+    printf '%s\n' '{"healthy":true,"target_serial":"SERIAL-MUST-STAY-PRIVATE"}'
+    ;;
+  run:screenshot)
+    shift 2
+    while test "$#" -gt 0; do
+      if test "$1" = --output; then
+        cp "$FAKE_PNG" "$2"
+        exit 0
+      fi
+      shift
+    done
+    exit 64
+    ;;
+  run:smoke-verify)
+    shift 2
+    doctor=
+    while test "$#" -gt 0; do
+      if test "$1" = --doctor-json; then
+        doctor=$2
+        break
+      fi
+      shift
+    done
+    test -n "$doctor"
+    test -f "$doctor"
+    grep -q SERIAL-MUST-STAY-PRIVATE "$doctor"
+    test -f dist/smoke-radar.png
+    printf '%s\n' 'Plane Radar smoke verified'
+    ;;
+  *)
+    exit 64
+    ;;
+esac
+"#,
+    )
+    .expect("fake mise");
+    fs::set_permissions(&fake_mise, fs::Permissions::from_mode(0o755)).expect("fake mise mode");
+    let log = root.join("mise.log");
+    let output = Command::new(root.join("scripts/smoke-pi.sh"))
+        .arg("pi@test.invalid")
+        .current_dir(root)
+        .env(
+            "PATH",
+            format!("{}:/usr/bin:/bin", root.join("bin").display()),
+        )
+        .env("TMPDIR", root.join("tmp"))
+        .env("FAKE_LOG", &log)
+        .env("FAKE_PNG", &png)
+        .output()
+        .expect("run smoke script");
+    assert!(
+        output.status.success(),
+        "smoke failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("smoke stdout");
+    assert!(!stdout.contains("SERIAL-MUST-STAY-PRIVATE"));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("SERIAL-MUST-STAY-PRIVATE"));
+    let invocations = fs::read_to_string(log).expect("mise invocation log");
+    let lines = invocations.lines().collect::<Vec<_>>();
+    assert_eq!(lines.len(), 4);
+    assert_eq!(lines[0], "run status -- pi@test.invalid");
+    assert_eq!(lines[1], "run doctor -- pi@test.invalid --json");
+    assert_eq!(
+        lines[2],
+        "run screenshot -- pi@test.invalid --output dist/smoke-radar.png"
+    );
+    assert!(lines[3].starts_with("run smoke-verify -- --release-dir dist/release "));
+    assert!(root.join("dist/smoke-radar.png").is_file());
 }

@@ -57,6 +57,9 @@ run = 'cargo run --locked -p planeradarctl -- doctor "$@"'
 [tasks.screenshot]
 run = 'cargo run --locked -p planeradarctl -- screenshot "$@"'
 
+[tasks.smoke-verify]
+run = 'cargo run --locked -p planeradarctl -- smoke-verify "$@"'
+
 [tasks.rollback]
 run = 'cargo run --locked -p planeradarctl -- rollback "$@"'
 

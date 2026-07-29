@@ -288,6 +288,11 @@ fn expected_owned_files(application: &ArtifactIdentity) -> Vec<OwnedFile> {
         ("/opt/planeradar/REVISION", "7".repeat(64)),
         ("/opt/planeradar/SHA256", "8".repeat(64)),
         ("/etc/systemd/system/planeradar.service", "9".repeat(64)),
+        ("/var/lib/planeradar/settings.json", "a".repeat(64)),
+        (
+            "/var/lib/planeradar-installer/settings-owned-v1",
+            "b".repeat(64),
+        ),
     ]
     .into_iter()
     .map(|(target_path, sha256)| OwnedFile {
@@ -711,22 +716,122 @@ fn target_install_json_rejects_hostile_partial_and_ambiguous_output() {
     }
 }
 
-#[test]
-fn target_install_ownership_json_is_a_separate_strict_internal_contract() {
-    let json = br#"{
+fn ownership_json(paths: &[&str]) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
         "schema_version": 1,
-        "owned_files": [
-            {"target_path": "/opt/planeradar/bin/planeradar", "sha256": "6666666666666666666666666666666666666666666666666666666666666666"},
-            {"target_path": "/opt/planeradar/REVISION", "sha256": "7777777777777777777777777777777777777777777777777777777777777777"},
-            {"target_path": "/opt/planeradar/SHA256", "sha256": "8888888888888888888888888888888888888888888888888888888888888888"},
-            {"target_path": "/etc/systemd/system/planeradar.service", "sha256": "9999999999999999999999999999999999999999999999999999999999999999"}
-        ]
-    }"#;
-    let parsed = TargetInstallOwnership::from_json(json).expect("valid ownership");
-    assert_eq!(parsed.owned_files.len(), 4);
-    assert!(
-        TargetInstallOwnership::from_json(br#"{"schema_version":1,"owned_files":[]}"#).is_err()
-    );
+        "owned_files": paths
+            .iter()
+            .enumerate()
+            .map(|(index, path)| serde_json::json!({
+                "target_path": path,
+                "sha256": format!("{:x}", index + 6).repeat(64),
+            }))
+            .collect::<Vec<_>>(),
+    }))
+    .expect("ownership test JSON")
+}
+
+#[test]
+fn target_install_ownership_accepts_both_exact_production_shapes() {
+    let mandatory = [
+        "/opt/planeradar/bin/planeradar",
+        "/opt/planeradar/REVISION",
+        "/opt/planeradar/SHA256",
+        "/etc/systemd/system/planeradar.service",
+    ];
+    let with_owned_settings = [
+        "/opt/planeradar/bin/planeradar",
+        "/opt/planeradar/REVISION",
+        "/opt/planeradar/SHA256",
+        "/etc/systemd/system/planeradar.service",
+        "/var/lib/planeradar/settings.json",
+        "/var/lib/planeradar-installer/settings-owned-v1",
+    ];
+
+    for expected in [&mandatory[..], &with_owned_settings[..]] {
+        let parsed =
+            TargetInstallOwnership::from_json(&ownership_json(expected)).expect("valid ownership");
+        assert_eq!(
+            parsed
+                .owned_files
+                .iter()
+                .map(|file| file.target_path.as_str())
+                .collect::<Vec<_>>(),
+            expected
+        );
+    }
+}
+
+#[test]
+fn target_install_ownership_rejects_partial_reordered_duplicate_and_extra_paths() {
+    let invalid = [
+        (
+            "settings without marker",
+            vec![
+                "/opt/planeradar/bin/planeradar",
+                "/opt/planeradar/REVISION",
+                "/opt/planeradar/SHA256",
+                "/etc/systemd/system/planeradar.service",
+                "/var/lib/planeradar/settings.json",
+            ],
+        ),
+        (
+            "marker without settings",
+            vec![
+                "/opt/planeradar/bin/planeradar",
+                "/opt/planeradar/REVISION",
+                "/opt/planeradar/SHA256",
+                "/etc/systemd/system/planeradar.service",
+                "/var/lib/planeradar-installer/settings-owned-v1",
+            ],
+        ),
+        (
+            "reordered mandatory paths",
+            vec![
+                "/opt/planeradar/REVISION",
+                "/opt/planeradar/bin/planeradar",
+                "/opt/planeradar/SHA256",
+                "/etc/systemd/system/planeradar.service",
+            ],
+        ),
+        (
+            "reordered settings paths",
+            vec![
+                "/opt/planeradar/bin/planeradar",
+                "/opt/planeradar/REVISION",
+                "/opt/planeradar/SHA256",
+                "/etc/systemd/system/planeradar.service",
+                "/var/lib/planeradar-installer/settings-owned-v1",
+                "/var/lib/planeradar/settings.json",
+            ],
+        ),
+        (
+            "duplicate path",
+            vec![
+                "/opt/planeradar/bin/planeradar",
+                "/opt/planeradar/REVISION",
+                "/opt/planeradar/SHA256",
+                "/opt/planeradar/bin/planeradar",
+            ],
+        ),
+        (
+            "extra path",
+            vec![
+                "/opt/planeradar/bin/planeradar",
+                "/opt/planeradar/REVISION",
+                "/opt/planeradar/SHA256",
+                "/etc/systemd/system/planeradar.service",
+                "/tmp/extra",
+            ],
+        ),
+    ];
+
+    for (case, paths) in invalid {
+        assert!(
+            TargetInstallOwnership::from_json(&ownership_json(&paths)).is_err(),
+            "accepted {case}"
+        );
+    }
 }
 
 #[test]

@@ -16,6 +16,8 @@ pub enum Command {
     Status(TargetOptions),
     Doctor(DoctorOptions),
     Screenshot(ScreenshotOptions),
+    #[command(hide = true)]
+    SmokeVerify(SmokeVerifyOptions),
     Rollback(MutatingOptions),
     Uninstall(UninstallOptions),
     Driver {
@@ -85,4 +87,16 @@ pub struct ScreenshotOptions {
     pub target: Option<String>,
     #[arg(long, default_value = "planeradar-radar.png")]
     pub output: PathBuf,
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct SmokeVerifyOptions {
+    #[arg(long)]
+    pub release_dir: PathBuf,
+    #[arg(long)]
+    pub doctor_json: PathBuf,
+    #[arg(long)]
+    pub screenshot: PathBuf,
+    #[arg(long)]
+    pub captured_after: u64,
 }
