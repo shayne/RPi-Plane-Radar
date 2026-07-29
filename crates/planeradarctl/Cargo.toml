@@ -9,7 +9,7 @@ license = "MIT"
 base64 = "0.22"
 clap = { version = "4.5", features = ["derive"] }
 libc = "0.2"
-nix = { version = "0.30", features = ["fs"] }
+nix = { version = "0.30", features = ["fs", "user"] }
 png = "0.18"
 rand = "0.9"
 semver = "1.0"

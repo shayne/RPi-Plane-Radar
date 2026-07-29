@@ -10,7 +10,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use nix::errno::Errno;
 use nix::fcntl::{AtFlags, OFlag, open, openat, renameat};
 use nix::sys::stat::{Mode, SFlag, fstat, fstatat, mkdirat};
-use nix::unistd::{UnlinkatFlags, unlinkat};
+use nix::unistd::{UnlinkatFlags, geteuid, unlinkat};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -66,6 +66,7 @@ pub struct DiagnosticFacts {
     pub expected_application: ArtifactIdentity,
     pub running_application_revision: String,
     pub installed_driver: ArtifactIdentity,
+    pub persisted_driver_manifest_sha256: String,
     pub expected_driver: ArtifactIdentity,
     pub running_kernel: String,
     pub expected_kernel: String,
@@ -400,8 +401,8 @@ impl<T: Transport> OperationsBackend for SshOperationsBackend<'_, T> {
             .identity;
         let state = self.target_state()?;
         let expected_application = state.application.ok_or(OperationError::MalformedFacts)?;
-        let installed_driver = state.driver.ok_or(OperationError::MalformedFacts)?;
-        let probe = self.diagnostic_probe(&installed_driver)?;
+        let persisted_driver = state.driver.ok_or(OperationError::MalformedFacts)?;
+        let probe = self.diagnostic_probe(&persisted_driver)?;
         if probe.schema_version != DOCTOR_SCHEMA_VERSION {
             return Err(OperationError::MalformedFacts);
         }
@@ -434,6 +435,7 @@ impl<T: Transport> OperationsBackend for SshOperationsBackend<'_, T> {
                 source_commit: probe.driver_revision,
                 sha256: probe.driver_manifest_sha256,
             },
+            persisted_driver_manifest_sha256: persisted_driver.sha256,
             expected_driver: ArtifactIdentity {
                 version: self.expected_driver.version.to_string(),
                 source_commit: self.expected_driver.commit.clone(),
@@ -727,7 +729,6 @@ impl<'a, B: OperationsBackend, C: CaptureClock> OperationsClient<'a, B, C> {
         validate_png(&capture.bytes)?;
         remaining(&self.clock, deadline)?;
         local.persist(&capture.bytes, &self.clock, deadline)?;
-        remaining(&self.clock, deadline)?;
         Ok(ScreenshotResult {
             destination: destination.to_owned(),
             sha256: digest,
@@ -767,7 +768,9 @@ fn evaluate(facts: &DiagnosticFacts) -> Vec<DiagnosticCode> {
     if facts.installed_driver.source_commit != facts.expected_driver.source_commit {
         diagnostics.push(DiagnosticCode::DriverRevisionMismatch);
     }
-    if facts.installed_driver.sha256 != facts.expected_driver.sha256 {
+    if facts.installed_driver.sha256 != facts.persisted_driver_manifest_sha256
+        || facts.installed_driver.sha256 != facts.expected_driver.sha256
+    {
         diagnostics.push(DiagnosticCode::DriverManifestMismatch);
     }
     if facts.running_kernel != facts.expected_kernel {
@@ -835,6 +838,7 @@ fn validate_facts(facts: &DiagnosticFacts) -> Result<(), OperationError> {
         &facts.installed_driver.version,
         &facts.installed_driver.source_commit,
         &facts.installed_driver.sha256,
+        &facts.persisted_driver_manifest_sha256,
         &facts.expected_driver.version,
         &facts.expected_driver.source_commit,
         &facts.expected_driver.sha256,
@@ -850,6 +854,7 @@ fn validate_facts(facts: &DiagnosticFacts) -> Result<(), OperationError> {
         &facts.overlay_sha256,
         &facts.expected_overlay_sha256,
         &facts.boot_config_sha256,
+        &facts.persisted_driver_manifest_sha256,
         &facts.drm_device,
         &facts.drm_mode,
         &facts.renderer,
@@ -1003,22 +1008,30 @@ impl PinnedDestination {
                 || metadata.st_nlink != 1
                 || metadata.st_size != bytes.len() as i64
                 || metadata.st_mode & 0o777 != 0o600
+                || metadata.st_uid != geteuid().as_raw()
             {
                 return Err(OperationError::UnsafeLocalDestination);
             }
             remaining(clock, deadline)?;
             self.verify_parent_identity()?;
             validate_final_entry(&self.directory, &self.file_name)?;
+            self.directory
+                .sync_all()
+                .map_err(|_| OperationError::LocalIo)?;
+            remaining(clock, deadline)?;
+            // The final parent is owned by the invoking uid; another process
+            // with that same uid already has authority to replace the final
+            // destination after success. Bind our random entry to its open fd
+            // with no callback or other fallible work between this check and
+            // the atomic rename.
+            validate_temporary_entry(&self.directory, &temporary_name, &temporary_file)?;
             renameat(
                 &self.directory,
                 temporary_name.as_str(),
                 &self.directory,
                 Path::new(&self.file_name),
             )
-            .map_err(|_| OperationError::LocalIo)?;
-            self.directory
-                .sync_all()
-                .map_err(|_| OperationError::LocalIo)
+            .map_err(|_| OperationError::LocalIo)
         })();
         if result.is_err() {
             let _ = unlinkat(
@@ -1087,6 +1100,7 @@ fn open_destination_parent(
             .map_err(|_| OperationError::UnsafeLocalDestination)?,
         )
     };
+    validate_open_directory(&directory, false)?;
     for component in parent_path.components() {
         let name = match component {
             Component::RootDir | Component::CurDir => continue,
@@ -1105,8 +1119,56 @@ fn open_destination_parent(
             Err(_) => return Err(OperationError::UnsafeLocalDestination),
         };
         directory = File::from(next);
+        validate_open_directory(&directory, false)?;
     }
+    validate_open_directory(&directory, true)?;
     Ok((directory, parent_path, file_name))
+}
+
+fn validate_open_directory(
+    directory: &File,
+    require_effective_user_owner: bool,
+) -> Result<(), OperationError> {
+    let metadata = fstat(directory).map_err(|_| OperationError::UnsafeLocalDestination)?;
+    let effective_uid = geteuid().as_raw();
+    let permissions = metadata.st_mode & 0o7777;
+    let owner_is_trusted = metadata.st_uid == 0 || metadata.st_uid == effective_uid;
+    let sticky_root_directory =
+        metadata.st_uid == 0 && permissions & libc::S_ISVTX as libc::mode_t != 0;
+    if SFlag::from_bits_truncate(metadata.st_mode) != SFlag::S_IFDIR
+        || !owner_is_trusted
+        || permissions & 0o700 != 0o700
+        || (permissions & 0o022 != 0 && !sticky_root_directory)
+        || (require_effective_user_owner && metadata.st_uid != effective_uid)
+    {
+        return Err(OperationError::UnsafeLocalDestination);
+    }
+    Ok(())
+}
+
+fn validate_temporary_entry(
+    directory: &File,
+    temporary_name: &str,
+    temporary_file: &File,
+) -> Result<(), OperationError> {
+    let opened = fstat(temporary_file).map_err(|_| OperationError::LocalIo)?;
+    let entry = fstatat(directory, temporary_name, AtFlags::AT_SYMLINK_NOFOLLOW)
+        .map_err(|_| OperationError::UnsafeLocalDestination)?;
+    if SFlag::from_bits_truncate(opened.st_mode) != SFlag::S_IFREG
+        || opened.st_dev != entry.st_dev
+        || opened.st_ino != entry.st_ino
+        || opened.st_mode != entry.st_mode
+        || opened.st_uid != entry.st_uid
+        || opened.st_gid != entry.st_gid
+        || opened.st_nlink != entry.st_nlink
+        || opened.st_size != entry.st_size
+        || opened.st_uid != geteuid().as_raw()
+        || opened.st_nlink != 1
+        || opened.st_mode & 0o777 != 0o600
+    {
+        return Err(OperationError::UnsafeLocalDestination);
+    }
+    Ok(())
 }
 
 fn validate_final_entry(directory: &File, file_name: &OsString) -> Result<(), OperationError> {

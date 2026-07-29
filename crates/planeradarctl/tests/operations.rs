@@ -52,6 +52,7 @@ fn healthy_facts() -> DiagnosticFacts {
         expected_application: artifact("0.1.0", APP_REVISION, APP_SHA256),
         running_application_revision: APP_REVISION.into(),
         installed_driver: artifact("0.1.0-rc.14", DRIVER_REVISION, DRIVER_MANIFEST),
+        persisted_driver_manifest_sha256: DRIVER_MANIFEST.into(),
         expected_driver: artifact("0.1.0-rc.14", DRIVER_REVISION, DRIVER_MANIFEST),
         running_kernel: KERNEL.into(),
         expected_kernel: KERNEL.into(),
@@ -350,6 +351,11 @@ fn every_required_health_mismatch_has_a_distinct_stable_diagnostic() {
         (
             "driver manifest",
             Box::new(|facts| facts.installed_driver.sha256 = "d".repeat(64)),
+            DiagnosticCode::DriverManifestMismatch,
+        ),
+        (
+            "persisted driver manifest",
+            Box::new(|facts| facts.persisted_driver_manifest_sha256 = "e".repeat(64)),
             DiagnosticCode::DriverManifestMismatch,
         ),
         (
@@ -742,6 +748,122 @@ fn screenshot_deadline_includes_snapshot_transfer_recheck_decode_and_persist() {
     assert!(!directory_path.join("late.png").exists());
 }
 
+#[test]
+fn screenshot_never_reports_a_deadline_failure_after_committing_the_destination() {
+    #[derive(Clone)]
+    struct CommitAwareClock {
+        destination: PathBuf,
+        committed: Vec<u8>,
+    }
+    impl CaptureClock for CommitAwareClock {
+        fn now(&self) -> Duration {
+            if fs::read(&self.destination).ok().as_deref() == Some(self.committed.as_slice()) {
+                Duration::from_secs(2)
+            } else {
+                Duration::ZERO
+            }
+        }
+    }
+
+    let bytes = rgba_png(480, 480);
+    let backend = FakeBackend::healthy(bytes.clone());
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let directory_path = fs::canonicalize(directory.path()).expect("canonical temporary directory");
+    let destination = directory_path.join("radar.png");
+    fs::write(&destination, b"keep me").expect("existing destination");
+    let clock = CommitAwareClock {
+        destination: destination.clone(),
+        committed: bytes.clone(),
+    };
+
+    OperationsClient::new(&backend, clock)
+        .screenshot(&destination, Duration::from_secs(1))
+        .expect("successful rename is the commit point");
+
+    assert_eq!(
+        fs::read(&destination).expect("committed destination"),
+        bytes
+    );
+}
+
+#[test]
+fn screenshot_rejects_an_existing_parent_writable_by_other_users() {
+    let bytes = rgba_png(480, 480);
+    let backend = FakeBackend::healthy(bytes);
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let directory_path = fs::canonicalize(directory.path()).expect("canonical temporary directory");
+    let unsafe_parent = directory_path.join("unsafe-parent");
+    fs::create_dir(&unsafe_parent).expect("unsafe parent");
+    fs::set_permissions(&unsafe_parent, fs::Permissions::from_mode(0o777))
+        .expect("unsafe parent mode");
+    let destination = unsafe_parent.join("radar.png");
+
+    assert_eq!(
+        OperationsClient::new(&backend, FakeClock::default())
+            .screenshot(&destination, Duration::from_secs(1))
+            .expect_err("writable parent"),
+        OperationError::UnsafeLocalDestination
+    );
+    assert!(!backend.signaled.get());
+    assert!(!destination.exists());
+}
+
+#[test]
+fn screenshot_rejects_a_temp_name_substituted_after_its_fd_is_validated() {
+    #[derive(Clone)]
+    struct TempSubstitutionClock {
+        directory: PathBuf,
+        substituted: Rc<Cell<bool>>,
+    }
+    impl CaptureClock for TempSubstitutionClock {
+        fn now(&self) -> Duration {
+            if !self.substituted.get()
+                && let Some(path) = fs::read_dir(&self.directory)
+                    .expect("destination directory")
+                    .filter_map(Result::ok)
+                    .find(|entry| {
+                        entry
+                            .file_name()
+                            .to_string_lossy()
+                            .starts_with(".planeradar-capture-")
+                    })
+                    .map(|entry| entry.path())
+            {
+                fs::remove_file(&path).expect("unlink opened temporary entry");
+                fs::write(&path, b"attacker substitution").expect("substitute temporary entry");
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+                    .expect("substitute mode");
+                self.substituted.set(true);
+            }
+            Duration::ZERO
+        }
+    }
+
+    let bytes = rgba_png(480, 480);
+    let backend = FakeBackend::healthy(bytes);
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let directory_path = fs::canonicalize(directory.path()).expect("canonical temporary directory");
+    let destination = directory_path.join("radar.png");
+    fs::write(&destination, b"keep me").expect("existing destination");
+    let substituted = Rc::new(Cell::new(false));
+    let clock = TempSubstitutionClock {
+        directory: directory_path,
+        substituted: substituted.clone(),
+    };
+
+    assert_eq!(
+        OperationsClient::new(&backend, clock)
+            .screenshot(&destination, Duration::from_secs(1))
+            .expect_err("substituted temporary entry"),
+        OperationError::UnsafeLocalDestination
+    );
+    assert!(substituted.get());
+    assert_eq!(
+        fs::read(&destination).expect("preserved destination"),
+        b"keep me"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn screenshot_never_redirects_when_the_destination_parent_is_swapped() {
@@ -924,8 +1046,12 @@ impl Transport for RecordingTransport {
 }
 
 fn target_state_json() -> Vec<u8> {
+    target_state_json_with_driver_manifest(DRIVER_MANIFEST)
+}
+
+fn target_state_json_with_driver_manifest(driver_manifest: &str) -> Vec<u8> {
     format!(
-        r#"{{"schema_version":1,"hardware":{{"model":"Raspberry Pi Zero 2 W Rev 1.0","serial":"1000000012345678"}},"application":{{"version":"0.1.0","source_commit":"{APP_REVISION}","sha256":"{APP_SHA256}"}},"driver":{{"version":"0.1.0-rc.14","source_commit":"{DRIVER_REVISION}","sha256":"{DRIVER_MANIFEST}"}},"owned_files":[{{"target_path":"/opt/planeradar/bin/planeradar","sha256":"{APP_SHA256}"}}],"last_verified_phase":"complete"}}"#
+        r#"{{"schema_version":1,"hardware":{{"model":"Raspberry Pi Zero 2 W Rev 1.0","serial":"1000000012345678"}},"application":{{"version":"0.1.0","source_commit":"{APP_REVISION}","sha256":"{APP_SHA256}"}},"driver":{{"version":"0.1.0-rc.14","source_commit":"{DRIVER_REVISION}","sha256":"{driver_manifest}"}},"owned_files":[{{"target_path":"/opt/planeradar/bin/planeradar","sha256":"{APP_SHA256}"}}],"last_verified_phase":"complete"}}"#
     )
     .into_bytes()
 }
@@ -1055,6 +1181,32 @@ fn production_doctor_observes_driver_artifact_hashes_and_strict_running_health()
     assert_eq!(report.facts.overlay_sha256, OVERLAY_SHA256);
     assert_eq!(report.facts.boot_config_sha256, BOOT_CONFIG_SHA256);
     assert_eq!(report.facts.running_application_revision, APP_REVISION);
+}
+
+#[test]
+fn production_doctor_rejects_persisted_manifest_digest_that_disagrees_with_observed_driver() {
+    let transport = RecordingTransport::default();
+    transport.outputs.borrow_mut().extend([
+        Ok(Output::success(
+            target_state_json_with_driver_manifest(
+                "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            ),
+            Vec::new(),
+        )),
+        Ok(Output::success(diagnostic_probe_json(), Vec::new())),
+    ]);
+    let backend = SshOperationsBackend::new(
+        &transport,
+        "shayne@planeradar.local".parse().expect("target"),
+        DriverLock::checked_in().expect("driver lock"),
+    );
+
+    let report = OperationsClient::new(&backend, FakeClock::default())
+        .doctor()
+        .expect("persisted mismatch is a diagnostic");
+
+    assert!(!report.healthy);
+    assert_eq!(report.diagnostics, [DiagnosticCode::DriverManifestMismatch]);
 }
 
 #[test]
