@@ -278,6 +278,30 @@ fn ordinary_commands_use_strict_argument_vectors_without_a_local_shell() {
 }
 
 #[test]
+fn bounded_remote_output_sets_one_wall_clock_and_stdout_budget() {
+    let runner = RecordingRunner::default();
+    let transport = OpenSshTransport::with_runner(
+        &runner,
+        TransportConfig::new(PathBuf::from("/private/trusted_known_hosts")).expect("config"),
+    );
+    let target = SshTarget::from_str("alice@radar.local").expect("target");
+
+    transport
+        .run_bounded(
+            &target,
+            RemoteCommand::ordinary(["sudo", "-n", "planeradar", "capture-snapshot"])
+                .expect("remote command"),
+            Duration::from_millis(750),
+            8 * 1024 * 1024 + 4096,
+        )
+        .expect("bounded command succeeds");
+
+    let invocation = &runner.invocations()[0];
+    assert_eq!(invocation.timeout(), Some(Duration::from_millis(750)));
+    assert_eq!(invocation.stdout_limit(), Some(8 * 1024 * 1024 + 4096));
+}
+
+#[test]
 fn remote_shell_arguments_are_quoted_and_controls_are_rejected() {
     let runner = RecordingRunner::default();
     let transport = OpenSshTransport::with_runner(

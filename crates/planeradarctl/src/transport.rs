@@ -158,6 +158,7 @@ pub struct Invocation {
     arguments: Vec<String>,
     os_arguments: Vec<OsString>,
     timeout: Option<Duration>,
+    stdout_limit: Option<usize>,
 }
 
 impl Invocation {
@@ -168,6 +169,7 @@ impl Invocation {
             arguments,
             os_arguments,
             timeout: None,
+            stdout_limit: None,
         }
     }
 
@@ -181,6 +183,7 @@ impl Invocation {
             arguments,
             os_arguments,
             timeout: None,
+            stdout_limit: None,
         }
     }
 
@@ -209,6 +212,15 @@ impl Invocation {
     pub fn timeout(&self) -> Option<Duration> {
         self.timeout
     }
+
+    pub(crate) fn with_stdout_limit(mut self, limit: usize) -> Self {
+        self.stdout_limit = Some(limit);
+        self
+    }
+
+    pub fn stdout_limit(&self) -> Option<usize> {
+        self.stdout_limit
+    }
 }
 
 impl fmt::Debug for Invocation {
@@ -218,6 +230,7 @@ impl fmt::Debug for Invocation {
             .field("program", &self.program)
             .field("argument_count", &self.arguments.len())
             .field("timeout", &self.timeout)
+            .field("stdout_limit", &self.stdout_limit)
             .finish()
     }
 }
@@ -296,6 +309,7 @@ pub struct SystemCommandRunner;
 impl CommandRunner for SystemCommandRunner {
     fn run(&self, invocation: Invocation) -> Result<CommandOutput, RunnerError> {
         let timeout = invocation.timeout;
+        let stdout_limit = invocation.stdout_limit.unwrap_or(MAX_CAPTURED_STREAM_BYTES);
         let started_at = Instant::now();
         let mut child = Command::new(&invocation.program)
             .args(invocation.os_arguments())
@@ -308,7 +322,7 @@ impl CommandRunner for SystemCommandRunner {
         let (overflow_sender, overflow_receiver) = mpsc::channel();
         let stdout_reader = thread::spawn({
             let overflow_sender = overflow_sender.clone();
-            move || read_limited_stream(stdout, MAX_CAPTURED_STREAM_BYTES, overflow_sender)
+            move || read_limited_stream(stdout, stdout_limit, overflow_sender)
         });
         let stderr_reader = thread::spawn(move || {
             read_limited_stream(stderr, MAX_CAPTURED_STREAM_BYTES, overflow_sender)
@@ -535,6 +549,15 @@ pub struct TargetProbe {
 pub trait Transport {
     fn probe(&self, target: &SshTarget) -> Result<TargetProbe, TransportError>;
     fn run(&self, target: &SshTarget, request: RemoteCommand) -> Result<Output, TransportError>;
+    fn run_bounded(
+        &self,
+        target: &SshTarget,
+        request: RemoteCommand,
+        _timeout: Duration,
+        _stdout_limit: usize,
+    ) -> Result<Output, TransportError> {
+        self.run(target, request)
+    }
     fn copy_to(
         &self,
         target: &SshTarget,
@@ -611,6 +634,40 @@ impl<R: CommandRunner, C: Clock> Transport for OpenSshTransport<R, C> {
                 .map(|(index, argument)| quote_remote_argument(argument, index == 0)),
         );
         let output = self.runner.run(Invocation::new("ssh", arguments))?;
+        if output.succeeded() {
+            Ok(output)
+        } else {
+            Err(TransportError::CommandFailed)
+        }
+    }
+
+    fn run_bounded(
+        &self,
+        target: &SshTarget,
+        request: RemoteCommand,
+        timeout: Duration,
+        stdout_limit: usize,
+    ) -> Result<Output, TransportError> {
+        if timeout.is_zero() || stdout_limit == 0 {
+            return Err(TransportError::CommandFailed);
+        }
+        let mut arguments = self.noninteractive_arguments();
+        if request.interactive_sudo {
+            arguments.insert(0, "-tt".into());
+        }
+        arguments.extend(target.ssh_arguments());
+        arguments.extend(
+            request
+                .arguments
+                .iter()
+                .enumerate()
+                .map(|(index, argument)| quote_remote_argument(argument, index == 0)),
+        );
+        let output = self.runner.run(
+            Invocation::new("ssh", arguments)
+                .with_timeout(timeout)
+                .with_stdout_limit(stdout_limit),
+        )?;
         if output.succeeded() {
             Ok(output)
         } else {

@@ -1,12 +1,15 @@
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::rc::Rc;
 use std::time::Duration;
 
 use planeradarctl::DriverLock;
 use planeradarctl::operations::{
-    CaptureClock, CaptureMetadata, DiagnosticCode, DiagnosticFacts, DoctorReport,
+    CaptureClock, CaptureMetadata, CaptureTransfer, DiagnosticCode, DiagnosticFacts, DoctorReport,
     MAX_CAPTURE_BYTES, OperationError, OperationsBackend, OperationsClient, SshOperationsBackend,
 };
 use planeradarctl::state::ArtifactIdentity;
@@ -20,8 +23,13 @@ const APP_REVISION: &str = "1111111111111111111111111111111111111111";
 const APP_SHA256: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const DRIVER_REVISION: &str = "f6213007a8e780309e34b220351fc229e3c7d554";
 const DRIVER_MANIFEST: &str = "5f0cd1deba54c740e58b8aee588b3a4b43143e58bc2ad342c9f81cba2cb402e1";
+const MODULE_SHA256: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+const OVERLAY_SHA256: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+const BOOT_CONFIG_SHA256: &str = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
 const KERNEL: &str = "6.18.34+rpt-rpi-v8";
 const VERMAGIC: &str = "6.18.34+rpt-rpi-v8 SMP preempt mod_unload modversions aarch64";
+const TEST_PUBLIC_KEY: &str =
+    "AAAAC3NzaC1lZDI1NTE5AAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 
 fn artifact(version: &str, revision: &str, sha256: &str) -> ArtifactIdentity {
     ArtifactIdentity {
@@ -42,6 +50,7 @@ fn healthy_facts() -> DiagnosticFacts {
         target_architecture: "arm64".into(),
         installed_application: artifact("0.1.0", APP_REVISION, APP_SHA256),
         expected_application: artifact("0.1.0", APP_REVISION, APP_SHA256),
+        running_application_revision: APP_REVISION.into(),
         installed_driver: artifact("0.1.0-rc.14", DRIVER_REVISION, DRIVER_MANIFEST),
         expected_driver: artifact("0.1.0-rc.14", DRIVER_REVISION, DRIVER_MANIFEST),
         running_kernel: KERNEL.into(),
@@ -50,8 +59,13 @@ fn healthy_facts() -> DiagnosticFacts {
         module_loaded: true,
         module_vermagic: VERMAGIC.into(),
         expected_module_vermagic: VERMAGIC.into(),
+        module_sha256: MODULE_SHA256.into(),
+        expected_module_sha256: MODULE_SHA256.into(),
         overlay_file: "hyperpixel2r-kms-f6213007a8e7.dtbo".into(),
         expected_overlay_file: "hyperpixel2r-kms-f6213007a8e7.dtbo".into(),
+        overlay_sha256: OVERLAY_SHA256.into(),
+        expected_overlay_sha256: OVERLAY_SHA256.into(),
+        boot_config_sha256: BOOT_CONFIG_SHA256.into(),
         overlay_configured: true,
         drm_device: "/dev/dri/card0".into(),
         drm_mode: "480x480".into(),
@@ -66,17 +80,19 @@ fn healthy_facts() -> DiagnosticFacts {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct FakeClock {
-    now: Cell<Duration>,
+    now: Rc<Cell<Duration>>,
 }
 
 impl CaptureClock for FakeClock {
     fn now(&self) -> Duration {
         self.now.get()
     }
+}
 
-    fn sleep(&self, duration: Duration) {
+impl FakeClock {
+    fn advance(&self, duration: Duration) {
         self.now.set(self.now.get() + duration);
     }
 }
@@ -111,7 +127,10 @@ impl OperationsBackend for FakeBackend {
         self.facts.borrow().clone()
     }
 
-    fn debug_frame_metadata(&self) -> Result<Option<CaptureMetadata>, OperationError> {
+    fn debug_frame_metadata(
+        &self,
+        _timeout: Duration,
+    ) -> Result<Option<CaptureMetadata>, OperationError> {
         let mut metadata = self.source_metadata.borrow_mut();
         if metadata.len() > 1 {
             metadata.pop_front().expect("queued metadata")
@@ -120,25 +139,34 @@ impl OperationsBackend for FakeBackend {
         }
     }
 
-    fn signal_debug_frame(&self) -> Result<(), OperationError> {
+    fn signal_debug_frame(&self, _timeout: Duration) -> Result<(), OperationError> {
         self.signaled.set(true);
         Ok(())
     }
 
-    fn publish_debug_frame(&self) -> Result<CaptureMetadata, OperationError> {
-        self.published_metadata.borrow().clone()
-    }
-
-    fn published_frame_metadata(&self) -> Result<CaptureMetadata, OperationError> {
-        self.published_metadata.borrow().clone()
-    }
-
-    fn fetch_published_frame(&self, destination: &Path) -> Result<(), OperationError> {
+    fn capture_debug_frame(
+        &self,
+        before: Option<&CaptureMetadata>,
+        _timeout: Duration,
+    ) -> Result<CaptureTransfer, OperationError> {
         if let Some(error) = self.fetch_error.borrow().clone() {
             return Err(error);
         }
-        fs::write(destination, self.capture.borrow().as_slice())
-            .map_err(|_| OperationError::LocalIo)
+        let source = self
+            .debug_frame_metadata(Duration::from_secs(1))?
+            .ok_or(OperationError::CaptureTimedOut)?;
+        if before.is_some_and(|before| {
+            source.inode == before.inode || source.modified_ns < before.modified_ns
+        }) {
+            return Err(OperationError::CaptureTimedOut);
+        }
+        let published = self.published_metadata.borrow().clone()?;
+        Ok(CaptureTransfer {
+            source,
+            published: published.clone(),
+            rechecked: published,
+            bytes: self.capture.borrow().clone(),
+        })
     }
 }
 
@@ -163,6 +191,49 @@ fn published_metadata(inode: u64, modified_ns: u64, contents: &[u8]) -> CaptureM
         gid: 0,
         ..source_metadata(inode, modified_ns, contents)
     }
+}
+
+fn capture_protocol(
+    source: &CaptureMetadata,
+    published: &CaptureMetadata,
+    contents: &[u8],
+) -> Vec<u8> {
+    let header = serde_json::to_vec(&serde_json::json!({
+        "schema_version": 1,
+        "source": source,
+        "published": published,
+    }))
+    .expect("capture header");
+    let footer = serde_json::to_vec(&serde_json::json!({
+        "schema_version": 1,
+        "rechecked": published,
+    }))
+    .expect("capture footer");
+    let mut output = Vec::new();
+    output.extend_from_slice(&(header.len() as u32).to_be_bytes());
+    output.extend_from_slice(&header);
+    output.extend_from_slice(contents);
+    output.extend_from_slice(&(footer.len() as u32).to_be_bytes());
+    output.extend_from_slice(&footer);
+    output
+}
+
+fn capture_protocol_with_unknown_header_field(mut protocol: Vec<u8>) -> Vec<u8> {
+    let header_length =
+        u32::from_be_bytes(protocol[..4].try_into().expect("header length")) as usize;
+    let mut header: serde_json::Value =
+        serde_json::from_slice(&protocol[4..4 + header_length]).expect("capture header");
+    header
+        .as_object_mut()
+        .expect("capture header object")
+        .insert("unexpected".into(), serde_json::Value::Bool(true));
+    let header = serde_json::to_vec(&header).expect("mutated header");
+    let rest = protocol.split_off(4 + header_length);
+    let mut output = Vec::new();
+    output.extend_from_slice(&(header.len() as u32).to_be_bytes());
+    output.extend_from_slice(&header);
+    output.extend_from_slice(&rest);
+    output
 }
 
 fn sha256(contents: &[u8]) -> String {
@@ -257,6 +328,11 @@ fn every_required_health_mismatch_has_a_distinct_stable_diagnostic() {
             DiagnosticCode::ApplicationRevisionMismatch,
         ),
         (
+            "running application revision",
+            Box::new(|facts| facts.running_application_revision = "3".repeat(40)),
+            DiagnosticCode::ApplicationRevisionMismatch,
+        ),
+        (
             "application checksum",
             Box::new(|facts| facts.installed_application.sha256 = "c".repeat(64)),
             DiagnosticCode::ApplicationChecksumMismatch,
@@ -292,8 +368,18 @@ fn every_required_health_mismatch_has_a_distinct_stable_diagnostic() {
             DiagnosticCode::ModuleMismatch,
         ),
         (
+            "module digest",
+            Box::new(|facts| facts.module_sha256 = "e".repeat(64)),
+            DiagnosticCode::ModuleMismatch,
+        ),
+        (
             "overlay",
             Box::new(|facts| facts.overlay_configured = false),
+            DiagnosticCode::OverlayMismatch,
+        ),
+        (
+            "overlay digest",
+            Box::new(|facts| facts.overlay_sha256 = "e".repeat(64)),
             DiagnosticCode::OverlayMismatch,
         ),
         (
@@ -320,6 +406,11 @@ fn every_required_health_mismatch_has_a_distinct_stable_diagnostic() {
             "DRM mode",
             Box::new(|facts| facts.drm_mode = "640x480".into()),
             DiagnosticCode::DrmModeWrong,
+        ),
+        (
+            "DRM device",
+            Box::new(|facts| facts.drm_device = "unavailable".into()),
+            DiagnosticCode::DrmDeviceWrong,
         ),
         (
             "renderer",
@@ -369,7 +460,8 @@ fn screenshot_accepts_only_a_fresh_valid_480_by_480_rgba_png() {
     let bytes = rgba_png(480, 480);
     let backend = FakeBackend::healthy(bytes.clone());
     let directory = tempfile::tempdir().expect("temporary directory");
-    let destination = directory.path().join("radar.png");
+    let directory_path = fs::canonicalize(directory.path()).expect("canonical temporary directory");
+    let destination = directory_path.join("radar.png");
 
     let result = OperationsClient::new(&backend, FakeClock::default())
         .screenshot(&destination, Duration::from_secs(2))
@@ -379,6 +471,29 @@ fn screenshot_accepts_only_a_fresh_valid_480_by_480_rgba_png() {
     assert_eq!(fs::read(&destination).expect("destination"), bytes);
     assert_eq!(result.destination, destination);
     assert_eq!(result.sha256, sha256(&bytes));
+}
+
+#[test]
+fn screenshot_accepts_the_default_bare_relative_output_name() {
+    let bytes = rgba_png(480, 480);
+    let backend = FakeBackend::healthy(bytes.clone());
+    let destination_file = tempfile::Builder::new()
+        .prefix(".planeradar-operation-test-")
+        .suffix(".png")
+        .tempfile_in(".")
+        .expect("temporary destination");
+    let destination = PathBuf::from(
+        destination_file
+            .path()
+            .file_name()
+            .expect("bare destination name"),
+    );
+
+    OperationsClient::new(&backend, FakeClock::default())
+        .screenshot(&destination, Duration::from_secs(2))
+        .expect("bare relative capture");
+
+    assert_eq!(fs::read(&destination).expect("destination"), bytes);
 }
 
 #[test]
@@ -404,7 +519,9 @@ fn screenshot_rejects_wrong_dimensions_non_rgba_and_corrupt_png() {
     for (name, bytes, expected) in cases {
         let backend = FakeBackend::healthy(bytes);
         let directory = tempfile::tempdir().expect("temporary directory");
-        let destination = directory.path().join("radar.png");
+        let directory_path =
+            fs::canonicalize(directory.path()).expect("canonical temporary directory");
+        let destination = directory_path.join("radar.png");
         assert_eq!(
             OperationsClient::new(&backend, FakeClock::default())
                 .screenshot(&destination, Duration::from_secs(2))
@@ -431,9 +548,10 @@ fn screenshot_rejects_unsafe_remote_metadata_stale_data_size_and_timeout() {
         .expect("metadata")
         .symlink = true;
     let directory = tempfile::tempdir().expect("temporary directory");
+    let directory_path = fs::canonicalize(directory.path()).expect("canonical temporary directory");
     assert_eq!(
         OperationsClient::new(&unsafe_backend, FakeClock::default())
-            .screenshot(&directory.path().join("unsafe.png"), Duration::from_secs(1))
+            .screenshot(&directory_path.join("unsafe.png"), Duration::from_secs(1))
             .expect_err("symlink"),
         OperationError::UnsafeRemoteCapture
     );
@@ -450,7 +568,7 @@ fn screenshot_rejects_unsafe_remote_metadata_stale_data_size_and_timeout() {
     assert_eq!(
         OperationsClient::new(&stale_backend, FakeClock::default())
             .screenshot(
-                &directory.path().join("stale.png"),
+                &directory_path.join("stale.png"),
                 Duration::from_millis(250)
             )
             .expect_err("stale"),
@@ -466,7 +584,7 @@ fn screenshot_rejects_unsafe_remote_metadata_stale_data_size_and_timeout() {
         .size = MAX_CAPTURE_BYTES + 1;
     assert_eq!(
         OperationsClient::new(&oversized_backend, FakeClock::default())
-            .screenshot(&directory.path().join("large.png"), Duration::from_secs(1))
+            .screenshot(&directory_path.join("large.png"), Duration::from_secs(1))
             .expect_err("oversized"),
         OperationError::CaptureTooLarge
     );
@@ -476,7 +594,7 @@ fn screenshot_rejects_unsafe_remote_metadata_stale_data_size_and_timeout() {
     assert_eq!(
         OperationsClient::new(&absent_backend, FakeClock::default())
             .screenshot(
-                &directory.path().join("absent.png"),
+                &directory_path.join("absent.png"),
                 Duration::from_millis(250)
             )
             .expect_err("no fresh capture"),
@@ -495,9 +613,10 @@ fn screenshot_requires_root_owned_stable_published_file() {
         .expect("metadata")
         .uid = 1000;
     let directory = tempfile::tempdir().expect("temporary directory");
+    let directory_path = fs::canonicalize(directory.path()).expect("canonical temporary directory");
     assert_eq!(
         OperationsClient::new(&backend, FakeClock::default())
-            .screenshot(&directory.path().join("owner.png"), Duration::from_secs(1))
+            .screenshot(&directory_path.join("owner.png"), Duration::from_secs(1))
             .expect_err("owner"),
         OperationError::UnsafeRemoteCapture
     );
@@ -524,25 +643,24 @@ fn screenshot_requires_root_owned_stable_published_file() {
         fn diagnostic_facts(&self) -> Result<DiagnosticFacts, OperationError> {
             self.inner.diagnostic_facts()
         }
-        fn debug_frame_metadata(&self) -> Result<Option<CaptureMetadata>, OperationError> {
-            self.inner.debug_frame_metadata()
+        fn debug_frame_metadata(
+            &self,
+            timeout: Duration,
+        ) -> Result<Option<CaptureMetadata>, OperationError> {
+            self.inner.debug_frame_metadata(timeout)
         }
-        fn signal_debug_frame(&self) -> Result<(), OperationError> {
-            self.inner.signal_debug_frame()
+        fn signal_debug_frame(&self, timeout: Duration) -> Result<(), OperationError> {
+            self.inner.signal_debug_frame(timeout)
         }
-        fn publish_debug_frame(&self) -> Result<CaptureMetadata, OperationError> {
-            let current = self.inner.publish_debug_frame()?;
-            Ok(CaptureMetadata {
-                inode: current.inode - 1,
-                ..current
-            })
-        }
-        fn published_frame_metadata(&self) -> Result<CaptureMetadata, OperationError> {
+        fn capture_debug_frame(
+            &self,
+            before: Option<&CaptureMetadata>,
+            timeout: Duration,
+        ) -> Result<CaptureTransfer, OperationError> {
+            let mut capture = self.inner.capture_debug_frame(before, timeout)?;
             self.reads.set(self.reads.get() + 1);
-            self.inner.published_frame_metadata()
-        }
-        fn fetch_published_frame(&self, destination: &Path) -> Result<(), OperationError> {
-            self.inner.fetch_published_frame(destination)
+            capture.rechecked.inode += 1;
+            Ok(capture)
         }
     }
     let changing = ChangingBackend {
@@ -551,13 +669,137 @@ fn screenshot_requires_root_owned_stable_published_file() {
     };
     assert_eq!(
         OperationsClient::new(&changing, FakeClock::default())
-            .screenshot(
-                &directory.path().join("changed.png"),
-                Duration::from_secs(1)
-            )
+            .screenshot(&directory_path.join("changed.png"), Duration::from_secs(1))
             .expect_err("changed published capture"),
         OperationError::RemoteCaptureChanged
     );
+}
+
+#[test]
+fn screenshot_rejects_a_snapshot_not_bound_to_the_selected_fresh_source() {
+    let selected = rgba_png(480, 480);
+    let mut pixels = vec![0; 480 * 480 * 4];
+    pixels[0] = 255;
+    let replacement = png_bytes(480, 480, png::ColorType::Rgba, pixels);
+    let backend = FakeBackend::healthy(selected);
+    *backend.capture.borrow_mut() = replacement.clone();
+    *backend.published_metadata.borrow_mut() = Ok(published_metadata(30, 40, &replacement));
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let directory_path = fs::canonicalize(directory.path()).expect("canonical temporary directory");
+
+    assert_eq!(
+        OperationsClient::new(&backend, FakeClock::default())
+            .screenshot(&directory_path.join("unbound.png"), Duration::from_secs(1))
+            .expect_err("published bytes must belong to selected source"),
+        OperationError::RemoteCaptureChanged
+    );
+}
+
+#[test]
+fn screenshot_deadline_includes_snapshot_transfer_recheck_decode_and_persist() {
+    struct SlowPublish<'a> {
+        inner: &'a FakeBackend,
+        clock: FakeClock,
+    }
+    impl OperationsBackend for SlowPublish<'_> {
+        fn diagnostic_facts(&self) -> Result<DiagnosticFacts, OperationError> {
+            self.inner.diagnostic_facts()
+        }
+        fn debug_frame_metadata(
+            &self,
+            timeout: Duration,
+        ) -> Result<Option<CaptureMetadata>, OperationError> {
+            self.inner.debug_frame_metadata(timeout)
+        }
+        fn signal_debug_frame(&self, timeout: Duration) -> Result<(), OperationError> {
+            self.inner.signal_debug_frame(timeout)
+        }
+        fn capture_debug_frame(
+            &self,
+            before: Option<&CaptureMetadata>,
+            timeout: Duration,
+        ) -> Result<CaptureTransfer, OperationError> {
+            self.clock.advance(Duration::from_secs(2));
+            self.inner.capture_debug_frame(before, timeout)
+        }
+    }
+
+    let bytes = rgba_png(480, 480);
+    let backend = FakeBackend::healthy(bytes);
+    let clock = FakeClock::default();
+    let slow = SlowPublish {
+        inner: &backend,
+        clock: clock.clone(),
+    };
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let directory_path = fs::canonicalize(directory.path()).expect("canonical temporary directory");
+    assert_eq!(
+        OperationsClient::new(&slow, clock)
+            .screenshot(&directory_path.join("late.png"), Duration::from_secs(1))
+            .expect_err("whole operation deadline"),
+        OperationError::CaptureTimedOut
+    );
+    assert!(!directory_path.join("late.png").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn screenshot_never_redirects_when_the_destination_parent_is_swapped() {
+    use std::os::unix::fs::symlink;
+
+    struct ParentSwap<'a> {
+        inner: &'a FakeBackend,
+        parent: PathBuf,
+        displaced: PathBuf,
+        attacker: PathBuf,
+    }
+    impl OperationsBackend for ParentSwap<'_> {
+        fn diagnostic_facts(&self) -> Result<DiagnosticFacts, OperationError> {
+            self.inner.diagnostic_facts()
+        }
+        fn debug_frame_metadata(
+            &self,
+            timeout: Duration,
+        ) -> Result<Option<CaptureMetadata>, OperationError> {
+            self.inner.debug_frame_metadata(timeout)
+        }
+        fn signal_debug_frame(&self, timeout: Duration) -> Result<(), OperationError> {
+            fs::rename(&self.parent, &self.displaced).expect("displace validated parent");
+            symlink(&self.attacker, &self.parent).expect("swap parent for symlink");
+            self.inner.signal_debug_frame(timeout)
+        }
+        fn capture_debug_frame(
+            &self,
+            before: Option<&CaptureMetadata>,
+            timeout: Duration,
+        ) -> Result<CaptureTransfer, OperationError> {
+            self.inner.capture_debug_frame(before, timeout)
+        }
+    }
+
+    let bytes = rgba_png(480, 480);
+    let backend = FakeBackend::healthy(bytes);
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let directory_path = fs::canonicalize(directory.path()).expect("canonical temporary directory");
+    let parent = directory_path.join("output");
+    let displaced = directory_path.join("validated-output");
+    let attacker = directory_path.join("attacker");
+    fs::create_dir(&parent).expect("output parent");
+    fs::create_dir(&attacker).expect("attacker parent");
+    let swapped = ParentSwap {
+        inner: &backend,
+        parent: parent.clone(),
+        displaced,
+        attacker: attacker.clone(),
+    };
+
+    assert_eq!(
+        OperationsClient::new(&swapped, FakeClock::default())
+            .screenshot(&parent.join("radar.png"), Duration::from_secs(1))
+            .expect_err("swapped parent"),
+        OperationError::UnsafeLocalDestination
+    );
+    assert!(!attacker.join("radar.png").exists());
 }
 
 #[cfg(unix)]
@@ -567,9 +809,10 @@ fn screenshot_rejects_destination_symlink_and_preserves_existing_file_on_failure
 
     let bytes = rgba_png(480, 480);
     let directory = tempfile::tempdir().expect("temporary directory");
-    let victim = directory.path().join("victim.png");
+    let directory_path = fs::canonicalize(directory.path()).expect("canonical temporary directory");
+    let victim = directory_path.join("victim.png");
     fs::write(&victim, b"victim").expect("victim");
-    let link = directory.path().join("radar.png");
+    let link = directory_path.join("radar.png");
     symlink(&victim, &link).expect("symlink");
     let backend = FakeBackend::healthy(bytes.clone());
     assert_eq!(
@@ -580,10 +823,10 @@ fn screenshot_rejects_destination_symlink_and_preserves_existing_file_on_failure
     );
     assert_eq!(fs::read(&victim).expect("victim"), b"victim");
 
-    let real_parent = directory.path().join("real-parent");
+    let real_parent = directory_path.join("real-parent");
     let nested = real_parent.join("nested");
     fs::create_dir_all(&nested).expect("real nested parent");
-    let linked_parent = directory.path().join("linked-parent");
+    let linked_parent = directory_path.join("linked-parent");
     symlink(&real_parent, &linked_parent).expect("parent symlink");
     let backend = FakeBackend::healthy(bytes.clone());
     assert_eq!(
@@ -596,7 +839,7 @@ fn screenshot_rejects_destination_symlink_and_preserves_existing_file_on_failure
         OperationError::UnsafeLocalDestination
     );
 
-    let destination = directory.path().join("existing.png");
+    let destination = directory_path.join("existing.png");
     fs::write(&destination, b"keep me").expect("existing");
     let failing = FakeBackend::healthy(bytes.clone());
     *failing.fetch_error.borrow_mut() = Some(OperationError::Transport);
@@ -688,10 +931,196 @@ fn target_state_json() -> Vec<u8> {
 }
 
 fn diagnostic_probe_json() -> Vec<u8> {
+    let health = base64::Engine::encode(
+        &base64::engine::general_purpose::STANDARD,
+        format!(
+            r#"{{"configured":true,"state":"RADAR","data_stale":false,"revision":"{APP_REVISION}"}}"#
+        ),
+    );
     format!(
-        r#"{{"schema_version":1,"os_id":"raspbian","os_version":"13","architecture":"arm64","application_version":"0.1.0","application_revision":"{APP_REVISION}","application_sha256":"{APP_SHA256}","expected_kernel":"{KERNEL}","running_kernel":"{KERNEL}","module_loaded":true,"module_vermagic":"{VERMAGIC}","expected_module_vermagic":"{VERMAGIC}","overlay_file":"hyperpixel2r-kms-f6213007a8e7.dtbo","expected_overlay_file":"hyperpixel2r-kms-f6213007a8e7.dtbo","overlay_configured":true,"drm_device":"/dev/dri/card0","drm_mode":"480x480","renderer":"opengles2","touch_device":"HyperPixel 2.1 Round Touch","service_active":true,"service_restart_count":0,"http_healthy":true,"hostname":"planeradar","settings_configured":true}}"#
+        r#"{{"schema_version":1,"os_id":"raspbian","os_version":"13","architecture":"arm64","application_version":"0.1.0","application_revision":"{APP_REVISION}","application_sha256":"{APP_SHA256}","driver_version":"0.1.0-rc.14","driver_revision":"{DRIVER_REVISION}","driver_manifest_sha256":"{DRIVER_MANIFEST}","expected_kernel":"{KERNEL}","running_kernel":"{KERNEL}","module_loaded":true,"module_vermagic":"{VERMAGIC}","expected_module_vermagic":"{VERMAGIC}","module_sha256":"{MODULE_SHA256}","expected_module_sha256":"{MODULE_SHA256}","overlay_file":"hyperpixel2r-kms-f6213007a8e7.dtbo","expected_overlay_file":"hyperpixel2r-kms-f6213007a8e7.dtbo","overlay_sha256":"{OVERLAY_SHA256}","expected_overlay_sha256":"{OVERLAY_SHA256}","boot_config_sha256":"{BOOT_CONFIG_SHA256}","overlay_configured":true,"drm_device":"/dev/dri/card0","drm_mode":"480x480","renderer":"opengles2","touch_device":"HyperPixel 2.1 Round Touch","service_active":true,"service_restart_count":0,"health_base64":"{health}","hostname":"planeradar"}}"#
     )
     .into_bytes()
+}
+
+fn write_executable(path: &Path, contents: &str) {
+    fs::write(path, contents).expect("write executable");
+    let mut permissions = fs::metadata(path)
+        .expect("executable metadata")
+        .permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(path, permissions).expect("executable permissions");
+}
+
+#[test]
+fn doctor_json_process_exit_and_stream_contract_covers_healthy_and_unhealthy_targets() {
+    let temporary = tempfile::tempdir().expect("temporary directory");
+    let root = fs::canonicalize(temporary.path()).expect("canonical temporary directory");
+    let binaries = root.join("bin");
+    let fixtures = root.join("fixtures");
+    let home = root.join("home");
+    fs::create_dir(&binaries).expect("binary directory");
+    fs::create_dir(&fixtures).expect("fixture directory");
+    fs::create_dir_all(home.join(".ssh")).expect("home directory");
+    fs::write(home.join(".ssh").join("known_hosts"), b"").expect("known hosts");
+    fs::write(fixtures.join("state.json"), target_state_json()).expect("target state fixture");
+    fs::write(fixtures.join("diagnostic.json"), diagnostic_probe_json())
+        .expect("diagnostic fixture");
+
+    write_executable(
+        &binaries.join("ssh-keygen"),
+        &format!(
+            "#!/bin/sh\nhost=$2\nprintf '# Host %s found\\n%s ssh-ed25519 {TEST_PUBLIC_KEY}\\n' \"$host\" \"$host\"\n"
+        ),
+    );
+    write_executable(
+        &binaries.join("ssh"),
+        "#!/bin/sh\ncase \"$*\" in\n  *'/proc/device-tree/model'*) printf 'Raspberry Pi Zero 2 W Rev 1.0\\n' ;;\n  *'/proc/cpuinfo'*) printf '1000000012345678\\n' ;;\n  *'installer-state'*) cat \"$PLANERADAR_TEST_FIXTURES/state.json\" ;;\n  *'planeradar-diagnostics'*) cat \"$PLANERADAR_TEST_FIXTURES/diagnostic.json\" ;;\n  *) exit 91 ;;\nesac\n",
+    );
+
+    let run = || {
+        Command::new(env!("CARGO_BIN_EXE_planeradarctl"))
+            .args(["doctor", "shayne@planeradar.local", "--json"])
+            .current_dir(&root)
+            .env("HOME", &home)
+            .env(
+                "PATH",
+                format!("{}:/usr/bin:/bin", binaries.to_string_lossy()),
+            )
+            .env("PLANERADAR_TEST_FIXTURES", &fixtures)
+            .output()
+            .expect("run planeradarctl")
+    };
+
+    let healthy = run();
+    assert!(healthy.status.success(), "{healthy:?}");
+    assert!(healthy.stderr.is_empty(), "{healthy:?}");
+    let healthy_report =
+        DoctorReport::from_json(&healthy.stdout).expect("healthy stdout is one strict report");
+    assert!(healthy_report.healthy);
+
+    let health = base64::Engine::encode(
+        &base64::engine::general_purpose::STANDARD,
+        format!(
+            r#"{{"configured":true,"state":"RADAR","data_stale":false,"revision":"{APP_REVISION}"}}"#
+        ),
+    );
+    let unhealthy_probe = String::from_utf8(diagnostic_probe_json())
+        .expect("diagnostic fixture")
+        .replace(
+            &format!(r#""health_base64":"{health}""#),
+            r#""health_base64":"""#,
+        );
+    fs::write(fixtures.join("diagnostic.json"), unhealthy_probe)
+        .expect("unhealthy diagnostic fixture");
+
+    let unhealthy = run();
+    assert!(!unhealthy.status.success(), "{unhealthy:?}");
+    let unhealthy_report =
+        DoctorReport::from_json(&unhealthy.stdout).expect("unhealthy stdout is one strict report");
+    assert!(!unhealthy_report.healthy);
+    assert_eq!(
+        unhealthy_report.diagnostics,
+        [
+            DiagnosticCode::ApplicationRevisionMismatch,
+            DiagnosticCode::HttpFailure
+        ]
+    );
+    assert_eq!(
+        String::from_utf8(unhealthy.stderr).expect("typed stderr"),
+        "planeradarctl: target is unhealthy: ApplicationRevisionMismatch\n"
+    );
+}
+
+#[test]
+fn production_doctor_observes_driver_artifact_hashes_and_strict_running_health() {
+    let transport = RecordingTransport::default();
+    transport.outputs.borrow_mut().extend([
+        Ok(Output::success(target_state_json(), Vec::new())),
+        Ok(Output::success(diagnostic_probe_json(), Vec::new())),
+    ]);
+    let backend = SshOperationsBackend::new(
+        &transport,
+        "shayne@planeradar.local".parse().expect("target"),
+        DriverLock::checked_in().expect("driver lock"),
+    );
+
+    let report = OperationsClient::new(&backend, FakeClock::default())
+        .doctor()
+        .expect("strict doctor");
+
+    assert!(report.healthy, "{report:?}");
+    assert_eq!(report.facts.installed_driver.sha256, DRIVER_MANIFEST);
+    assert_eq!(report.facts.module_sha256, MODULE_SHA256);
+    assert_eq!(report.facts.overlay_sha256, OVERLAY_SHA256);
+    assert_eq!(report.facts.boot_config_sha256, BOOT_CONFIG_SHA256);
+    assert_eq!(report.facts.running_application_revision, APP_REVISION);
+}
+
+#[test]
+fn production_doctor_rejects_malformed_health_and_flags_a_stale_running_revision() {
+    let stale_health = base64::Engine::encode(
+        &base64::engine::general_purpose::STANDARD,
+        r#"{"configured":true,"state":"RADAR","data_stale":false,"revision":"3333333333333333333333333333333333333333"}"#,
+    );
+    let stale_probe = String::from_utf8(diagnostic_probe_json())
+        .expect("probe JSON")
+        .replace(
+            &base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                format!(
+                    r#"{{"configured":true,"state":"RADAR","data_stale":false,"revision":"{APP_REVISION}"}}"#
+                ),
+            ),
+            &stale_health,
+        )
+        .into_bytes();
+    let transport = RecordingTransport::default();
+    transport.outputs.borrow_mut().extend([
+        Ok(Output::success(target_state_json(), Vec::new())),
+        Ok(Output::success(stale_probe, Vec::new())),
+    ]);
+    let backend = SshOperationsBackend::new(
+        &transport,
+        "shayne@planeradar.local".parse().expect("target"),
+        DriverLock::checked_in().expect("driver lock"),
+    );
+    let report = OperationsClient::new(&backend, FakeClock::default())
+        .doctor()
+        .expect("stale revision is a diagnostic");
+    assert_eq!(
+        report.diagnostics,
+        [DiagnosticCode::ApplicationRevisionMismatch]
+    );
+
+    let malformed_probe = String::from_utf8(diagnostic_probe_json())
+        .expect("probe JSON")
+        .replace(
+            &base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                format!(
+                    r#"{{"configured":true,"state":"RADAR","data_stale":false,"revision":"{APP_REVISION}"}}"#
+                ),
+            ),
+            "bm90LWpzb24=",
+        )
+        .into_bytes();
+    let malformed_transport = RecordingTransport::default();
+    malformed_transport.outputs.borrow_mut().extend([
+        Ok(Output::success(target_state_json(), Vec::new())),
+        Ok(Output::success(malformed_probe, Vec::new())),
+    ]);
+    let malformed_backend = SshOperationsBackend::new(
+        &malformed_transport,
+        "shayne@planeradar.local".parse().expect("target"),
+        DriverLock::checked_in().expect("driver lock"),
+    );
+    assert_eq!(
+        malformed_backend
+            .diagnostic_facts()
+            .expect_err("malformed health"),
+        OperationError::MalformedFacts
+    );
 }
 
 #[test]
@@ -768,52 +1197,57 @@ fn production_backend_rejects_unknown_or_oversized_probe_output() {
 #[test]
 fn production_capture_adapter_uses_only_systemd_and_fixed_remote_paths() {
     let bytes = rgba_png(480, 480);
-    let source = serde_json::to_vec(&serde_json::json!({
-        "inode": 1,
-        "modified_ns": 2,
-        "size": bytes.len(),
-        "sha256": sha256(&bytes),
-        "uid": 1000,
-        "gid": 1000,
-        "mode": 384,
-        "links": 1,
-        "regular": true,
-        "symlink": false
-    }))
-    .expect("metadata");
-    let published = serde_json::to_vec(&serde_json::json!({
-        "inode": 3,
-        "modified_ns": 4,
-        "size": bytes.len(),
-        "sha256": sha256(&bytes),
-        "uid": 0,
-        "gid": 0,
-        "mode": 384,
-        "links": 1,
-        "regular": true,
-        "symlink": false
-    }))
-    .expect("metadata");
+    let before = CaptureMetadata {
+        inode: 1,
+        modified_ns: 2,
+        size: bytes.len() as u64,
+        sha256: sha256(&bytes),
+        uid: 1000,
+        gid: 1000,
+        mode: 384,
+        links: 1,
+        regular: true,
+        symlink: false,
+    };
+    let source = CaptureMetadata {
+        inode: 2,
+        modified_ns: 3,
+        ..before.clone()
+    };
+    let published = CaptureMetadata {
+        inode: 3,
+        modified_ns: 4,
+        uid: 0,
+        gid: 0,
+        ..source.clone()
+    };
     let transport = RecordingTransport::default();
     transport.outputs.borrow_mut().extend([
-        Ok(Output::success(source, Vec::new())),
+        Ok(Output::success(
+            serde_json::to_vec(&before).expect("metadata"),
+            Vec::new(),
+        )),
         Ok(Output::success(Vec::new(), Vec::new())),
-        Ok(Output::success(published.clone(), Vec::new())),
-        Ok(Output::success(published, Vec::new())),
+        Ok(Output::success(
+            capture_protocol(&source, &published, &bytes),
+            Vec::new(),
+        )),
     ]);
     let backend = SshOperationsBackend::new(
         &transport,
         "shayne@planeradar.local".parse().expect("target"),
         DriverLock::checked_in().expect("driver lock"),
     );
-    backend.debug_frame_metadata().expect("metadata");
-    backend.signal_debug_frame().expect("signal");
-    backend.publish_debug_frame().expect("publish");
-    backend.published_frame_metadata().expect("published");
-    let destination = Path::new("/tmp/planeradar-test-capture.png");
+    let observed = backend
+        .debug_frame_metadata(Duration::from_secs(1))
+        .expect("metadata");
     backend
-        .fetch_published_frame(destination)
-        .expect("copy fixed capture");
+        .signal_debug_frame(Duration::from_secs(1))
+        .expect("signal");
+    let transfer = backend
+        .capture_debug_frame(observed.as_ref(), Duration::from_secs(1))
+        .expect("bounded privileged capture");
+    assert_eq!(transfer.bytes, bytes);
 
     let commands = transport.commands.borrow();
     assert_eq!(
@@ -827,21 +1261,46 @@ fn production_capture_adapter_uses_only_systemd_and_fixed_remote_paths() {
             "planeradar.service"
         ]
     );
+    assert!(commands[0].iter().any(|value| value == "capture-metadata"));
+    assert!(commands[2].iter().any(|value| value == "capture-snapshot"));
     assert!(
-        commands[0]
-            .iter()
-            .any(|value| value == "/var/lib/planeradar/debug.png")
+        transport.copies.borrow().is_empty(),
+        "a root-only capture must travel over bounded privileged SSH stdout, not unprivileged SCP"
     );
-    assert!(
-        commands[2]
-            .iter()
-            .any(|value| value == "/var/lib/planeradar-installer/captures/current.png")
-    );
-    assert_eq!(
-        transport.copies.borrow()[0],
-        (
-            PathBuf::from("/var/lib/planeradar-installer/captures/current.png"),
-            destination.to_owned()
-        )
-    );
+}
+
+#[test]
+fn production_capture_parser_rejects_truncated_trailing_and_unknown_protocol_data() {
+    let bytes = rgba_png(480, 480);
+    let source = source_metadata(2, 3, &bytes);
+    let published = published_metadata(3, 4, &bytes);
+    let valid = capture_protocol(&source, &published, &bytes);
+    let mut truncated = valid.clone();
+    truncated.pop();
+    let mut trailing = valid.clone();
+    trailing.push(0);
+    let unknown = capture_protocol_with_unknown_header_field(valid);
+
+    for (name, protocol) in [
+        ("truncated", truncated),
+        ("trailing", trailing),
+        ("unknown field", unknown),
+    ] {
+        let transport = RecordingTransport::default();
+        transport
+            .outputs
+            .borrow_mut()
+            .push_back(Ok(Output::success(protocol, Vec::new())));
+        let backend = SshOperationsBackend::new(
+            &transport,
+            "shayne@planeradar.local".parse().expect("target"),
+            DriverLock::checked_in().expect("driver lock"),
+        );
+        assert!(
+            backend
+                .capture_debug_frame(None, Duration::from_secs(1))
+                .is_err(),
+            "{name} protocol must be rejected"
+        );
+    }
 }

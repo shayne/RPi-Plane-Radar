@@ -6,6 +6,10 @@ use std::time::Duration;
 
 use clap::Parser;
 use planeradar::app::PlaneRadarApp;
+use planeradar::capture::{
+    CapturePaths, capture_metadata, capture_snapshot_protocol, metadata_json, parse_metadata_json,
+    parse_snapshot_protocol,
+};
 use planeradar::cli::{Cli, Command, DemoCommand, InstallerStateCommand, version_line};
 use planeradar::display::{DisplayConfig, run_display, run_probe};
 use planeradar::install::{
@@ -138,6 +142,38 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         Command::InstallerOwnership => {
             println!("{}", installer_ownership_json(std::path::Path::new("/"))?);
+        }
+        Command::CaptureMetadata => {
+            let metadata = capture_metadata(CapturePaths::production().debug_frame())?;
+            println!(
+                "{}",
+                metadata
+                    .as_ref()
+                    .map(metadata_json)
+                    .transpose()?
+                    .unwrap_or_else(|| "null".to_owned())
+            );
+        }
+        Command::CaptureSnapshot { before, timeout_ms } => {
+            let before = match before.as_str() {
+                "none" => None,
+                value => Some(parse_metadata_json(value)?),
+            };
+            let protocol = capture_snapshot_protocol(
+                &CapturePaths::production(),
+                before.as_ref(),
+                Duration::from_millis(timeout_ms),
+            )?;
+            let snapshot = parse_snapshot_protocol(&protocol)?;
+            if snapshot.published.uid != 0
+                || snapshot.published.gid != 0
+                || snapshot.rechecked.uid != 0
+                || snapshot.rechecked.gid != 0
+            {
+                return Err("privileged capture is not root-owned".into());
+            }
+            io::stdout().write_all(&protocol)?;
+            io::stdout().flush()?;
         }
         Command::ConfigureDisplay {
             boot_config,

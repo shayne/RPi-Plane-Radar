@@ -1,13 +1,19 @@
+use std::ffi::OsString;
 use std::fmt;
-use std::fs;
-use std::io::{Cursor, Read};
-use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+use std::fs::File;
+use std::io::{Cursor, Write};
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use base64::{Engine as _, engine::general_purpose::STANDARD};
+use nix::errno::Errno;
+use nix::fcntl::{AtFlags, OFlag, open, openat, renameat};
+use nix::sys::stat::{Mode, SFlag, fstat, fstatat, mkdirat};
+use nix::unistd::{UnlinkatFlags, unlinkat};
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tempfile::NamedTempFile;
 use thiserror::Error;
 
 use crate::config::DriverLock;
@@ -18,7 +24,6 @@ use crate::transport::{RemoteCommand, Transport};
 pub const DOCTOR_SCHEMA_VERSION: u32 = 1;
 pub const MAX_DOCTOR_JSON_BYTES: usize = 32 * 1024;
 pub const MAX_CAPTURE_BYTES: u64 = 8 * 1024 * 1024;
-const CAPTURE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const EXPECTED_WIDTH: u32 = 480;
 const EXPECTED_HEIGHT: u32 = 480;
 
@@ -41,6 +46,7 @@ pub enum DiagnosticCode {
     UnexpectedRestartCount,
     HttpFailure,
     TouchMissing,
+    DrmDeviceWrong,
     DrmModeWrong,
     RendererWrong,
     MdnsFailure,
@@ -58,6 +64,7 @@ pub struct DiagnosticFacts {
     pub target_architecture: String,
     pub installed_application: ArtifactIdentity,
     pub expected_application: ArtifactIdentity,
+    pub running_application_revision: String,
     pub installed_driver: ArtifactIdentity,
     pub expected_driver: ArtifactIdentity,
     pub running_kernel: String,
@@ -66,8 +73,13 @@ pub struct DiagnosticFacts {
     pub module_loaded: bool,
     pub module_vermagic: String,
     pub expected_module_vermagic: String,
+    pub module_sha256: String,
+    pub expected_module_sha256: String,
     pub overlay_file: String,
     pub expected_overlay_file: String,
+    pub overlay_sha256: String,
+    pub expected_overlay_sha256: String,
+    pub boot_config_sha256: String,
     pub overlay_configured: bool,
     pub drm_device: String,
     pub drm_mode: String,
@@ -173,13 +185,26 @@ pub struct CaptureMetadata {
     pub symlink: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CaptureTransfer {
+    pub source: CaptureMetadata,
+    pub published: CaptureMetadata,
+    pub rechecked: CaptureMetadata,
+    pub bytes: Vec<u8>,
+}
+
 pub trait OperationsBackend {
     fn diagnostic_facts(&self) -> Result<DiagnosticFacts, OperationError>;
-    fn debug_frame_metadata(&self) -> Result<Option<CaptureMetadata>, OperationError>;
-    fn signal_debug_frame(&self) -> Result<(), OperationError>;
-    fn publish_debug_frame(&self) -> Result<CaptureMetadata, OperationError>;
-    fn published_frame_metadata(&self) -> Result<CaptureMetadata, OperationError>;
-    fn fetch_published_frame(&self, destination: &Path) -> Result<(), OperationError>;
+    fn debug_frame_metadata(
+        &self,
+        timeout: Duration,
+    ) -> Result<Option<CaptureMetadata>, OperationError>;
+    fn signal_debug_frame(&self, timeout: Duration) -> Result<(), OperationError>;
+    fn capture_debug_frame(
+        &self,
+        before: Option<&CaptureMetadata>,
+        timeout: Duration,
+    ) -> Result<CaptureTransfer, OperationError>;
 }
 
 const TARGET_STATE_COMMAND: [&str; 7] = [
@@ -191,11 +216,11 @@ const TARGET_STATE_COMMAND: [&str; 7] = [
     "installer-state",
     "read",
 ];
-const DEBUG_FRAME_PATH: &str = "/var/lib/planeradar/debug.png";
-const PUBLISHED_FRAME_PATH: &str = "/var/lib/planeradar-installer/captures/current.png";
 const MAX_TARGET_STATE_BYTES: usize = 64 * 1024;
 const MAX_PROBE_BYTES: usize = 32 * 1024;
+const MAX_HEALTH_BYTES: usize = 4 * 1024;
 const MAX_METADATA_BYTES: usize = 2 * 1024;
+const MAX_CAPTURE_PROTOCOL_BYTES: usize = MAX_CAPTURE_BYTES as usize + (MAX_METADATA_BYTES * 2) + 8;
 
 const DIAGNOSTIC_SCRIPT: &str = concat!(
     r#"set -eu; "#,
@@ -208,40 +233,19 @@ const DIAGNOSTIC_SCRIPT: &str = concat!(
     r#"kernel_count=0; driver_dir=; for candidate in "$driver_root"/*; do test ! -L "$candidate" && test -d "$candidate" || continue; kernel_count=$((kernel_count + 1)); driver_dir=$candidate; done; test "$kernel_count" = 1; "#,
     r#"manifest="$driver_dir/manifest.txt"; test ! -L "$manifest" && test -f "$manifest" && test "$(stat -c '%u:%g:%a' -- "$manifest")" = 0:0:644; "#,
     r#"field() { awk -F '\t' -v key="$1" '$1 == key { if (seen++) exit 2; value=$2 } END { if (!seen || value == "") exit 1; print value }' "$manifest"; }; "#,
-    r#"test "$(field driver_version)" = "$1"; test "$(field source_revision)" = "$2"; expected_kernel=$(field kernel_release); expected_module_vermagic=$(field module_vermagic); expected_overlay_file=$(field overlay_file); "#,
+    r#"driver_version=$(field driver_version); driver_revision=$(field source_revision); driver_manifest_sha256=$(sha256sum -- "$manifest" | awk '{print $1}'); expected_kernel=$(field kernel_release); expected_module_vermagic=$(field module_vermagic); module_file=$(field module_file); expected_module_sha256=$(field module_sha256); expected_overlay_file=$(field overlay_file); expected_overlay_sha256=$(field overlay_sha256); "#,
+    r#"test "$driver_version" = "$1"; test "$driver_revision" = "$2"; test "$expected_overlay_file" = "hyperpixel2r-kms-${2%${2#????????????}}.dtbo"; test "$module_file" = hyperpixel2r_kms.ko; "#,
     r#"running_kernel=$(uname -r); module_loaded=false; if awk '$1 == "hyperpixel2r_kms" { count++ } END { exit count != 1 }' /proc/modules; then module_loaded=true; fi; "#,
     r#"module_vermagic=$(/usr/sbin/modinfo -F vermagic hyperpixel2r_kms 2>/dev/null || printf unavailable); "#,
-    r#"overlay_count=$(awk '{ line=$0; sub(/^[[:space:]]+/, "", line); sub(/[[:space:]]+$/, "", line); if (line ~ /^dtoverlay=.*hyperpixel2r/) count++ } END { print count+0 }' /boot/firmware/config.txt); overlay_file=unavailable; if test "$overlay_count" = 1; then overlay_file=$(awk '{ line=$0; sub(/^[[:space:]]+/, "", line); sub(/[[:space:]]+$/, "", line); if (line ~ /^dtoverlay=.*hyperpixel2r/) { sub(/^dtoverlay=/, "", line); print line } }' /boot/firmware/config.txt); fi; overlay_configured=false; if test "$overlay_file" = "$expected_overlay_file"; then overlay_configured=true; fi; "#,
-    r#"drm_device=/dev/dri/card0; drm_mode=$(sed -n '1p' /sys/class/drm/card0-DPI-1/modes 2>/dev/null || true); test -n "$drm_mode" || drm_mode=unavailable; "#,
-    r#"renderer=$(journalctl -u planeradar.service -b --no-pager -o cat 2>/dev/null | sed -n 's/.*render_driver=\([^ ]*\).*/\1/p' | tail -n 1); test -n "$renderer" || renderer=unavailable; "#,
+    r#"module_sha256=0000000000000000000000000000000000000000000000000000000000000000; module="/lib/modules/$expected_kernel/extra/$module_file"; if test ! -L "$module" && test -f "$module" && test "$(stat -c '%u:%g:%a' -- "$module")" = 0:0:644; then module_sha256=$(sha256sum -- "$module" | awk '{print $1}'); fi; "#,
+    r#"overlay_sha256=0000000000000000000000000000000000000000000000000000000000000000; overlay="/boot/firmware/overlays/$expected_overlay_file"; if test ! -L "$overlay" && test -f "$overlay" && test "$(stat -c '%u:%g:%a' -- "$overlay")" = 0:0:644; then overlay_sha256=$(sha256sum -- "$overlay" | awk '{print $1}'); fi; "#,
+    r#"config=/boot/firmware/config.txt; boot_config_sha256=0000000000000000000000000000000000000000000000000000000000000000; overlay_file=unavailable; overlay_configured=false; if test ! -L "$config" && test -f "$config" && test "$(stat -c '%u:%g:%a' -- "$config")" = 0:0:644; then boot_config_sha256=$(sha256sum -- "$config" | awk '{print $1}'); overlay_result=$(awk -v wanted="dtoverlay=$expected_overlay_file" '{ line=$0; sub(/^[[:space:]]+/, "", line); sub(/[[:space:]]+$/, "", line); if (line !~ /^dtoverlay=/) next; if (line == wanted) { count++; selected=line; next } if (line ~ /hyperpixel2r/) bad=1 } END { if (count == 1 && !bad) { sub(/^dtoverlay=/, "", selected); print "true:" selected } else print "false:unavailable" }' "$config"); overlay_configured=${overlay_result%%:*}; overlay_file=${overlay_result#*:}; fi; "#,
+    r#"service_active=false; if systemctl is-active --quiet planeradar.service; then service_active=true; fi; service_restart_count=$(systemctl show planeradar.service --property=NRestarts --value); service_main_pid=$(systemctl show planeradar.service --property=MainPID --value); service_invocation=$(systemctl show planeradar.service --property=InvocationID --value); "#,
+    r#"drm_device=unavailable; drm_mode=unavailable; renderer=unavailable; case "$service_main_pid:$service_invocation" in 0:*|*[!0-9]*:*|*:*[!0-9a-f]*) ;; *) card_count=0; for fd in /proc/"$service_main_pid"/fd/*; do target=$(readlink -- "$fd" 2>/dev/null || true); case "$target" in /dev/dri/card[0-9]*) if test "$drm_device" != unavailable && test "$drm_device" != "$target"; then card_count=2; break; fi; drm_device=$target; card_count=1;; esac; done; if test "$card_count" = 1 && test -c "$drm_device"; then card_name=${drm_device#/dev/dri/}; mode_file="/sys/class/drm/$card_name-DPI-1/modes"; drm_mode=$(sed -n '1p' "$mode_file" 2>/dev/null || true); test -n "$drm_mode" || drm_mode=unavailable; else drm_device=unavailable; fi; renderer=$(journalctl -b -u planeradar.service "_PID=$service_main_pid" "_SYSTEMD_INVOCATION_ID=$service_invocation" --no-pager -o cat 2>/dev/null | awk 'match($0, /render_driver=[^ ]+/) { value=substr($0, RSTART+14, RLENGTH-14); count++ } END { if (count == 1) print value }'); test -n "$renderer" || renderer=unavailable;; esac; "#,
     r#"touch_device=; touch_count=0; for name_file in /sys/class/input/event*/device/name; do test ! -L "$name_file" && test -f "$name_file" || continue; candidate=$(tr -d '\r\n' <"$name_file"); case "$candidate" in *HyperPixel*) touch_count=$((touch_count + 1)); touch_device=$candidate;; esac; done; test "$touch_count" -le 1; "#,
-    r#"service_active=false; if systemctl is-active --quiet planeradar.service; then service_active=true; fi; service_restart_count=$(systemctl show planeradar.service --property=NRestarts --value); "#,
-    r#"hostname=$(tr -d '\r\n' </etc/hostname); health=$(curl --fail --silent --show-error --max-time 5 -H "Host: $hostname.local" http://127.0.0.1/healthz 2>/dev/null || true); http_healthy=false; settings_configured=false; "#,
-    r#"case "$health" in *'"configured":true'*) http_healthy=true; settings_configured=true;; *'"configured":false'*) http_healthy=true;; esac; "#,
-    r#"printf '{"schema_version":1,"os_id":"%s","os_version":"%s","architecture":"%s","application_version":"%s","application_revision":"%s","application_sha256":"%s","expected_kernel":"%s","running_kernel":"%s","module_loaded":%s,"module_vermagic":"%s","expected_module_vermagic":"%s","overlay_file":"%s","expected_overlay_file":"%s","overlay_configured":%s,"drm_device":"%s","drm_mode":"%s","renderer":"%s","touch_device":"%s","service_active":%s,"service_restart_count":%s,"http_healthy":%s,"hostname":"%s","settings_configured":%s}' "#,
-    r#""$os_id" "$os_version" "$architecture" "$application_version" "$application_revision" "$application_sha256" "$expected_kernel" "$running_kernel" "$module_loaded" "$module_vermagic" "$expected_module_vermagic" "$overlay_file" "$expected_overlay_file" "$overlay_configured" "$drm_device" "$drm_mode" "$renderer" "$touch_device" "$service_active" "$service_restart_count" "$http_healthy" "$hostname" "$settings_configured""#,
-);
-
-const METADATA_SCRIPT: &str = concat!(
-    r#"set -eu; path=$1; if test ! -e "$path" && test ! -L "$path"; then printf null; exit 0; fi; "#,
-    r#"symlink=false; regular=false; if test -L "$path"; then symlink=true; elif test -f "$path"; then regular=true; fi; "#,
-    r#"inode=$(stat -c %i -- "$path" 2>/dev/null || printf 0); seconds=$(stat -c %Y -- "$path" 2>/dev/null || printf 0); modified_ns=$((seconds * 1000000000)); size=$(stat -c %s -- "$path" 2>/dev/null || printf 0); "#,
-    r#"uid=$(stat -c %u -- "$path" 2>/dev/null || printf 0); gid=$(stat -c %g -- "$path" 2>/dev/null || printf 0); mode_text=$(stat -c %a -- "$path" 2>/dev/null || printf 0); mode=$(printf '%d' "0$mode_text"); links=$(stat -c %h -- "$path" 2>/dev/null || printf 0); "#,
-    r#"sha256=0000000000000000000000000000000000000000000000000000000000000000; if test "$regular" = true && test "$symlink" = false; then sha256=$(sha256sum -- "$path" | awk '{print $1}'); fi; "#,
-    r#"printf '{"inode":%s,"modified_ns":%s,"size":%s,"sha256":"%s","uid":%s,"gid":%s,"mode":%s,"links":%s,"regular":%s,"symlink":%s}' "$inode" "$modified_ns" "$size" "$sha256" "$uid" "$gid" "$mode" "$links" "$regular" "$symlink""#,
-);
-
-const PUBLISH_SCRIPT: &str = concat!(
-    r#"set -eu; src=$1; dst=$2; directory=${dst%/*}; "#,
-    r#"test ! -L "$src" && test -f "$src" && test "$(stat -c %h -- "$src")" = 1; service_uid=$(id -u planeradar); test "$(stat -c %u -- "$src")" = "$service_uid"; case "$(stat -c %a -- "$src")" in 600|640) ;; *) exit 1;; esac; "#,
-    r#"size=$(stat -c %s -- "$src"); test "$size" -gt 0 && test "$size" -le 8388608; before=$(stat -c '%i:%Y:%s:%u:%g:%a:%h' -- "$src"); before_sha=$(sha256sum -- "$src" | awk '{print $1}'); "#,
-    r#"if test -e "$directory" || test -L "$directory"; then test ! -L "$directory" && test -d "$directory" && test "$(stat -c '%u:%g:%a' -- "$directory")" = 0:0:700; else install -d -m 700 -o root -g root -- "$directory"; fi; "#,
-    r#"if test -e "$dst" || test -L "$dst"; then test ! -L "$dst" && test -f "$dst" && test "$(stat -c '%u:%g:%a:%h' -- "$dst")" = 0:0:600:1; fi; "#,
-    r#"tmp=$(mktemp "$directory/.capture.XXXXXXXX"); trap 'rm -f -- "$tmp"' EXIT HUP INT TERM; dd if="$src" of="$tmp" iflag=nofollow status=none; "#,
-    r#"after=$(stat -c '%i:%Y:%s:%u:%g:%a:%h' -- "$src"); after_sha=$(sha256sum -- "$src" | awk '{print $1}'); test "$before" = "$after" && test "$before_sha" = "$after_sha"; test "$(sha256sum -- "$tmp" | awk '{print $1}')" = "$before_sha"; "#,
-    r#"chown root:root -- "$tmp"; chmod 600 -- "$tmp"; sync -f "$tmp"; mv -fT -- "$tmp" "$dst"; trap - EXIT HUP INT TERM; sync -f "$directory"; "#,
-    r#"path=$dst; inode=$(stat -c %i -- "$path"); seconds=$(stat -c %Y -- "$path"); modified_ns=$((seconds * 1000000000)); size=$(stat -c %s -- "$path"); uid=$(stat -c %u -- "$path"); gid=$(stat -c %g -- "$path"); mode_text=$(stat -c %a -- "$path"); mode=$(printf '%d' "0$mode_text"); links=$(stat -c %h -- "$path"); sha256=$(sha256sum -- "$path" | awk '{print $1}'); "#,
-    r#"printf '{"inode":%s,"modified_ns":%s,"size":%s,"sha256":"%s","uid":%s,"gid":%s,"mode":%s,"links":%s,"regular":true,"symlink":false}' "$inode" "$modified_ns" "$size" "$sha256" "$uid" "$gid" "$mode" "$links""#,
+    r#"hostname=$(tr -d '\r\n' </etc/hostname); health_base64=; if health=$(curl --fail --silent --show-error --max-time 5 --max-filesize 4096 -H "Host: $hostname.local" http://127.0.0.1/healthz 2>/dev/null); then health_base64=$(printf %s "$health" | base64 -w0); fi; "#,
+    r#"printf '{"schema_version":1,"os_id":"%s","os_version":"%s","architecture":"%s","application_version":"%s","application_revision":"%s","application_sha256":"%s","driver_version":"%s","driver_revision":"%s","driver_manifest_sha256":"%s","expected_kernel":"%s","running_kernel":"%s","module_loaded":%s,"module_vermagic":"%s","expected_module_vermagic":"%s","module_sha256":"%s","expected_module_sha256":"%s","overlay_file":"%s","expected_overlay_file":"%s","overlay_sha256":"%s","expected_overlay_sha256":"%s","boot_config_sha256":"%s","overlay_configured":%s,"drm_device":"%s","drm_mode":"%s","renderer":"%s","touch_device":"%s","service_active":%s,"service_restart_count":%s,"health_base64":"%s","hostname":"%s"}' "#,
+    r#""$os_id" "$os_version" "$architecture" "$application_version" "$application_revision" "$application_sha256" "$driver_version" "$driver_revision" "$driver_manifest_sha256" "$expected_kernel" "$running_kernel" "$module_loaded" "$module_vermagic" "$expected_module_vermagic" "$module_sha256" "$expected_module_sha256" "$overlay_file" "$expected_overlay_file" "$overlay_sha256" "$expected_overlay_sha256" "$boot_config_sha256" "$overlay_configured" "$drm_device" "$drm_mode" "$renderer" "$touch_device" "$service_active" "$service_restart_count" "$health_base64" "$hostname""#,
 );
 
 #[derive(Deserialize)]
@@ -254,13 +258,21 @@ struct DiagnosticProbe {
     application_version: String,
     application_revision: String,
     application_sha256: String,
+    driver_version: String,
+    driver_revision: String,
+    driver_manifest_sha256: String,
     expected_kernel: String,
     running_kernel: String,
     module_loaded: bool,
     module_vermagic: String,
     expected_module_vermagic: String,
+    module_sha256: String,
+    expected_module_sha256: String,
     overlay_file: String,
     expected_overlay_file: String,
+    overlay_sha256: String,
+    expected_overlay_sha256: String,
+    boot_config_sha256: String,
     overlay_configured: bool,
     drm_device: String,
     drm_mode: String,
@@ -268,9 +280,32 @@ struct DiagnosticProbe {
     touch_device: String,
     service_active: bool,
     service_restart_count: u64,
-    http_healthy: bool,
+    health_base64: String,
     hostname: String,
-    settings_configured: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HealthProbe {
+    configured: bool,
+    state: String,
+    data_stale: bool,
+    revision: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CaptureProtocolHeader {
+    schema_version: u32,
+    source: CaptureMetadata,
+    published: CaptureMetadata,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CaptureProtocolFooter {
+    schema_version: u32,
+    rechecked: CaptureMetadata,
 }
 
 pub struct SshOperationsBackend<'a, T> {
@@ -288,9 +323,14 @@ impl<'a, T: Transport> SshOperationsBackend<'a, T> {
         }
     }
 
-    fn run(&self, request: RemoteCommand) -> Result<Vec<u8>, OperationError> {
+    fn run_bounded(
+        &self,
+        request: RemoteCommand,
+        timeout: Duration,
+        stdout_limit: usize,
+    ) -> Result<Vec<u8>, OperationError> {
         self.transport
-            .run(&self.target, request)
+            .run_bounded(&self.target, request, timeout, stdout_limit)
             .map(|output| output.stdout().to_vec())
             .map_err(|_| OperationError::Transport)
     }
@@ -298,7 +338,8 @@ impl<'a, T: Transport> SshOperationsBackend<'a, T> {
     fn target_state(&self) -> Result<TargetInstallState, OperationError> {
         let request =
             RemoteCommand::ordinary(TARGET_STATE_COMMAND).map_err(|_| OperationError::Transport)?;
-        let output = self.run(request)?;
+        let output =
+            self.run_bounded(request, Duration::from_secs(10), MAX_TARGET_STATE_BYTES + 1)?;
         if output.len() > MAX_TARGET_STATE_BYTES {
             return Err(OperationError::MalformedFacts);
         }
@@ -328,27 +369,24 @@ impl<'a, T: Transport> SshOperationsBackend<'a, T> {
             &installed_driver.source_commit,
         ])
         .map_err(|_| OperationError::Transport)?;
-        let output = self.run(request)?;
+        let output = self.run_bounded(request, Duration::from_secs(15), MAX_PROBE_BYTES + 1)?;
         parse_bounded_json(&output, MAX_PROBE_BYTES)
     }
 
     fn capture_metadata_at(
         &self,
-        path: &'static str,
+        timeout: Duration,
     ) -> Result<Option<CaptureMetadata>, OperationError> {
         let request = RemoteCommand::ordinary([
             "/usr/bin/timeout",
             "10",
             "sudo",
             "-n",
-            "sh",
-            "-c",
-            METADATA_SCRIPT,
-            "planeradar-capture-metadata",
-            path,
+            "/opt/planeradar/bin/planeradar",
+            "capture-metadata",
         ])
         .map_err(|_| OperationError::Transport)?;
-        let output = self.run(request)?;
+        let output = self.run_bounded(request, timeout, MAX_METADATA_BYTES + 1)?;
         parse_bounded_json(&output, MAX_METADATA_BYTES)
     }
 }
@@ -367,6 +405,7 @@ impl<T: Transport> OperationsBackend for SshOperationsBackend<'_, T> {
         if probe.schema_version != DOCTOR_SCHEMA_VERSION {
             return Err(OperationError::MalformedFacts);
         }
+        let health = parse_health_probe(&probe.health_base64)?;
         let mdns_hostname = format!("{}.local", probe.hostname);
         let mdns_reachable = format!("{}@{}", self.target.username().as_str(), mdns_hostname)
             .parse::<SshTarget>()
@@ -387,7 +426,14 @@ impl<T: Transport> OperationsBackend for SshOperationsBackend<'_, T> {
                 sha256: probe.application_sha256,
             },
             expected_application,
-            installed_driver,
+            running_application_revision: health
+                .as_ref()
+                .map_or_else(|| "0".repeat(40), |health| health.revision.clone()),
+            installed_driver: ArtifactIdentity {
+                version: probe.driver_version,
+                source_commit: probe.driver_revision,
+                sha256: probe.driver_manifest_sha256,
+            },
             expected_driver: ArtifactIdentity {
                 version: self.expected_driver.version.to_string(),
                 source_commit: self.expected_driver.commit.clone(),
@@ -399,8 +445,13 @@ impl<T: Transport> OperationsBackend for SshOperationsBackend<'_, T> {
             module_loaded: probe.module_loaded,
             module_vermagic: probe.module_vermagic,
             expected_module_vermagic: probe.expected_module_vermagic,
+            module_sha256: probe.module_sha256,
+            expected_module_sha256: probe.expected_module_sha256,
             overlay_file: probe.overlay_file,
             expected_overlay_file: probe.expected_overlay_file,
+            overlay_sha256: probe.overlay_sha256,
+            expected_overlay_sha256: probe.expected_overlay_sha256,
+            boot_config_sha256: probe.boot_config_sha256,
             overlay_configured: probe.overlay_configured,
             drm_device: probe.drm_device,
             drm_mode: probe.drm_mode,
@@ -408,18 +459,21 @@ impl<T: Transport> OperationsBackend for SshOperationsBackend<'_, T> {
             touch_device: (!probe.touch_device.is_empty()).then_some(probe.touch_device),
             service_active: probe.service_active,
             service_restart_count: probe.service_restart_count,
-            http_healthy: probe.http_healthy,
+            http_healthy: health.is_some(),
             mdns_hostname,
             mdns_reachable,
-            settings_configured: probe.settings_configured,
+            settings_configured: health.is_some_and(|health| health.configured),
         })
     }
 
-    fn debug_frame_metadata(&self) -> Result<Option<CaptureMetadata>, OperationError> {
-        self.capture_metadata_at(DEBUG_FRAME_PATH)
+    fn debug_frame_metadata(
+        &self,
+        timeout: Duration,
+    ) -> Result<Option<CaptureMetadata>, OperationError> {
+        self.capture_metadata_at(timeout)
     }
 
-    fn signal_debug_frame(&self) -> Result<(), OperationError> {
+    fn signal_debug_frame(&self, timeout: Duration) -> Result<(), OperationError> {
         let request = RemoteCommand::ordinary([
             "/usr/bin/timeout",
             "10",
@@ -431,36 +485,43 @@ impl<T: Transport> OperationsBackend for SshOperationsBackend<'_, T> {
             "planeradar.service",
         ])
         .map_err(|_| OperationError::Transport)?;
-        self.run(request).map(|_| ())
+        self.run_bounded(request, timeout, 1).map(|_| ())
     }
 
-    fn publish_debug_frame(&self) -> Result<CaptureMetadata, OperationError> {
+    fn capture_debug_frame(
+        &self,
+        before: Option<&CaptureMetadata>,
+        timeout: Duration,
+    ) -> Result<CaptureTransfer, OperationError> {
+        let before = before
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|_| OperationError::UnsafeRemoteCapture)?
+            .unwrap_or_else(|| "none".to_owned());
+        let timeout_ms = u64::try_from(timeout.as_millis())
+            .unwrap_or(30_000)
+            .clamp(1, 30_000)
+            .to_string();
+        let remote_timeout_seconds = timeout
+            .as_secs()
+            .saturating_add(u64::from(timeout.subsec_nanos() > 0))
+            .clamp(1, 30)
+            .to_string();
         let request = RemoteCommand::ordinary([
             "/usr/bin/timeout",
-            "15",
+            &remote_timeout_seconds,
             "sudo",
             "-n",
-            "sh",
-            "-c",
-            PUBLISH_SCRIPT,
-            "planeradar-capture-publish",
-            DEBUG_FRAME_PATH,
-            PUBLISHED_FRAME_PATH,
+            "/opt/planeradar/bin/planeradar",
+            "capture-snapshot",
+            "--before",
+            &before,
+            "--timeout-ms",
+            &timeout_ms,
         ])
         .map_err(|_| OperationError::Transport)?;
-        let output = self.run(request)?;
-        parse_bounded_json(&output, MAX_METADATA_BYTES)
-    }
-
-    fn published_frame_metadata(&self) -> Result<CaptureMetadata, OperationError> {
-        self.capture_metadata_at(PUBLISHED_FRAME_PATH)?
-            .ok_or(OperationError::UnsafeRemoteCapture)
-    }
-
-    fn fetch_published_frame(&self, destination: &Path) -> Result<(), OperationError> {
-        self.transport
-            .copy_from(&self.target, Path::new(PUBLISHED_FRAME_PATH), destination)
-            .map_err(|_| OperationError::Transport)
+        let output = self.run_bounded(request, timeout, MAX_CAPTURE_PROTOCOL_BYTES)?;
+        parse_capture_protocol(&output)
     }
 }
 
@@ -479,9 +540,87 @@ fn parse_bounded_json<T: for<'de> Deserialize<'de>>(
     Ok(value)
 }
 
+fn parse_health_probe(encoded: &str) -> Result<Option<HealthProbe>, OperationError> {
+    if encoded.is_empty() {
+        return Ok(None);
+    }
+    if encoded.len() > MAX_HEALTH_BYTES.saturating_mul(2) {
+        return Err(OperationError::MalformedFacts);
+    }
+    let bytes = STANDARD
+        .decode(encoded)
+        .map_err(|_| OperationError::MalformedFacts)?;
+    if bytes.len() > MAX_HEALTH_BYTES {
+        return Err(OperationError::MalformedFacts);
+    }
+    let health: HealthProbe = parse_bounded_json(&bytes, MAX_HEALTH_BYTES)?;
+    if !matches!(
+        health.state.as_str(),
+        "SETUP_REQUIRED" | "WAITING_FOR_NETWORK" | "RADAR" | "SETTINGS"
+    ) || !is_lower_hex(&health.revision, 40)
+    {
+        return Err(OperationError::MalformedFacts);
+    }
+    let _ = health.data_stale;
+    Ok(Some(health))
+}
+
+fn parse_capture_protocol(input: &[u8]) -> Result<CaptureTransfer, OperationError> {
+    if input.len() > MAX_CAPTURE_PROTOCOL_BYTES {
+        return Err(OperationError::CaptureTooLarge);
+    }
+    let (header_bytes, rest) = take_protocol_json(input)?;
+    let header: CaptureProtocolHeader = parse_bounded_json(header_bytes, MAX_METADATA_BYTES)?;
+    if header.schema_version != DOCTOR_SCHEMA_VERSION {
+        return Err(OperationError::UnsafeRemoteCapture);
+    }
+    validate_source_metadata(&header.source)?;
+    validate_published_metadata(&header.published)?;
+    let size =
+        usize::try_from(header.published.size).map_err(|_| OperationError::CaptureTooLarge)?;
+    if rest.len() < size {
+        return Err(OperationError::RemoteCaptureChanged);
+    }
+    let (bytes, footer_input) = rest.split_at(size);
+    let (footer_bytes, trailing) = take_protocol_json(footer_input)?;
+    if !trailing.is_empty() {
+        return Err(OperationError::RemoteCaptureChanged);
+    }
+    let footer: CaptureProtocolFooter = parse_bounded_json(footer_bytes, MAX_METADATA_BYTES)?;
+    if footer.schema_version != DOCTOR_SCHEMA_VERSION {
+        return Err(OperationError::UnsafeRemoteCapture);
+    }
+    validate_published_metadata(&footer.rechecked)?;
+    if header.published != footer.rechecked
+        || header.source.sha256 != header.published.sha256
+        || header.source.size != header.published.size
+        || sha256(bytes) != header.published.sha256
+    {
+        return Err(OperationError::RemoteCaptureChanged);
+    }
+    Ok(CaptureTransfer {
+        source: header.source,
+        published: header.published,
+        rechecked: footer.rechecked,
+        bytes: bytes.to_vec(),
+    })
+}
+
+fn take_protocol_json(input: &[u8]) -> Result<(&[u8], &[u8]), OperationError> {
+    let length: [u8; 4] = input
+        .get(..4)
+        .ok_or(OperationError::RemoteCaptureChanged)?
+        .try_into()
+        .map_err(|_| OperationError::RemoteCaptureChanged)?;
+    let length = u32::from_be_bytes(length) as usize;
+    if length == 0 || length > MAX_METADATA_BYTES || input.len() < 4 + length {
+        return Err(OperationError::RemoteCaptureChanged);
+    }
+    Ok((&input[4..4 + length], &input[4 + length..]))
+}
+
 pub trait CaptureClock {
     fn now(&self) -> Duration;
-    fn sleep(&self, duration: Duration);
 }
 
 #[derive(Debug)]
@@ -500,10 +639,6 @@ impl Default for SystemCaptureClock {
 impl CaptureClock for SystemCaptureClock {
     fn now(&self) -> Duration {
         self.started_at.elapsed()
-    }
-
-    fn sleep(&self, duration: Duration) {
-        std::thread::sleep(duration);
     }
 }
 
@@ -554,58 +689,45 @@ impl<'a, B: OperationsBackend, C: CaptureClock> OperationsClient<'a, B, C> {
         destination: &Path,
         timeout: Duration,
     ) -> Result<ScreenshotResult, OperationError> {
-        let parent = prepare_local_destination(destination)?;
-        let before = self.backend.debug_frame_metadata()?;
+        if timeout.is_zero() {
+            return Err(OperationError::CaptureTimedOut);
+        }
+        let deadline = self.clock.now().saturating_add(timeout);
+        let local = PinnedDestination::prepare(destination)?;
+        let before = self
+            .backend
+            .debug_frame_metadata(remaining(&self.clock, deadline)?)?;
         if let Some(metadata) = before.as_ref() {
             validate_source_metadata(metadata)?;
         }
 
-        self.backend.signal_debug_frame()?;
-        let deadline = self.clock.now().saturating_add(timeout);
-        loop {
-            if let Some(metadata) = self.backend.debug_frame_metadata()? {
-                validate_source_metadata(&metadata)?;
-                if capture_is_fresh(before.as_ref(), &metadata) {
-                    break;
-                }
-            }
-            if self.clock.now() >= deadline {
-                return Err(OperationError::CaptureTimedOut);
-            }
-            let remaining = deadline.saturating_sub(self.clock.now());
-            self.clock.sleep(CAPTURE_POLL_INTERVAL.min(remaining));
-        }
-
-        let published = self.backend.publish_debug_frame()?;
-        validate_published_metadata(&published)?;
-        let temporary = NamedTempFile::new_in(&parent).map_err(|_| OperationError::LocalIo)?;
         self.backend
-            .fetch_published_frame(temporary.path())
-            .inspect_err(|_| {
-                let _ = temporary.as_file().sync_all();
-            })?;
-        let after = self.backend.published_frame_metadata()?;
-        validate_published_metadata(&after)?;
-        if published != after {
+            .signal_debug_frame(remaining(&self.clock, deadline)?)?;
+        let capture = self
+            .backend
+            .capture_debug_frame(before.as_ref(), remaining(&self.clock, deadline)?)?;
+        remaining(&self.clock, deadline)?;
+        validate_source_metadata(&capture.source)?;
+        validate_published_metadata(&capture.published)?;
+        validate_published_metadata(&capture.rechecked)?;
+        if !capture_is_fresh(before.as_ref(), &capture.source)
+            || capture.published != capture.rechecked
+            || capture.source.sha256 != capture.published.sha256
+            || capture.source.size != capture.published.size
+        {
             return Err(OperationError::RemoteCaptureChanged);
         }
 
-        let bytes = read_bounded(temporary.path())?;
-        let digest = sha256(&bytes);
-        if digest != published.sha256 || bytes.len() as u64 != published.size {
+        let digest = sha256(&capture.bytes);
+        if digest != capture.published.sha256
+            || capture.bytes.len() as u64 != capture.published.size
+        {
             return Err(OperationError::RemoteCaptureChanged);
         }
-        validate_png(&bytes)?;
-        temporary
-            .as_file()
-            .sync_all()
-            .map_err(|_| OperationError::LocalIo)?;
-        temporary
-            .persist(destination)
-            .map_err(|_| OperationError::LocalIo)?;
-        fs::File::open(&parent)
-            .and_then(|directory| directory.sync_all())
-            .map_err(|_| OperationError::LocalIo)?;
+        validate_png(&capture.bytes)?;
+        remaining(&self.clock, deadline)?;
+        local.persist(&capture.bytes, &self.clock, deadline)?;
+        remaining(&self.clock, deadline)?;
         Ok(ScreenshotResult {
             destination: destination.to_owned(),
             sha256: digest,
@@ -630,7 +752,10 @@ fn evaluate(facts: &DiagnosticFacts) -> Vec<DiagnosticCode> {
     if facts.installed_application.version != facts.expected_application.version {
         diagnostics.push(DiagnosticCode::ApplicationVersionMismatch);
     }
-    if facts.installed_application.source_commit != facts.expected_application.source_commit {
+    if facts.installed_application.source_commit != facts.expected_application.source_commit
+        || facts.running_application_revision != facts.installed_application.source_commit
+        || facts.running_application_revision != facts.expected_application.source_commit
+    {
         diagnostics.push(DiagnosticCode::ApplicationRevisionMismatch);
     }
     if facts.installed_application.sha256 != facts.expected_application.sha256 {
@@ -651,10 +776,14 @@ fn evaluate(facts: &DiagnosticFacts) -> Vec<DiagnosticCode> {
     if !facts.module_loaded
         || facts.module_name != "hyperpixel2r_kms"
         || facts.module_vermagic != facts.expected_module_vermagic
+        || facts.module_sha256 != facts.expected_module_sha256
     {
         diagnostics.push(DiagnosticCode::ModuleMismatch);
     }
-    if !facts.overlay_configured || facts.overlay_file != facts.expected_overlay_file {
+    if !facts.overlay_configured
+        || facts.overlay_file != facts.expected_overlay_file
+        || facts.overlay_sha256 != facts.expected_overlay_sha256
+    {
         diagnostics.push(DiagnosticCode::OverlayMismatch);
     }
     if !facts.service_active {
@@ -668,6 +797,9 @@ fn evaluate(facts: &DiagnosticFacts) -> Vec<DiagnosticCode> {
     }
     if facts.touch_device.is_none() {
         diagnostics.push(DiagnosticCode::TouchMissing);
+    }
+    if facts.drm_device != "/dev/dri/card0" {
+        diagnostics.push(DiagnosticCode::DrmDeviceWrong);
     }
     if facts.drm_mode != "480x480" {
         diagnostics.push(DiagnosticCode::DrmModeWrong);
@@ -699,6 +831,7 @@ fn validate_facts(facts: &DiagnosticFacts) -> Result<(), OperationError> {
         &facts.expected_application.version,
         &facts.expected_application.source_commit,
         &facts.expected_application.sha256,
+        &facts.running_application_revision,
         &facts.installed_driver.version,
         &facts.installed_driver.source_commit,
         &facts.installed_driver.sha256,
@@ -710,8 +843,13 @@ fn validate_facts(facts: &DiagnosticFacts) -> Result<(), OperationError> {
         &facts.module_name,
         &facts.module_vermagic,
         &facts.expected_module_vermagic,
+        &facts.module_sha256,
+        &facts.expected_module_sha256,
         &facts.overlay_file,
         &facts.expected_overlay_file,
+        &facts.overlay_sha256,
+        &facts.expected_overlay_sha256,
+        &facts.boot_config_sha256,
         &facts.drm_device,
         &facts.drm_mode,
         &facts.renderer,
@@ -732,6 +870,20 @@ fn validate_facts(facts: &DiagnosticFacts) -> Result<(), OperationError> {
         if !is_lower_hex(&artifact.source_commit, 40) || !is_lower_hex(&artifact.sha256, 64) {
             return Err(OperationError::MalformedFacts);
         }
+    }
+    for digest in [
+        &facts.module_sha256,
+        &facts.expected_module_sha256,
+        &facts.overlay_sha256,
+        &facts.expected_overlay_sha256,
+        &facts.boot_config_sha256,
+    ] {
+        if !is_lower_hex(digest, 64) {
+            return Err(OperationError::MalformedFacts);
+        }
+    }
+    if !is_lower_hex(&facts.running_application_revision, 40) {
+        return Err(OperationError::MalformedFacts);
     }
     Ok(())
 }
@@ -788,96 +940,201 @@ fn capture_is_fresh(before: Option<&CaptureMetadata>, after: &CaptureMetadata) -
         .is_none_or(|before| after.inode != before.inode && after.modified_ns >= before.modified_ns)
 }
 
-fn prepare_local_destination(destination: &Path) -> Result<PathBuf, OperationError> {
+struct PinnedDestination {
+    directory: File,
+    parent_path: PathBuf,
+    directory_device: i128,
+    directory_inode: i128,
+    file_name: OsString,
+}
+
+impl PinnedDestination {
+    fn prepare(destination: &Path) -> Result<Self, OperationError> {
+        let (directory, parent_path, file_name) = open_destination_parent(destination, true)?;
+        validate_final_entry(&directory, &file_name)?;
+        let identity = fstat(&directory).map_err(|_| OperationError::LocalIo)?;
+        Ok(Self {
+            directory,
+            parent_path,
+            directory_device: i128::from(identity.st_dev),
+            directory_inode: i128::from(identity.st_ino),
+            file_name,
+        })
+    }
+
+    fn persist<C: CaptureClock>(
+        &self,
+        bytes: &[u8],
+        clock: &C,
+        deadline: Duration,
+    ) -> Result<(), OperationError> {
+        self.verify_parent_identity()?;
+        remaining(clock, deadline)?;
+        let mut random = rand::rng();
+        let mut temporary = None;
+        for _ in 0..16 {
+            let name = format!(".planeradar-capture-{:016x}", random.next_u64());
+            match openat(
+                &self.directory,
+                name.as_str(),
+                OFlag::O_CREAT
+                    | OFlag::O_EXCL
+                    | OFlag::O_RDWR
+                    | OFlag::O_CLOEXEC
+                    | OFlag::O_NOFOLLOW,
+                Mode::from_bits_truncate(0o600),
+            ) {
+                Ok(file) => {
+                    temporary = Some((name, File::from(file)));
+                    break;
+                }
+                Err(Errno::EEXIST) => continue,
+                Err(_) => return Err(OperationError::LocalIo),
+            }
+        }
+        let (temporary_name, mut temporary_file) = temporary.ok_or(OperationError::LocalIo)?;
+        let result = (|| {
+            temporary_file
+                .write_all(bytes)
+                .and_then(|()| temporary_file.sync_all())
+                .map_err(|_| OperationError::LocalIo)?;
+            let metadata = fstat(&temporary_file).map_err(|_| OperationError::LocalIo)?;
+            if SFlag::from_bits_truncate(metadata.st_mode) != SFlag::S_IFREG
+                || metadata.st_nlink != 1
+                || metadata.st_size != bytes.len() as i64
+                || metadata.st_mode & 0o777 != 0o600
+            {
+                return Err(OperationError::UnsafeLocalDestination);
+            }
+            remaining(clock, deadline)?;
+            self.verify_parent_identity()?;
+            validate_final_entry(&self.directory, &self.file_name)?;
+            renameat(
+                &self.directory,
+                temporary_name.as_str(),
+                &self.directory,
+                Path::new(&self.file_name),
+            )
+            .map_err(|_| OperationError::LocalIo)?;
+            self.directory
+                .sync_all()
+                .map_err(|_| OperationError::LocalIo)
+        })();
+        if result.is_err() {
+            let _ = unlinkat(
+                &self.directory,
+                temporary_name.as_str(),
+                UnlinkatFlags::NoRemoveDir,
+            );
+        }
+        result
+    }
+
+    fn verify_parent_identity(&self) -> Result<(), OperationError> {
+        let destination = if self.parent_path == Path::new(".") {
+            PathBuf::from(&self.file_name)
+        } else {
+            self.parent_path.join(&self.file_name)
+        };
+        let (directory, _, file_name) = open_destination_parent(&destination, false)?;
+        let identity = fstat(&directory).map_err(|_| OperationError::LocalIo)?;
+        if i128::from(identity.st_dev) != self.directory_device
+            || i128::from(identity.st_ino) != self.directory_inode
+            || file_name != self.file_name
+        {
+            return Err(OperationError::UnsafeLocalDestination);
+        }
+        Ok(())
+    }
+}
+
+fn open_destination_parent(
+    destination: &Path,
+    create: bool,
+) -> Result<(File, PathBuf, OsString), OperationError> {
     if destination.as_os_str().is_empty()
-        || destination.file_name().is_none()
         || destination
             .components()
             .any(|component| matches!(component, Component::ParentDir | Component::CurDir))
     {
         return Err(OperationError::UnsafeLocalDestination);
     }
-    if let Ok(metadata) = fs::symlink_metadata(destination)
-        && (metadata.file_type().is_symlink() || !metadata.is_file())
-    {
-        return Err(OperationError::UnsafeLocalDestination);
-    }
-    let parent = destination
+    let file_name = match destination.components().next_back() {
+        Some(Component::Normal(name)) if !name.as_bytes().contains(&0) => name.to_os_string(),
+        _ => return Err(OperationError::UnsafeLocalDestination),
+    };
+    let parent_path = destination
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    ensure_safe_parent(parent)?;
-    Ok(parent.to_owned())
-}
-
-fn ensure_safe_parent(parent: &Path) -> Result<(), OperationError> {
-    reject_symlink_ancestors(parent)?;
-    if parent.exists() {
-        let metadata = fs::symlink_metadata(parent).map_err(|_| OperationError::LocalIo)?;
-        if metadata.file_type().is_symlink() || !metadata.is_dir() {
-            return Err(OperationError::UnsafeLocalDestination);
-        }
-        return Ok(());
-    }
-    let ancestor = parent
-        .ancestors()
-        .find(|candidate| candidate.exists())
-        .ok_or(OperationError::UnsafeLocalDestination)?;
-    let metadata = fs::symlink_metadata(ancestor).map_err(|_| OperationError::LocalIo)?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        return Err(OperationError::UnsafeLocalDestination);
-    }
-    let mut builder = fs::DirBuilder::new();
-    builder.recursive(true).mode(0o700);
-    builder
-        .create(parent)
-        .map_err(|_| OperationError::LocalIo)?;
-    reject_symlink_ancestors(parent)?;
-    Ok(())
-}
-
-fn reject_symlink_ancestors(path: &Path) -> Result<(), OperationError> {
-    let mut current = PathBuf::new();
-    for component in path.components() {
-        current.push(component);
-        match fs::symlink_metadata(&current) {
-            Ok(metadata) => {
-                if metadata.file_type().is_symlink() {
-                    if metadata.uid() != 0
-                        || !fs::metadata(&current).is_ok_and(|target| target.is_dir())
-                    {
-                        return Err(OperationError::UnsafeLocalDestination);
-                    }
-                } else if !metadata.is_dir() {
-                    return Err(OperationError::UnsafeLocalDestination);
-                }
+        .unwrap_or_else(|| Path::new("."))
+        .to_owned();
+    let mut directory = if destination.is_absolute() {
+        File::from(
+            open(
+                Path::new("/"),
+                OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+                Mode::empty(),
+            )
+            .map_err(|_| OperationError::UnsafeLocalDestination)?,
+        )
+    } else {
+        File::from(
+            open(
+                Path::new("."),
+                OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+                Mode::empty(),
+            )
+            .map_err(|_| OperationError::UnsafeLocalDestination)?,
+        )
+    };
+    for component in parent_path.components() {
+        let name = match component {
+            Component::RootDir | Component::CurDir => continue,
+            Component::Normal(name) => name,
+            _ => return Err(OperationError::UnsafeLocalDestination),
+        };
+        let flags = OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW;
+        let next = match openat(&directory, Path::new(name), flags, Mode::empty()) {
+            Ok(next) => next,
+            Err(Errno::ENOENT) if create => {
+                mkdirat(&directory, Path::new(name), Mode::from_bits_truncate(0o700))
+                    .map_err(|_| OperationError::LocalIo)?;
+                openat(&directory, Path::new(name), flags, Mode::empty())
+                    .map_err(|_| OperationError::UnsafeLocalDestination)?
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(_) => return Err(OperationError::LocalIo),
+            Err(_) => return Err(OperationError::UnsafeLocalDestination),
+        };
+        directory = File::from(next);
+    }
+    Ok((directory, parent_path, file_name))
+}
+
+fn validate_final_entry(directory: &File, file_name: &OsString) -> Result<(), OperationError> {
+    match fstatat(
+        directory,
+        Path::new(file_name),
+        AtFlags::AT_SYMLINK_NOFOLLOW,
+    ) {
+        Ok(metadata) => {
+            if SFlag::from_bits_truncate(metadata.st_mode) != SFlag::S_IFREG
+                || metadata.st_nlink != 1
+            {
+                return Err(OperationError::UnsafeLocalDestination);
+            }
         }
+        Err(Errno::ENOENT) => {}
+        Err(_) => return Err(OperationError::LocalIo),
     }
     Ok(())
 }
 
-fn read_bounded(path: &Path) -> Result<Vec<u8>, OperationError> {
-    let metadata = fs::symlink_metadata(path).map_err(|_| OperationError::LocalIo)?;
-    if !metadata.is_file()
-        || metadata.file_type().is_symlink()
-        || metadata.nlink() != 1
-        || metadata.len() > MAX_CAPTURE_BYTES
-    {
-        return Err(OperationError::UnsafeLocalDestination);
+fn remaining<C: CaptureClock>(clock: &C, deadline: Duration) -> Result<Duration, OperationError> {
+    let remaining = deadline.saturating_sub(clock.now());
+    if remaining.is_zero() {
+        Err(OperationError::CaptureTimedOut)
+    } else {
+        Ok(remaining)
     }
-    let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    fs::File::open(path)
-        .map_err(|_| OperationError::LocalIo)?
-        .take(MAX_CAPTURE_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|_| OperationError::LocalIo)?;
-    if bytes.len() as u64 > MAX_CAPTURE_BYTES {
-        return Err(OperationError::CaptureTooLarge);
-    }
-    Ok(bytes)
 }
 
 fn validate_png(bytes: &[u8]) -> Result<(), OperationError> {

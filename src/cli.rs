@@ -74,6 +74,15 @@ pub enum Command {
     },
     #[command(hide = true)]
     InstallerOwnership,
+    #[command(hide = true)]
+    CaptureMetadata,
+    #[command(hide = true)]
+    CaptureSnapshot {
+        #[arg(long, value_name = "JSON_OR_NONE")]
+        before: String,
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..=30_000))]
+        timeout_ms: u64,
+    },
     ConfigureDisplay {
         #[arg(long, default_value = "/boot/firmware/config.txt")]
         boot_config: PathBuf,
