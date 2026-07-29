@@ -22,6 +22,7 @@ const INSTALL_REVISION: &str = "opt/planeradar/REVISION";
 const INSTALL_CHECKSUM: &str = "opt/planeradar/SHA256";
 const INSTALL_SERVICE: &str = "etc/systemd/system/planeradar.service";
 const INSTALL_STATE: &str = "var/lib/planeradar";
+const LIFECYCLE_STATE: &str = "var/lib/planeradar-installer/lifecycle.json";
 const RUNTIME_PACKAGES: &[&str] = &[
     "libsdl2-2.0-0",
     "libegl1",
@@ -96,6 +97,14 @@ pub enum InstallError {
     RevisionMismatch(String),
     #[error("target installer state is invalid")]
     InvalidInstallerState,
+    #[error("application release identity is invalid")]
+    InvalidReleaseIdentity,
+    #[error("owned-file manifest is invalid")]
+    InvalidOwnershipManifest,
+    #[error("settings are not proven installer-owned")]
+    SettingsNotOwned,
+    #[error("an installer-owned path has drifted: {0}")]
+    OwnedPathDrift(PathBuf),
     #[error("boot configuration has {0} active HyperPixel declarations; expected at most one")]
     AmbiguousDisplay(usize),
     #[error("path is not valid UTF-8: {0}")]
@@ -121,14 +130,14 @@ struct InstallerStateDocument {
     last_verified_phase: InstallerPhase,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 struct InstallerHardwareIdentity {
     model: String,
     serial: String,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 struct InstallerArtifactIdentity {
     version: String,
@@ -438,9 +447,242 @@ pub struct InstallResult {
     pub owned_files: Vec<InstalledFile>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct InstalledFile {
     pub target_path: String,
+    pub sha256: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct LifecycleStateDocument {
+    schema_version: u32,
+    hardware: InstallerHardwareIdentity,
+    accepted: Vec<LifecycleAcceptedPair>,
+    transaction: Option<LifecycleTransactionDocument>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct LifecycleAcceptedPair {
+    pair: LifecycleReleasePair,
+    sequence: u64,
+    owned_files: Vec<InstalledFile>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct LifecycleReleasePair {
+    application: InstallerArtifactIdentity,
+    driver: InstallerArtifactIdentity,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct LifecycleTransactionDocument {
+    prior: LifecycleAcceptedPair,
+    candidate: LifecycleReleasePair,
+    phase: LifecyclePhaseDocument,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum LifecyclePhaseDocument {
+    Prepared,
+    ApplicationStaged,
+    DriverStaged,
+    TrybootVerified,
+    DriverCommitted,
+    NormalBootVerified,
+    ApplicationActivated,
+    ApplicationRestarted,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ApplicationOwnershipDocument {
+    schema_version: u32,
+    owned_files: Vec<InstalledFile>,
+}
+
+pub fn application_release_ownership_json(
+    owned_files: &[InstalledFile],
+) -> Result<String, InstallError> {
+    validate_application_ownership(owned_files)?;
+    serde_json::to_string(&ApplicationOwnershipDocument {
+        schema_version: 1,
+        owned_files: owned_files.to_vec(),
+    })
+    .map_err(|_| InstallError::InvalidOwnershipManifest)
+}
+
+pub fn parse_application_ownership_json(
+    contents: &[u8],
+) -> Result<Vec<InstalledFile>, InstallError> {
+    if contents.len() > MAX_INSTALLER_STATE_BYTES {
+        return Err(InstallError::InvalidOwnershipManifest);
+    }
+    let mut deserializer = serde_json::Deserializer::from_slice(contents);
+    let document = ApplicationOwnershipDocument::deserialize(&mut deserializer)
+        .map_err(|_| InstallError::InvalidOwnershipManifest)?;
+    deserializer
+        .end()
+        .map_err(|_| InstallError::InvalidOwnershipManifest)?;
+    if document.schema_version != 1 {
+        return Err(InstallError::InvalidOwnershipManifest);
+    }
+    validate_application_ownership(&document.owned_files)?;
+    Ok(document.owned_files)
+}
+
+fn validate_application_ownership(owned_files: &[InstalledFile]) -> Result<(), InstallError> {
+    if owned_files.is_empty()
+        || owned_files.len() > 64
+        || owned_files.iter().enumerate().any(|(index, file)| {
+            !valid_installer_owned_file(&InstallerOwnedFile {
+                target_path: file.target_path.clone(),
+                sha256: file.sha256.clone(),
+            }) || owned_files[..index]
+                .iter()
+                .any(|prior| prior.target_path == file.target_path)
+        })
+    {
+        return Err(InstallError::InvalidOwnershipManifest);
+    }
+    Ok(())
+}
+
+pub fn write_lifecycle_state_json(path: &Path, contents: &[u8]) -> Result<(), InstallError> {
+    let state = parse_lifecycle_state(contents)?;
+    let serialized = serde_json::to_vec(&state).map_err(|_| InstallError::InvalidInstallerState)?;
+    let parent_path = path
+        .parent()
+        .ok_or_else(|| InstallError::MissingParent(path.into()))?;
+    let parent = open_private_installer_directory(parent_path, true)?
+        .ok_or_else(|| InstallError::MissingParent(parent_path.into()))?;
+    let state_name = path
+        .file_name()
+        .ok_or_else(|| InstallError::UnsafeFileType(path.into()))?;
+    reject_unsafe_installer_state_at(&parent, state_name)?;
+
+    static LIFECYCLE_TEMPORARY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    let temporary_name = format!(
+        ".lifecycle.json.{}.{}",
+        std::process::id(),
+        LIFECYCLE_TEMPORARY_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    );
+    let temporary_fd = openat(
+        &parent,
+        temporary_name.as_str(),
+        OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+        Mode::from_bits_truncate(0o600),
+    )
+    .map_err(nix_io)?;
+    let mut temporary = File::from(temporary_fd);
+    temporary.write_all(&serialized)?;
+    temporary.flush()?;
+    temporary.sync_all()?;
+    if let Err(error) = renameat(&parent, temporary_name.as_str(), &parent, state_name) {
+        let _ = nix::unistd::unlinkat(
+            &parent,
+            temporary_name.as_str(),
+            nix::unistd::UnlinkatFlags::NoRemoveDir,
+        );
+        return Err(nix_io(error).into());
+    }
+    parent.sync_all()?;
+    Ok(())
+}
+
+pub fn read_lifecycle_state_json(path: &Path) -> Result<String, InstallError> {
+    let contents = read_bounded_private_state(path)?;
+    let state = parse_lifecycle_state(&contents)?;
+    serde_json::to_string(&state).map_err(|_| InstallError::InvalidInstallerState)
+}
+
+pub fn read_optional_lifecycle_state_json(path: &Path) -> Result<String, InstallError> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| InstallError::MissingParent(path.into()))?;
+    if open_private_installer_directory(parent, false)?.is_none() {
+        return Ok("null".into());
+    }
+    match read_lifecycle_state_json(path) {
+        Err(InstallError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+            Ok("null".into())
+        }
+        result => result,
+    }
+}
+
+fn read_bounded_private_state(path: &Path) -> Result<Vec<u8>, InstallError> {
+    let parent_path = path
+        .parent()
+        .ok_or_else(|| InstallError::MissingParent(path.into()))?;
+    let parent = open_private_installer_directory(parent_path, false)?
+        .ok_or_else(|| InstallError::MissingParent(parent_path.into()))?;
+    let state_name = path
+        .file_name()
+        .ok_or_else(|| InstallError::UnsafeFileType(path.into()))?;
+    reject_unsafe_installer_state_at(&parent, state_name)?;
+    let state_fd = openat(
+        &parent,
+        state_name,
+        OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(nix_io)?;
+    let mut file = File::from(state_fd);
+    let mut contents = Vec::new();
+    Read::by_ref(&mut file)
+        .take((MAX_INSTALLER_STATE_BYTES + 1) as u64)
+        .read_to_end(&mut contents)?;
+    Ok(contents)
+}
+
+fn parse_lifecycle_state(contents: &[u8]) -> Result<LifecycleStateDocument, InstallError> {
+    if contents.len() > MAX_INSTALLER_STATE_BYTES {
+        return Err(InstallError::InvalidInstallerState);
+    }
+    let mut deserializer = serde_json::Deserializer::from_slice(contents);
+    let state = LifecycleStateDocument::deserialize(&mut deserializer)
+        .map_err(|_| InstallError::InvalidInstallerState)?;
+    deserializer
+        .end()
+        .map_err(|_| InstallError::InvalidInstallerState)?;
+    let accepted_valid = state.accepted.len() <= 3
+        && state.accepted.iter().enumerate().all(|(index, accepted)| {
+            accepted.sequence > 0
+                && valid_installer_artifact(&accepted.pair.application)
+                && valid_installer_artifact(&accepted.pair.driver)
+                && validate_application_ownership(&accepted.owned_files).is_ok()
+                && state.accepted[..index]
+                    .iter()
+                    .all(|prior| prior.sequence > accepted.sequence && prior.pair != accepted.pair)
+        });
+    let transaction_valid = state.transaction.as_ref().is_none_or(|transaction| {
+        valid_installer_artifact(&transaction.candidate.application)
+            && valid_installer_artifact(&transaction.candidate.driver)
+            && state
+                .accepted
+                .first()
+                .is_some_and(|current| current == &transaction.prior)
+    });
+    if state.schema_version != 1
+        || !valid_installer_hardware(&state.hardware)
+        || !accepted_valid
+        || !transaction_valid
+    {
+        return Err(InstallError::InvalidInstallerState);
+    }
+    Ok(state)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ApplicationReleaseIdentity {
+    pub version: String,
+    pub revision: String,
     pub sha256: String,
 }
 
@@ -502,6 +744,340 @@ pub fn installer_ownership_json(root: &Path) -> Result<String, InstallError> {
         owned_files,
     })
     .map_err(|error| InstallError::Io(io::Error::other(error)))
+}
+
+pub fn activate_application_release(
+    root: &Path,
+    artifact: &Path,
+    identity: &ApplicationReleaseIdentity,
+    current_owned_files: &[InstalledFile],
+) -> Result<Vec<InstalledFile>, InstallError> {
+    let root = canonical_installation_root(root)?;
+    validate_application_release_identity(identity)?;
+    verify_application_switch_precondition(&root, current_owned_files, identity)?;
+    require_single_link_regular(artifact, None)?;
+    let artifact_bytes = fs::read(artifact)?;
+    validate_aarch64_elf(&artifact_bytes)?;
+    if format!("{:x}", Sha256::digest(&artifact_bytes)) != identity.sha256 {
+        return Err(InstallError::ChecksumMismatch);
+    }
+
+    for relative in [
+        Path::new("opt/planeradar/releases"),
+        Path::new("opt/planeradar/releases")
+            .join(&identity.version)
+            .as_path(),
+    ] {
+        ensure_install_directory(&root, relative, 0o755, true)?;
+    }
+    let digest_relative = Path::new("opt/planeradar/releases")
+        .join(&identity.version)
+        .join(&identity.sha256);
+    ensure_install_directory(&root, &digest_relative, 0o755, true)?;
+    let release_relative = digest_relative.join("planeradar");
+    let release_path = install_path(&root, &release_relative);
+    durable_atomic_write_bytes(&release_path, &artifact_bytes, 0o755)?;
+    require_single_link_regular(&release_path, Some(&root))?;
+
+    durable_atomic_write_bytes(&install_path(&root, INSTALL_BINARY), &artifact_bytes, 0o755)?;
+    let revision = format!("{}\n", identity.revision);
+    durable_atomic_write_bytes(
+        &install_path(&root, INSTALL_REVISION),
+        revision.as_bytes(),
+        0o644,
+    )?;
+    let checksum = format!("{}  planeradar\n", identity.sha256);
+    durable_atomic_write_bytes(
+        &install_path(&root, INSTALL_CHECKSUM),
+        checksum.as_bytes(),
+        0o644,
+    )?;
+
+    let mut owned = current_owned_files
+        .iter()
+        .filter(|file| {
+            !matches!(
+                file.target_path.as_str(),
+                "/opt/planeradar/bin/planeradar"
+                    | "/opt/planeradar/REVISION"
+                    | "/opt/planeradar/SHA256"
+            )
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    owned.splice(
+        0..0,
+        [
+            InstalledFile {
+                target_path: "/opt/planeradar/bin/planeradar".into(),
+                sha256: identity.sha256.clone(),
+            },
+            InstalledFile {
+                target_path: "/opt/planeradar/REVISION".into(),
+                sha256: format!("{:x}", Sha256::digest(revision.as_bytes())),
+            },
+            InstalledFile {
+                target_path: "/opt/planeradar/SHA256".into(),
+                sha256: format!("{:x}", Sha256::digest(checksum.as_bytes())),
+            },
+        ],
+    );
+    owned.push(InstalledFile {
+        target_path: format!("/{}", release_relative.display()),
+        sha256: identity.sha256.clone(),
+    });
+    Ok(owned)
+}
+
+pub fn uninstall_owned_installation(
+    root: &Path,
+    owned_files: &[InstalledFile],
+    purge_settings: bool,
+    commands: &dyn CommandRunner,
+) -> Result<(), InstallError> {
+    let root = canonical_installation_root(root)?;
+    if purge_settings
+        && !owned_files
+            .iter()
+            .any(|file| file.target_path == "/var/lib/planeradar/settings.json")
+    {
+        return Err(InstallError::SettingsNotOwned);
+    }
+    verify_owned_manifest(&root, owned_files, purge_settings)?;
+    commands.run("systemctl", &["disable", "--now", "planeradar.service"])?;
+    for file in owned_files {
+        if !purge_settings && file.target_path == "/var/lib/planeradar/settings.json" {
+            continue;
+        }
+        let path = owned_target_path(&root, &file.target_path)?;
+        match fs::symlink_metadata(&path) {
+            Ok(_) => {
+                fs::remove_file(&path)?;
+                if let Some(parent) = path.parent() {
+                    File::open(parent)?.sync_all()?;
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    commands.run("systemctl", &["daemon-reload"])?;
+    Ok(())
+}
+
+fn canonical_installation_root(root: &Path) -> Result<PathBuf, InstallError> {
+    if !root.is_absolute() {
+        return Err(InstallError::InvalidRoot(root.to_owned()));
+    }
+    let metadata = fs::symlink_metadata(root)?;
+    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+        return Err(InstallError::InvalidRoot(root.to_owned()));
+    }
+    fs::canonicalize(root).map_err(InstallError::Io)
+}
+
+fn validate_application_release_identity(
+    identity: &ApplicationReleaseIdentity,
+) -> Result<(), InstallError> {
+    if semver::Version::parse(&identity.version)
+        .ok()
+        .is_none_or(|version| version.to_string() != identity.version)
+        || !is_lower_hex(&identity.revision, 40)
+        || !is_lower_hex(&identity.sha256, 64)
+    {
+        return Err(InstallError::InvalidReleaseIdentity);
+    }
+    Ok(())
+}
+
+fn verify_application_switch_precondition(
+    root: &Path,
+    current_owned_files: &[InstalledFile],
+    identity: &ApplicationReleaseIdentity,
+) -> Result<(), InstallError> {
+    let drift = match verify_owned_manifest(root, current_owned_files, false) {
+        Ok(()) => return Ok(()),
+        Err(error @ InstallError::OwnedPathDrift(_)) => error,
+        Err(error) => return Err(error),
+    };
+    if transaction_proves_interrupted_application_switch(root, current_owned_files, identity) {
+        Ok(())
+    } else {
+        Err(drift)
+    }
+}
+
+fn transaction_proves_interrupted_application_switch(
+    root: &Path,
+    current_owned_files: &[InstalledFile],
+    identity: &ApplicationReleaseIdentity,
+) -> bool {
+    let state_path = install_path(root, LIFECYCLE_STATE);
+    let Ok(contents) = read_bounded_private_state(&state_path) else {
+        return false;
+    };
+    let Ok(state) = parse_lifecycle_state(&contents) else {
+        return false;
+    };
+    let Some(transaction) = state.transaction else {
+        return false;
+    };
+    if transaction.prior.owned_files != current_owned_files
+        || (!application_identity_matches(&transaction.prior.pair.application, identity)
+            && !application_identity_matches(&transaction.candidate.application, identity))
+    {
+        return false;
+    }
+
+    current_owned_files.iter().all(|file| {
+        let Ok(path) = owned_target_path(root, &file.target_path) else {
+            return false;
+        };
+        if require_single_link_regular(&path, Some(root)).is_err() {
+            return false;
+        }
+        let Ok(bytes) = fs::read(&path) else {
+            return false;
+        };
+        let digest = format!("{:x}", Sha256::digest(&bytes));
+        digest == file.sha256
+            || interrupted_candidate_digest(&file.target_path, &transaction.candidate.application)
+                .is_some_and(|candidate| digest == candidate)
+    })
+}
+
+fn application_identity_matches(
+    artifact: &InstallerArtifactIdentity,
+    identity: &ApplicationReleaseIdentity,
+) -> bool {
+    artifact.version == identity.version
+        && artifact.source_commit == identity.revision
+        && artifact.sha256 == identity.sha256
+}
+
+fn interrupted_candidate_digest(
+    target_path: &str,
+    candidate: &InstallerArtifactIdentity,
+) -> Option<String> {
+    match target_path {
+        "/opt/planeradar/bin/planeradar" => Some(candidate.sha256.clone()),
+        "/opt/planeradar/REVISION" => Some(format!(
+            "{:x}",
+            Sha256::digest(format!("{}\n", candidate.source_commit))
+        )),
+        "/opt/planeradar/SHA256" => Some(format!(
+            "{:x}",
+            Sha256::digest(format!("{}  planeradar\n", candidate.sha256))
+        )),
+        _ => None,
+    }
+}
+
+fn verify_owned_manifest(
+    root: &Path,
+    owned_files: &[InstalledFile],
+    include_settings: bool,
+) -> Result<(), InstallError> {
+    if owned_files.is_empty() || owned_files.len() > 64 {
+        return Err(InstallError::InvalidOwnershipManifest);
+    }
+    for (index, file) in owned_files.iter().enumerate() {
+        if owned_files[..index]
+            .iter()
+            .any(|prior| prior.target_path == file.target_path)
+            || !is_lower_hex(&file.sha256, 64)
+            || !allowed_owned_path(&file.target_path, include_settings)
+        {
+            return Err(InstallError::InvalidOwnershipManifest);
+        }
+        let path = owned_target_path(root, &file.target_path)?;
+        match fs::symlink_metadata(&path) {
+            Ok(_) => {
+                require_single_link_regular(&path, Some(root))?;
+                let digest = format!("{:x}", Sha256::digest(fs::read(&path)?));
+                if digest != file.sha256 {
+                    return Err(InstallError::OwnedPathDrift(path));
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
+fn allowed_owned_path(path: &str, include_settings: bool) -> bool {
+    if matches!(
+        path,
+        "/opt/planeradar/bin/planeradar"
+            | "/opt/planeradar/REVISION"
+            | "/opt/planeradar/SHA256"
+            | "/etc/systemd/system/planeradar.service"
+    ) {
+        return true;
+    }
+    if include_settings && path == "/var/lib/planeradar/settings.json" {
+        return true;
+    }
+    let Some(release) = path.strip_prefix("/opt/planeradar/releases/") else {
+        return false;
+    };
+    let mut components = release.split('/');
+    let (Some(version), Some(digest), Some("planeradar"), None) = (
+        components.next(),
+        components.next(),
+        components.next(),
+        components.next(),
+    ) else {
+        return false;
+    };
+    semver::Version::parse(version).is_ok_and(|parsed| parsed.to_string() == version)
+        && is_lower_hex(digest, 64)
+}
+
+fn owned_target_path(root: &Path, target_path: &str) -> Result<PathBuf, InstallError> {
+    if !target_path.starts_with('/')
+        || target_path == "/"
+        || target_path.contains("//")
+        || target_path
+            .split('/')
+            .any(|component| component == "." || component == "..")
+        || target_path.bytes().any(|byte| byte.is_ascii_control())
+    {
+        return Err(InstallError::InvalidOwnershipManifest);
+    }
+    let relative = target_path.trim_start_matches('/');
+    let mut current = root.to_owned();
+    let components = Path::new(relative).components().collect::<Vec<_>>();
+    for component in components.iter().take(components.len().saturating_sub(1)) {
+        let Component::Normal(component) = component else {
+            return Err(InstallError::InvalidOwnershipManifest);
+        };
+        current.push(component);
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() => {
+            }
+            Ok(_) => return Err(InstallError::OwnedPathDrift(current)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => break,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(root.join(relative))
+}
+
+fn require_single_link_regular(path: &Path, root: Option<&Path>) -> Result<(), InstallError> {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() || metadata.nlink() != 1
+    {
+        return Err(InstallError::OwnedPathDrift(path.to_owned()));
+    }
+    if let Some(root) = root {
+        let root_metadata = fs::symlink_metadata(root)?;
+        if metadata.uid() != root_metadata.uid() || metadata.gid() != root_metadata.gid() {
+            return Err(InstallError::OwnedPathDrift(path.to_owned()));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Error)]

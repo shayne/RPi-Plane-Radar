@@ -7,8 +7,11 @@ use std::sync::Mutex;
 use clap::Parser;
 use planeradar::cli::{Cli, Command as CliCommand};
 use planeradar::install::{
-    CommandRunner, InstallError, InstallOptions, InstallResult, Installer, PLANERADAR_SERVICE,
-    read_installer_state_json, read_optional_installer_state_json, write_installer_state_json,
+    ApplicationReleaseIdentity, CommandRunner, InstallError, InstallOptions, InstallResult,
+    InstalledFile, Installer, PLANERADAR_SERVICE, activate_application_release,
+    application_release_ownership_json, parse_application_ownership_json,
+    read_installer_state_json, read_lifecycle_state_json, read_optional_installer_state_json,
+    uninstall_owned_installation, write_installer_state_json, write_lifecycle_state_json,
 };
 use sha2::{Digest, Sha256};
 
@@ -918,4 +921,367 @@ fn target_installer_state_rejects_non_private_or_symlinked_state_directories() {
     symlink(&outside, &linked).expect("linked state directory");
     assert!(write_installer_state_json(&linked.join("state.json"), valid.as_bytes()).is_err());
     assert!(!outside.join("state.json").exists());
+}
+
+#[test]
+fn application_upgrade_stages_content_addressed_bytes_and_atomically_switches_the_live_binary() {
+    let fixture = Fixture::new("[all]\n");
+    let runner = RecordingRunner::for_root(&fixture.root);
+    let installed = Installer::new(&runner)
+        .install(&fixture.options(false))
+        .expect("initial install");
+    let settings = fixture.root.join("var/lib/planeradar/settings.json");
+    fs::write(&settings, b"{\"range_km\":10}").expect("settings");
+    let old_settings = fs::read(&settings).expect("old settings");
+    let mut next_bytes = fs::read(&fixture.artifact).expect("artifact");
+    next_bytes.push(42);
+    let next = fixture._directory.path().join("planeradar-next");
+    fs::write(&next, &next_bytes).expect("next artifact");
+    let identity = ApplicationReleaseIdentity {
+        version: "1.1.0".into(),
+        revision: "b".repeat(40),
+        sha256: format!("{:x}", Sha256::digest(&next_bytes)),
+    };
+
+    let owned =
+        activate_application_release(&fixture.root, &next, &identity, &installed.owned_files)
+            .expect("activate release");
+
+    assert_eq!(
+        fs::read(fixture.root.join("opt/planeradar/bin/planeradar")).expect("live binary"),
+        next_bytes
+    );
+    assert_eq!(
+        fs::read(
+            fixture
+                .root
+                .join("opt/planeradar/releases/1.1.0")
+                .join(&identity.sha256)
+                .join("planeradar")
+        )
+        .expect("versioned binary"),
+        fs::read(&next).unwrap()
+    );
+    assert_eq!(fs::read(&settings).unwrap(), old_settings);
+    assert_eq!(owned.len(), 5);
+    assert_eq!(
+        owned.last().unwrap().target_path,
+        format!(
+            "/opt/planeradar/releases/1.1.0/{}/planeradar",
+            identity.sha256
+        )
+    );
+}
+
+#[test]
+fn exact_manifest_uninstall_preserves_settings_unrelated_files_and_boot_lines_and_is_idempotent() {
+    let fixture = Fixture::new("[all]\ndtparam=audio=on\n");
+    let runner = RecordingRunner::for_root(&fixture.root);
+    let installed = Installer::new(&runner)
+        .install(&fixture.options(false))
+        .expect("initial install");
+    let settings = fixture.root.join("var/lib/planeradar/settings.json");
+    fs::write(&settings, b"{\"latitude\":40}").expect("settings");
+    let unrelated = fixture.root.join("opt/planeradar/user-note");
+    fs::write(&unrelated, b"mine").expect("unrelated file");
+    let boot_before = fs::read(&fixture.boot_config).expect("boot before");
+
+    uninstall_owned_installation(&fixture.root, &installed.owned_files, false, &runner)
+        .expect("uninstall");
+    uninstall_owned_installation(&fixture.root, &installed.owned_files, false, &runner)
+        .expect("idempotent repeat");
+
+    for owned in &installed.owned_files {
+        assert!(
+            !fixture
+                .root
+                .join(owned.target_path.trim_start_matches('/'))
+                .exists()
+        );
+    }
+    assert_eq!(fs::read(&settings).unwrap(), b"{\"latitude\":40}");
+    assert_eq!(fs::read(&unrelated).unwrap(), b"mine");
+    assert_eq!(fs::read(&fixture.boot_config).unwrap(), boot_before);
+    assert!(runner.commands().iter().any(|(program, arguments)| {
+        program == "systemctl" && arguments == &["disable", "--now", "planeradar.service"]
+    }));
+}
+
+#[test]
+fn purge_settings_requires_and_removes_only_an_exact_owned_settings_record() {
+    let fixture = Fixture::new("[all]\n");
+    let runner = RecordingRunner::for_root(&fixture.root);
+    let installed = Installer::new(&runner)
+        .install(&fixture.options(false))
+        .expect("initial install");
+    let settings = fixture.root.join("var/lib/planeradar/settings.json");
+    fs::write(&settings, b"{\"latitude\":40}").expect("settings");
+
+    assert!(matches!(
+        uninstall_owned_installation(&fixture.root, &installed.owned_files, true, &runner),
+        Err(InstallError::SettingsNotOwned)
+    ));
+    assert!(settings.exists());
+    assert!(
+        fixture.root.join("opt/planeradar/bin/planeradar").exists(),
+        "preflight must happen before any deletion"
+    );
+
+    let mut owned = installed.owned_files;
+    owned.push(InstalledFile {
+        target_path: "/var/lib/planeradar/settings.json".into(),
+        sha256: format!("{:x}", Sha256::digest(fs::read(&settings).unwrap())),
+    });
+    uninstall_owned_installation(&fixture.root, &owned, true, &runner).expect("purge uninstall");
+    assert!(!settings.exists());
+}
+
+#[test]
+fn uninstall_fails_closed_before_deletion_on_drift_symlinks_or_hardlinks() {
+    for hostile in ["drift", "symlink", "hardlink"] {
+        let fixture = Fixture::new("[all]\n");
+        let runner = RecordingRunner::for_root(&fixture.root);
+        let installed = Installer::new(&runner)
+            .install(&fixture.options(false))
+            .expect("initial install");
+        let binary = fixture.root.join("opt/planeradar/bin/planeradar");
+        match hostile {
+            "drift" => fs::write(&binary, b"changed").expect("drift"),
+            "symlink" => {
+                let outside = fixture._directory.path().join("outside");
+                fs::write(&outside, b"outside").expect("outside");
+                fs::remove_file(&binary).expect("remove binary");
+                symlink(&outside, &binary).expect("binary symlink");
+            }
+            "hardlink" => {
+                fs::hard_link(
+                    &binary,
+                    fixture._directory.path().join("second-binary-link"),
+                )
+                .expect("hard link");
+            }
+            _ => unreachable!(),
+        }
+
+        assert!(
+            uninstall_owned_installation(&fixture.root, &installed.owned_files, false, &runner)
+                .is_err(),
+            "{hostile}"
+        );
+        assert!(
+            fixture.root.join("opt/planeradar/REVISION").exists(),
+            "{hostile}: no earlier verified file may be deleted"
+        );
+        assert!(
+            !runner.commands().iter().any(|(program, arguments)| {
+                program == "systemctl" && arguments == &["disable", "--now", "planeradar.service"]
+            }),
+            "{hostile}: service mutation must follow complete preflight"
+        );
+    }
+}
+
+#[test]
+fn target_lifecycle_state_round_trips_strict_bounded_json_atomically() {
+    let directory = tempfile::tempdir().expect("temporary state directory");
+    let state_directory = directory
+        .path()
+        .canonicalize()
+        .expect("canonical temporary directory")
+        .join("lifecycle");
+    fs::create_dir(&state_directory).expect("state directory");
+    fs::set_permissions(&state_directory, fs::Permissions::from_mode(0o700))
+        .expect("private state directory");
+    let path = state_directory.join("state.json");
+    let json = r#"{"schema_version":1,"hardware":{"model":"Raspberry Pi Zero 2 W","serial":"0123456789abcdef"},"accepted":[{"pair":{"application":{"version":"1.0.0","source_commit":"1111111111111111111111111111111111111111","sha256":"2222222222222222222222222222222222222222222222222222222222222222"},"driver":{"version":"0.1.0","source_commit":"3333333333333333333333333333333333333333","sha256":"4444444444444444444444444444444444444444444444444444444444444444"}},"sequence":1,"owned_files":[{"target_path":"/opt/planeradar/bin/planeradar","sha256":"2222222222222222222222222222222222222222222222222222222222222222"}]}],"transaction":null}"#;
+
+    write_lifecycle_state_json(&path, json.as_bytes()).expect("write lifecycle");
+    assert_eq!(read_lifecycle_state_json(&path).unwrap(), json);
+    assert_eq!(mode(&path), 0o600);
+
+    for hostile in [
+        json.replace("\"schema_version\":1", "\"schema_version\":2"),
+        json.replace("\"sequence\":1", "\"sequence\":0"),
+        format!("{json}\n{{}}"),
+    ] {
+        assert!(write_lifecycle_state_json(&path, hostile.as_bytes()).is_err());
+        assert_eq!(read_lifecycle_state_json(&path).unwrap(), json);
+    }
+}
+
+#[test]
+fn target_application_ownership_protocol_round_trips_exactly() {
+    let owned = vec![InstalledFile {
+        target_path: "/opt/planeradar/bin/planeradar".into(),
+        sha256: "a".repeat(64),
+    }];
+    let json = application_release_ownership_json(&owned).expect("ownership JSON");
+    assert_eq!(
+        parse_application_ownership_json(json.as_bytes()).expect("parse ownership"),
+        owned
+    );
+    assert!(parse_application_ownership_json(format!("{json}\n{{}}").as_bytes()).is_err());
+}
+
+#[test]
+fn target_lifecycle_cli_exposes_only_typed_state_activation_and_uninstall_arguments() {
+    let state =
+        Cli::try_parse_from(["planeradar", "lifecycle-state", "read"]).expect("lifecycle state");
+    assert!(matches!(state.command, CliCommand::LifecycleState { .. }));
+
+    let activate = Cli::try_parse_from([
+        "planeradar",
+        "lifecycle-activate",
+        "--artifact",
+        "/opt/planeradar/releases/1.0.0/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/planeradar",
+        "--version",
+        "1.0.0",
+        "--revision",
+        "1111111111111111111111111111111111111111",
+        "--sha256",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "--owned-json",
+        "{\"schema_version\":1,\"owned_files\":[]}",
+    ])
+    .expect("lifecycle activate");
+    assert!(matches!(
+        activate.command,
+        CliCommand::LifecycleActivate { version, .. } if version == "1.0.0"
+    ));
+
+    let uninstall = Cli::try_parse_from([
+        "planeradar",
+        "lifecycle-uninstall",
+        "--owned-json",
+        "{\"schema_version\":1,\"owned_files\":[]}",
+        "--purge-settings",
+    ])
+    .expect("lifecycle uninstall");
+    assert!(matches!(
+        uninstall.command,
+        CliCommand::LifecycleUninstall {
+            purge_settings: true,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn interrupted_mixed_application_switch_restores_only_transaction_proven_bytes() {
+    let fixture = Fixture::new("[all]\n");
+    let runner = RecordingRunner::for_root(&fixture.root);
+    let installed = Installer::new(&runner)
+        .install(&fixture.options(false))
+        .expect("initial install");
+    let prior_bytes = fs::read(&fixture.artifact).expect("prior artifact");
+    let prior_sha = format!("{:x}", Sha256::digest(&prior_bytes));
+    let prior_revision = "a".repeat(40);
+    let revision_bytes = format!("{prior_revision}\n");
+    fs::write(
+        fixture.root.join("opt/planeradar/REVISION"),
+        revision_bytes.as_bytes(),
+    )
+    .expect("valid prior revision");
+    let mut prior_owned = installed.owned_files.clone();
+    prior_owned
+        .iter_mut()
+        .find(|file| file.target_path == "/opt/planeradar/REVISION")
+        .expect("revision ownership")
+        .sha256 = format!("{:x}", Sha256::digest(revision_bytes.as_bytes()));
+    let prior_identity = ApplicationReleaseIdentity {
+        version: "1.0.0".into(),
+        revision: prior_revision.clone(),
+        sha256: prior_sha.clone(),
+    };
+    let mut candidate_bytes = prior_bytes.clone();
+    candidate_bytes.push(42);
+    let candidate_sha = format!("{:x}", Sha256::digest(&candidate_bytes));
+    let lifecycle_path = fixture
+        .root
+        .canonicalize()
+        .expect("canonical fixture root")
+        .join("var/lib/planeradar-installer/lifecycle.json");
+    fs::create_dir_all(lifecycle_path.parent().expect("lifecycle parent"))
+        .expect("lifecycle state directory");
+    fs::set_permissions(
+        lifecycle_path.parent().expect("lifecycle parent"),
+        fs::Permissions::from_mode(0o700),
+    )
+    .expect("private lifecycle state directory");
+    let accepted_owned = serde_json::to_value(&prior_owned).unwrap();
+    let state = serde_json::json!({
+        "schema_version": 1,
+        "hardware": {
+            "model": "Raspberry Pi Zero 2 W",
+            "serial": "0123456789abcdef"
+        },
+        "accepted": [{
+            "pair": {
+                "application": {
+                    "version": "1.0.0",
+                    "source_commit": prior_revision,
+                    "sha256": prior_sha
+                },
+                "driver": {
+                    "version": "0.1.0",
+                    "source_commit": "3".repeat(40),
+                    "sha256": "4".repeat(64)
+                }
+            },
+            "sequence": 1,
+            "owned_files": accepted_owned
+        }],
+        "transaction": {
+            "prior": {
+                "pair": {
+                    "application": {
+                        "version": "1.0.0",
+                        "source_commit": prior_identity.revision,
+                        "sha256": prior_identity.sha256
+                    },
+                    "driver": {
+                        "version": "0.1.0",
+                        "source_commit": "3".repeat(40),
+                        "sha256": "4".repeat(64)
+                    }
+                },
+                "sequence": 1,
+                "owned_files": prior_owned.clone()
+            },
+            "candidate": {
+                "application": {
+                    "version": "2.0.0",
+                    "source_commit": "b".repeat(40),
+                    "sha256": candidate_sha
+                },
+                "driver": {
+                    "version": "0.1.0",
+                    "source_commit": "3".repeat(40),
+                    "sha256": "4".repeat(64)
+                }
+            },
+            "phase": "application_activated"
+        }
+    });
+    let encoded_state = serde_json::to_string(&state).unwrap();
+    write_lifecycle_state_json(&lifecycle_path, encoded_state.as_bytes())
+        .unwrap_or_else(|error| panic!("transaction state {error}: {encoded_state}"));
+    fs::write(
+        fixture.root.join("opt/planeradar/bin/planeradar"),
+        candidate_bytes,
+    )
+    .expect("interrupted live switch");
+
+    activate_application_release(
+        &fixture.root,
+        &fixture.artifact,
+        &prior_identity,
+        &prior_owned,
+    )
+    .expect("transaction-proven recovery");
+
+    assert_eq!(
+        fs::read(fixture.root.join("opt/planeradar/bin/planeradar")).unwrap(),
+        prior_bytes
+    );
 }

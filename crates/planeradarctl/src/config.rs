@@ -90,6 +90,7 @@ pub struct InstallConfig {
     pub release_dir: Option<PathBuf>,
     pub docker_context: Option<String>,
     pub non_interactive: bool,
+    pub purge_settings: bool,
 }
 
 impl InstallConfig {
@@ -144,6 +145,7 @@ impl InstallConfig {
             release_dir,
             docker_context,
             non_interactive: options.non_interactive,
+            purge_settings: options.purge_settings,
         })
     }
 }

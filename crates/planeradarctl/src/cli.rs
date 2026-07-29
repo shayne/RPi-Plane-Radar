@@ -63,6 +63,8 @@ pub struct MutatingOptions {
     pub docker_context: Option<String>,
     #[arg(long)]
     pub non_interactive: bool,
+    #[arg(long)]
+    pub purge_settings: bool,
 }
 
 #[derive(Clone, Debug, Args)]

@@ -13,10 +13,13 @@ use planeradar::capture::{
 use planeradar::cli::{Cli, Command, DemoCommand, InstallerStateCommand, version_line};
 use planeradar::display::{DisplayConfig, run_display, run_probe};
 use planeradar::install::{
-    BootConfigEditor, DisplaySelection, InstallOptions, Installer, SystemCommandRunner,
-    commit_display_config, ensure_overlay, installer_ownership_json, read_installer_state_json,
-    read_optional_installer_state_json, rollback_display_config, stage_tryboot_config,
-    stage_tryboot_config_if_source_matches, write_installer_state_json,
+    ApplicationReleaseIdentity, BootConfigEditor, DisplaySelection, InstallOptions, Installer,
+    SystemCommandRunner, activate_application_release, application_release_ownership_json,
+    commit_display_config, ensure_overlay, installer_ownership_json,
+    parse_application_ownership_json, read_installer_state_json, read_lifecycle_state_json,
+    read_optional_installer_state_json, read_optional_lifecycle_state_json,
+    rollback_display_config, stage_tryboot_config, stage_tryboot_config_if_source_matches,
+    uninstall_owned_installation, write_installer_state_json, write_lifecycle_state_json,
 };
 use planeradar::logging;
 use planeradar::render::FontAsset;
@@ -139,6 +142,56 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     "/var/lib/planeradar-installer/state.json",
                 ))?
             );
+        }
+        Command::LifecycleState {
+            command: InstallerStateCommand::Read,
+        } => {
+            println!(
+                "{}",
+                read_optional_lifecycle_state_json(std::path::Path::new(
+                    "/var/lib/planeradar-installer/lifecycle.json",
+                ))?
+            );
+        }
+        Command::LifecycleState {
+            command: InstallerStateCommand::Write { json },
+        } => {
+            let path = std::path::Path::new("/var/lib/planeradar-installer/lifecycle.json");
+            write_lifecycle_state_json(path, json.as_bytes())?;
+            println!("{}", read_lifecycle_state_json(path)?);
+        }
+        Command::LifecycleActivate {
+            artifact,
+            version,
+            revision,
+            sha256,
+            owned_json,
+        } => {
+            let current = parse_application_ownership_json(owned_json.as_bytes())?;
+            let owned = activate_application_release(
+                std::path::Path::new("/"),
+                &artifact,
+                &ApplicationReleaseIdentity {
+                    version,
+                    revision,
+                    sha256,
+                },
+                &current,
+            )?;
+            println!("{}", application_release_ownership_json(&owned)?);
+        }
+        Command::LifecycleUninstall {
+            owned_json,
+            purge_settings,
+        } => {
+            let owned = parse_application_ownership_json(owned_json.as_bytes())?;
+            uninstall_owned_installation(
+                std::path::Path::new("/"),
+                &owned,
+                purge_settings,
+                &SystemCommandRunner,
+            )?;
+            println!("uninstalled");
         }
         Command::InstallerOwnership => {
             println!("{}", installer_ownership_json(std::path::Path::new("/"))?);

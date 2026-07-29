@@ -17,7 +17,9 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::config::DriverLock;
-use crate::state::{ArtifactIdentity, TargetInstallState};
+use crate::state::{
+    ArtifactIdentity, InstallPhase, OwnedFile, TargetHardwareIdentity, TargetInstallState,
+};
 use crate::target::SshTarget;
 use crate::transport::{RemoteCommand, Transport};
 
@@ -1242,6 +1244,500 @@ fn is_lower_hex(value: &str, length: usize) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+pub const LIFECYCLE_SCHEMA_VERSION: u32 = 1;
+pub const MAX_ACCEPTED_PAIRS: usize = 3;
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReleasePair {
+    pub application: ArtifactIdentity,
+    pub driver: ArtifactIdentity,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AcceptedPair {
+    pub pair: ReleasePair,
+    pub sequence: u64,
+    pub owned_files: Vec<OwnedFile>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LifecyclePhase {
+    Prepared,
+    ApplicationStaged,
+    DriverStaged,
+    TrybootVerified,
+    DriverCommitted,
+    NormalBootVerified,
+    ApplicationActivated,
+    ApplicationRestarted,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LifecycleTransaction {
+    pub prior: AcceptedPair,
+    pub candidate: ReleasePair,
+    pub phase: LifecyclePhase,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LifecycleState {
+    schema_version: u32,
+    hardware: TargetHardwareIdentity,
+    accepted: Vec<AcceptedPair>,
+    transaction: Option<LifecycleTransaction>,
+}
+
+impl LifecycleState {
+    pub fn empty(hardware: TargetHardwareIdentity) -> Result<Self, LifecycleError> {
+        Self::installed(hardware, Vec::new())
+    }
+
+    pub fn installed(
+        hardware: TargetHardwareIdentity,
+        accepted: Vec<AcceptedPair>,
+    ) -> Result<Self, LifecycleError> {
+        let state = Self {
+            schema_version: LIFECYCLE_SCHEMA_VERSION,
+            hardware,
+            accepted,
+            transaction: None,
+        };
+        state.validate()?;
+        Ok(state)
+    }
+
+    pub fn migrate_task14(state: &TargetInstallState) -> Result<Self, LifecycleError> {
+        if state.schema_version != 1 || state.last_verified_phase != InstallPhase::Complete {
+            return Err(LifecycleError::InvalidState);
+        }
+        let application = state
+            .application
+            .clone()
+            .ok_or(LifecycleError::InvalidState)?;
+        let driver = state.driver.clone().ok_or(LifecycleError::InvalidState)?;
+        Self::installed(
+            state.hardware.clone(),
+            vec![AcceptedPair {
+                pair: ReleasePair {
+                    application,
+                    driver,
+                },
+                sequence: 1,
+                owned_files: state.owned_files.clone(),
+            }],
+        )
+    }
+
+    pub fn schema_version(&self) -> u32 {
+        self.schema_version
+    }
+
+    pub fn hardware(&self) -> &TargetHardwareIdentity {
+        &self.hardware
+    }
+
+    pub fn accepted(&self) -> &[AcceptedPair] {
+        &self.accepted
+    }
+
+    pub fn to_json(&self) -> Result<String, LifecycleError> {
+        self.validate()?;
+        serde_json::to_string(self).map_err(|_| LifecycleError::InvalidState)
+    }
+
+    pub fn from_json(contents: &[u8]) -> Result<Self, LifecycleError> {
+        if contents.len() > MAX_TARGET_STATE_BYTES {
+            return Err(LifecycleError::InvalidState);
+        }
+        let mut deserializer = serde_json::Deserializer::from_slice(contents);
+        let state =
+            Self::deserialize(&mut deserializer).map_err(|_| LifecycleError::InvalidState)?;
+        deserializer
+            .end()
+            .map_err(|_| LifecycleError::InvalidState)?;
+        state.validate()?;
+        Ok(state)
+    }
+
+    fn validate(&self) -> Result<(), LifecycleError> {
+        if self.schema_version != LIFECYCLE_SCHEMA_VERSION
+            || self.accepted.len() > MAX_ACCEPTED_PAIRS
+            || self
+                .accepted
+                .windows(2)
+                .any(|window| window[0].sequence <= window[1].sequence)
+            || self.accepted.iter().any(|accepted| {
+                accepted.sequence == 0
+                    || accepted.owned_files.is_empty()
+                    || !valid_release_pair(&accepted.pair)
+                    || accepted
+                        .owned_files
+                        .iter()
+                        .enumerate()
+                        .any(|(index, file)| {
+                            !valid_owned_file(file)
+                                || accepted.owned_files[..index]
+                                    .iter()
+                                    .any(|prior| prior.target_path == file.target_path)
+                        })
+            })
+            || self.accepted.iter().enumerate().any(|(index, accepted)| {
+                self.accepted[index + 1..]
+                    .iter()
+                    .any(|other| other.pair == accepted.pair)
+            })
+        {
+            return Err(LifecycleError::InvalidState);
+        }
+        if let Some(transaction) = &self.transaction
+            && (!valid_release_pair(&transaction.candidate)
+                || !self
+                    .accepted
+                    .first()
+                    .is_some_and(|current| current == &transaction.prior))
+        {
+            return Err(LifecycleError::InvalidState);
+        }
+        Ok(())
+    }
+
+    fn current(&self) -> Result<&AcceptedPair, LifecycleError> {
+        self.accepted.first().ok_or(LifecycleError::NoAcceptedPair)
+    }
+
+    fn begin(&mut self, candidate: ReleasePair) -> Result<(), LifecycleError> {
+        self.validate()?;
+        self.transaction = Some(LifecycleTransaction {
+            prior: self.current()?.clone(),
+            candidate,
+            phase: LifecyclePhase::Prepared,
+        });
+        Ok(())
+    }
+
+    fn set_phase(&mut self, phase: LifecyclePhase) -> Result<(), LifecycleError> {
+        self.transaction
+            .as_mut()
+            .ok_or(LifecycleError::InvalidState)?
+            .phase = phase;
+        Ok(())
+    }
+
+    fn accept(
+        &mut self,
+        pair: ReleasePair,
+        owned_files: Vec<OwnedFile>,
+    ) -> Result<(), LifecycleError> {
+        if owned_files.is_empty() || owned_files.iter().any(|file| !valid_owned_file(file)) {
+            return Err(LifecycleError::InvalidOwnership);
+        }
+        let next_sequence = self
+            .accepted
+            .iter()
+            .map(|accepted| accepted.sequence)
+            .max()
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or(LifecycleError::InvalidState)?;
+        self.accepted.retain(|accepted| accepted.pair != pair);
+        self.accepted.insert(
+            0,
+            AcceptedPair {
+                pair,
+                sequence: next_sequence,
+                owned_files,
+            },
+        );
+        self.accepted.truncate(MAX_ACCEPTED_PAIRS);
+        self.transaction = None;
+        self.validate()
+    }
+}
+
+fn valid_release_pair(pair: &ReleasePair) -> bool {
+    [&pair.application, &pair.driver]
+        .into_iter()
+        .all(|artifact| {
+            semver::Version::parse(&artifact.version)
+                .is_ok_and(|version| version.to_string() == artifact.version)
+                && is_lower_hex(&artifact.source_commit, 40)
+                && is_lower_hex(&artifact.sha256, 64)
+        })
+}
+
+fn valid_owned_file(file: &OwnedFile) -> bool {
+    file.target_path.starts_with('/')
+        && file.target_path != "/"
+        && !file.target_path.contains("//")
+        && !file
+            .target_path
+            .split('/')
+            .any(|component| component == "." || component == "..")
+        && !file.target_path.bytes().any(|byte| byte.is_ascii_control())
+        && is_lower_hex(&file.sha256, 64)
+}
+
+pub trait LifecycleBackend {
+    fn load_lifecycle_state(&self) -> Result<LifecycleState, LifecycleError>;
+    fn save_lifecycle_state(&self, state: &LifecycleState) -> Result<(), LifecycleError>;
+    fn resolve_release(
+        &self,
+        requested: Option<&semver::Version>,
+    ) -> Result<ReleasePair, LifecycleError>;
+    fn stage_application(&self, pair: &ReleasePair) -> Result<(), LifecycleError>;
+    fn stage_driver(&self, pair: &ReleasePair) -> Result<(), LifecycleError>;
+    fn tryboot_driver(&self, pair: &ReleasePair) -> Result<(), LifecycleError>;
+    fn verify_tryboot_driver(&self, pair: &ReleasePair) -> Result<(), LifecycleError>;
+    fn commit_driver(&self, pair: &ReleasePair) -> Result<(), LifecycleError>;
+    fn reboot_normal(&self, pair: &ReleasePair) -> Result<(), LifecycleError>;
+    fn activate_application(&self, pair: &ReleasePair) -> Result<Vec<OwnedFile>, LifecycleError>;
+    fn restart_application(&self) -> Result<(), LifecycleError>;
+    fn verify_pair(&self, pair: &ReleasePair) -> Result<(), LifecycleError>;
+    fn restore_application(&self, prior: &AcceptedPair) -> Result<(), LifecycleError>;
+    fn restore_driver(&self, prior: &AcceptedPair) -> Result<(), LifecycleError>;
+    fn uninstall_application(
+        &self,
+        owned_files: &[OwnedFile],
+        purge_settings: bool,
+    ) -> Result<(), LifecycleError>;
+    fn uninstall_driver(&self, driver: &ArtifactIdentity) -> Result<(), LifecycleError>;
+    fn finalize_uninstall(&self, state: &LifecycleState) -> Result<(), LifecycleError>;
+}
+
+pub struct LifecycleManager<'a, B> {
+    backend: &'a B,
+}
+
+impl<'a, B: LifecycleBackend> LifecycleManager<'a, B> {
+    pub fn new(backend: &'a B) -> Self {
+        Self { backend }
+    }
+
+    pub fn upgrade(
+        &self,
+        requested: Option<&semver::Version>,
+    ) -> Result<LifecycleOutcome, LifecycleError> {
+        let pair = self.backend.resolve_release(requested)?;
+        if !valid_release_pair(&pair) {
+            return Err(LifecycleError::ImmutableReleaseMismatch);
+        }
+        self.apply_pair(pair)
+    }
+
+    pub fn rollback(
+        &self,
+        requested: Option<&semver::Version>,
+    ) -> Result<LifecycleOutcome, LifecycleError> {
+        let state = self.load_recovered_state()?;
+        let current = state.current()?;
+        let candidate = match requested {
+            None => state
+                .accepted
+                .get(1)
+                .cloned()
+                .ok_or(LifecycleError::NoPriorAcceptedPair)?,
+            Some(version) => {
+                let matches = state
+                    .accepted
+                    .iter()
+                    .skip(1)
+                    .filter(|accepted| accepted.pair.application.version == version.to_string())
+                    .collect::<Vec<_>>();
+                match matches.as_slice() {
+                    [accepted] => (*accepted).clone(),
+                    [] => return Err(LifecycleError::RequestedVersionNotAccepted),
+                    _ => return Err(LifecycleError::AmbiguousAcceptedVersion),
+                }
+            }
+        };
+        if candidate.pair == current.pair {
+            return Err(LifecycleError::NoPriorAcceptedPair);
+        }
+        self.apply_pair(candidate.pair)
+    }
+
+    pub fn uninstall(&self, purge_settings: bool) -> Result<LifecycleOutcome, LifecycleError> {
+        let state = self.load_recovered_state()?;
+        let Some(current) = state.accepted.first().cloned() else {
+            return Ok(LifecycleOutcome::AlreadyUninstalled);
+        };
+        self.backend
+            .uninstall_application(&current.owned_files, purge_settings)?;
+        self.backend.uninstall_driver(&current.pair.driver)?;
+        self.backend.finalize_uninstall(&state)?;
+        Ok(LifecycleOutcome::Uninstalled)
+    }
+
+    fn apply_pair(&self, pair: ReleasePair) -> Result<LifecycleOutcome, LifecycleError> {
+        let mut state = self.load_recovered_state()?;
+        let prior = state.current()?.clone();
+        if pair == prior.pair {
+            return Ok(LifecycleOutcome::AlreadyAccepted {
+                version: semver::Version::parse(&pair.application.version)
+                    .map_err(|_| LifecycleError::InvalidState)?,
+            });
+        }
+        let driver_changed = pair.driver != prior.pair.driver;
+        state.begin(pair.clone())?;
+        self.backend.save_lifecycle_state(&state)?;
+
+        let result = self.apply_candidate(&mut state, &pair, driver_changed);
+        let owned_files = match result {
+            Ok(owned_files) => owned_files,
+            Err(error) => {
+                let recovered = self.recover(&prior, driver_changed);
+                state.transaction = None;
+                let persisted = self.backend.save_lifecycle_state(&state);
+                return if recovered.is_ok() && persisted.is_ok() {
+                    Err(error)
+                } else {
+                    Err(LifecycleError::RecoveryFailed)
+                };
+            }
+        };
+        state.accept(pair.clone(), owned_files)?;
+        self.backend.save_lifecycle_state(&state)?;
+        Ok(LifecycleOutcome::Accepted {
+            version: semver::Version::parse(&pair.application.version)
+                .map_err(|_| LifecycleError::InvalidState)?,
+            driver_changed,
+        })
+    }
+
+    fn apply_candidate(
+        &self,
+        state: &mut LifecycleState,
+        pair: &ReleasePair,
+        driver_changed: bool,
+    ) -> Result<Vec<OwnedFile>, LifecycleError> {
+        self.backend.stage_application(pair)?;
+        self.persist_phase(state, LifecyclePhase::ApplicationStaged)?;
+        if driver_changed {
+            self.backend.stage_driver(pair)?;
+            self.persist_phase(state, LifecyclePhase::DriverStaged)?;
+            self.backend.tryboot_driver(pair)?;
+            self.backend.verify_tryboot_driver(pair)?;
+            self.persist_phase(state, LifecyclePhase::TrybootVerified)?;
+            self.backend.commit_driver(pair)?;
+            self.persist_phase(state, LifecyclePhase::DriverCommitted)?;
+            self.backend.reboot_normal(pair)?;
+            self.persist_phase(state, LifecyclePhase::NormalBootVerified)?;
+        }
+        let owned_files = self.backend.activate_application(pair)?;
+        self.persist_phase(state, LifecyclePhase::ApplicationActivated)?;
+        self.backend.restart_application()?;
+        self.persist_phase(state, LifecyclePhase::ApplicationRestarted)?;
+        self.backend.verify_pair(pair)?;
+        Ok(owned_files)
+    }
+
+    fn persist_phase(
+        &self,
+        state: &mut LifecycleState,
+        phase: LifecyclePhase,
+    ) -> Result<(), LifecycleError> {
+        state.set_phase(phase)?;
+        self.backend.save_lifecycle_state(state)
+    }
+
+    fn load_recovered_state(&self) -> Result<LifecycleState, LifecycleError> {
+        let mut state = self.backend.load_lifecycle_state()?;
+        state.validate()?;
+        if let Some(transaction) = state.transaction.clone() {
+            let driver_changed = transaction.prior.pair.driver != transaction.candidate.driver;
+            self.recover(&transaction.prior, driver_changed)?;
+            state.transaction = None;
+            self.backend.save_lifecycle_state(&state)?;
+        }
+        Ok(state)
+    }
+
+    fn recover(&self, prior: &AcceptedPair, driver_changed: bool) -> Result<(), LifecycleError> {
+        let mut failed = false;
+        if driver_changed && self.backend.restore_driver(prior).is_err() {
+            failed = true;
+        }
+        if self.backend.restore_application(prior).is_err() {
+            failed = true;
+        }
+        if self.backend.restart_application().is_err() {
+            failed = true;
+        }
+        if self.backend.verify_pair(&prior.pair).is_err() {
+            failed = true;
+        }
+        if failed {
+            Err(LifecycleError::RecoveryFailed)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LifecycleOutcome {
+    Accepted {
+        version: semver::Version,
+        driver_changed: bool,
+    },
+    AlreadyAccepted {
+        version: semver::Version,
+    },
+    Uninstalled,
+    AlreadyUninstalled,
+}
+
+impl fmt::Display for LifecycleOutcome {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Accepted {
+                version,
+                driver_changed,
+            } => write!(
+                formatter,
+                "Plane Radar {version} accepted ({})",
+                if *driver_changed {
+                    "application and driver"
+                } else {
+                    "application only"
+                }
+            ),
+            Self::AlreadyAccepted { version } => {
+                write!(formatter, "Plane Radar {version} is already accepted")
+            }
+            Self::Uninstalled => formatter.write_str("Plane Radar uninstalled"),
+            Self::AlreadyUninstalled => formatter.write_str("Plane Radar is already uninstalled"),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+pub enum LifecycleError {
+    #[error("lifecycle state is invalid or inconsistent")]
+    InvalidState,
+    #[error("no accepted Plane Radar installation exists")]
+    NoAcceptedPair,
+    #[error("no prior accepted Plane Radar release exists")]
+    NoPriorAcceptedPair,
+    #[error("the requested rollback version was not accepted")]
+    RequestedVersionNotAccepted,
+    #[error("the requested rollback version is ambiguous")]
+    AmbiguousAcceptedVersion,
+    #[error("the resolved release identity is not immutable and valid")]
+    ImmutableReleaseMismatch,
+    #[error("the target returned an invalid ownership manifest")]
+    InvalidOwnership,
+    #[error("the lifecycle backend operation failed")]
+    Backend,
+    #[error("the prior accepted pair could not be restored and verified")]
+    RecoveryFailed,
 }
 
 #[derive(Clone, Debug, Error, Eq, PartialEq)]

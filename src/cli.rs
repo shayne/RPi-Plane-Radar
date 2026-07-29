@@ -73,6 +73,31 @@ pub enum Command {
         command: InstallerStateCommand,
     },
     #[command(hide = true)]
+    LifecycleState {
+        #[command(subcommand)]
+        command: InstallerStateCommand,
+    },
+    #[command(hide = true)]
+    LifecycleActivate {
+        #[arg(long)]
+        artifact: PathBuf,
+        #[arg(long)]
+        version: String,
+        #[arg(long)]
+        revision: String,
+        #[arg(long)]
+        sha256: String,
+        #[arg(long, value_name = "JSON")]
+        owned_json: String,
+    },
+    #[command(hide = true)]
+    LifecycleUninstall {
+        #[arg(long, value_name = "JSON")]
+        owned_json: String,
+        #[arg(long)]
+        purge_settings: bool,
+    },
+    #[command(hide = true)]
     InstallerOwnership,
     #[command(hide = true)]
     CaptureMetadata,
