@@ -1985,6 +1985,10 @@ original_pgid="$(/bin/ps -o pgid= -p "$$" | /usr/bin/tr -d '[:space:]')"
   planeradar-installer "$installer" "$@"
 installer_status=$?
 restored_tpgid="$(/bin/ps -o tpgid= -p "$$" | /usr/bin/tr -d '[:space:]')"
+if [[ "${PLANERADAR_DELAY_PTY_RESULT_WRITE:-0}" == "1" ]]; then
+  : >"$PLANERADAR_PTY_RESULT_RECORD"
+  /bin/sleep 0.1
+fi
 printf '%s %s %s\n' "$original_pgid" "$installer_status" "$restored_tpgid" \
   >"$PLANERADAR_PTY_RESULT_RECORD"
 "#,
@@ -2039,6 +2043,14 @@ printf '%s %s %s\n' "$original_pgid" "$installer_status" "$restored_tpgid" \
             if post_reap_signal.is_some() { "1" } else { "0" },
         )
         .env("PLANERADAR_PTY_RESULT_RECORD", &pty_result_record)
+        .env(
+            "PLANERADAR_DELAY_PTY_RESULT_WRITE",
+            if matches!(scenario, BootstrapScenario::PtyMalformedCompletion) {
+                "1"
+            } else {
+                "0"
+            },
+        )
         .env("PLANERADAR_ARGV_RECORD", &argv_record)
         .env("PLANERADAR_DOWNLOAD_RECORD", &download_record)
         .env("PLANERADAR_METADATA_PARSE_RECORD", &metadata_parse_record)
@@ -2363,18 +2375,24 @@ printf '%s %s %s\n' "$original_pgid" "$installer_status" "$restored_tpgid" \
         restored_terminal_pgid,
     ) = if pty_scenario {
         let deadline = Instant::now() + Duration::from_secs(60);
-        while !pty_result_record.exists() && Instant::now() < deadline {
+        let result = loop {
+            let result = fs::read_to_string(&pty_result_record).unwrap_or_default();
+            if result.ends_with('\n')
+                && result.lines().count() == 1
+                && result.split_whitespace().count() == 3
+            {
+                break result;
+            }
+            if Instant::now() >= deadline {
+                let output = read_release_pty(pty_master.as_mut().expect("PTY timeout output"));
+                stop_pty_wrapper(&mut process, &installer_pid_record, &control_pid_record);
+                panic!(
+                    "PTY bootstrap fixture published no complete result: {result:?}; output={}",
+                    String::from_utf8_lossy(&output)
+                );
+            }
             thread::sleep(Duration::from_millis(10));
-        }
-        if !pty_result_record.exists() {
-            let output = read_release_pty(pty_master.as_mut().expect("PTY timeout output"));
-            stop_pty_wrapper(&mut process, &installer_pid_record, &control_pid_record);
-            panic!(
-                "PTY bootstrap fixture hung: {}",
-                String::from_utf8_lossy(&output)
-            );
-        }
-        let result = fs::read_to_string(&pty_result_record).expect("PTY result");
+        };
         let fields = result.split_whitespace().collect::<Vec<_>>();
         assert_eq!(fields.len(), 3, "unexpected PTY result: {result:?}");
         let original = fields[0].parse::<u32>().expect("original PTY PGID");
