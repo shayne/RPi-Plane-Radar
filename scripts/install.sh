@@ -277,6 +277,7 @@ read_control_completion() {
 }
 await_control_completion() {
   local completion completion_status snapshot
+  local control_started=0 resume_attempt=0
   while :; do
     completion_status=""
     completion="$(read_control_completion)" || completion=""
@@ -290,6 +291,12 @@ await_control_completion() {
     [[ "$3" != Z* ]] || return 1
     if [[ "$3" == T* ]]; then
       if [[ -z "$completion_status" ]]; then
+        if [[ $control_started -eq 0 && -z "$completion" ]]; then
+          ((resume_attempt += 1))
+          [[ $resume_attempt -lt 600 ]] || return 1
+          /bin/sleep 0.05
+          continue
+        fi
         # The child can stop after the first record read but before the
         # process-table snapshot. Once stopped, its synced record is stable;
         # read it once more before deciding that completion is malformed.
@@ -302,6 +309,7 @@ await_control_completion() {
       control_status=$completion_status
       return 0
     fi
+    control_started=1
     /bin/sleep 0.05
   done
 }

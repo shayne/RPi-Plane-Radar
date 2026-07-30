@@ -972,6 +972,10 @@ struct BootstrapOutcome {
     post_reap_restore_marker_survived: bool,
     stale_control_action_recorded: bool,
     completion_group_was_stopped: bool,
+    initial_continue_was_intercepted: bool,
+    initial_stopped_state_was_observed: bool,
+    initial_continue_followed_observation: bool,
+    initial_continue_handshake_timed_out: bool,
 }
 
 fn open_release_pty() -> (File, File) {
@@ -1068,6 +1072,10 @@ fn bootstrap_fixture_outcome(scenario: BootstrapScenario) -> BootstrapOutcome {
     let post_reap_signal_record = temporary.path().join("post-reap-signal");
     let stale_control_action_record = temporary.path().join("stale-control-action");
     let completion_group_stopped_record = temporary.path().join("completion-group-stopped");
+    let initial_continue_intercept_record = temporary.path().join("initial-continue-intercept");
+    let initial_stopped_observation_record = temporary.path().join("initial-stopped-observation");
+    let initial_continue_ack_record = temporary.path().join("initial-continue-ack");
+    let initial_continue_timeout_record = temporary.path().join("initial-continue-timeout");
     let pty_scenario = matches!(
         scenario,
         BootstrapScenario::PtySuccess
@@ -1620,6 +1628,22 @@ case "$*" in
         exit 0
         ;;
     esac
+    output="$(/bin/ps "$@")"
+    status=$?
+    if test "$status" -eq 0 &&
+       test "${PLANERADAR_DELAY_INITIAL_CONTINUE:-0}" = 1 &&
+       test -f "$PLANERADAR_INITIAL_CONTINUE_INTERCEPT_RECORD" &&
+       test ! -f "$PLANERADAR_INITIAL_CONTINUE_ACK_RECORD" &&
+       test ! -f "$PLANERADAR_INITIAL_CONTINUE_TIMEOUT_RECORD"; then
+      set -- $output
+      if test "$#" -eq 3; then
+        case "$3" in
+          T*) printf 'stopped\n' >"$PLANERADAR_INITIAL_STOPPED_OBSERVATION_RECORD" ;;
+        esac
+      fi
+    fi
+    printf '%s\n' "$output"
+    exit "$status"
     ;;
 esac
 exec /bin/ps "$@"
@@ -1816,7 +1840,32 @@ trap '__planeradar_before_control_pid_publication' DEBUG
             &inner_bash_env,
             format!(
                 r#"__planeradar_retire_group_actions=0
+__planeradar_initial_continue_delayed=0
 kill() {{
+  if [[ "$*" == "-CONT -- -${{control_pid:-0}}" &&
+        "${{control_group_owned:-0}}" -eq 1 &&
+        "${{control_retire_pending:-0}}" -eq 0 &&
+        $__planeradar_initial_continue_delayed -eq 0 ]]; then
+    __planeradar_initial_continue_delayed=1
+    printf 'intercepted\n' >"$PLANERADAR_INITIAL_CONTINUE_INTERCEPT_RECORD"
+    (
+      __planeradar_resume_observed=0
+      for ((__planeradar_resume_wait=0; __planeradar_resume_wait<3000; __planeradar_resume_wait++)); do
+        if [[ -f "$PLANERADAR_INITIAL_STOPPED_OBSERVATION_RECORD" ]]; then
+          __planeradar_resume_observed=1
+          break
+        fi
+        /bin/sleep 0.01
+      done
+      if [[ $__planeradar_resume_observed -eq 1 ]]; then
+        printf 'continued\n' >"$PLANERADAR_INITIAL_CONTINUE_ACK_RECORD"
+        builtin kill "$@"
+      else
+        printf 'timeout\n' >"$PLANERADAR_INITIAL_CONTINUE_TIMEOUT_RECORD"
+      fi
+    ) &
+    return 0
+  fi
   case "$*" in
     *"-- -${{control_pid:-0}}"*)
       if [[ "${{control_retire_pending:-0}}" -eq 1 ]]; then
@@ -1950,6 +1999,26 @@ printf '%s %s %s\n' "$original_pgid" "$installer_status" "$restored_tpgid" \
         .env(
             "PLANERADAR_COMPLETION_GROUP_STOPPED_RECORD",
             &completion_group_stopped_record,
+        )
+        .env(
+            "PLANERADAR_INITIAL_CONTINUE_INTERCEPT_RECORD",
+            &initial_continue_intercept_record,
+        )
+        .env(
+            "PLANERADAR_INITIAL_STOPPED_OBSERVATION_RECORD",
+            &initial_stopped_observation_record,
+        )
+        .env(
+            "PLANERADAR_INITIAL_CONTINUE_ACK_RECORD",
+            &initial_continue_ack_record,
+        )
+        .env(
+            "PLANERADAR_INITIAL_CONTINUE_TIMEOUT_RECORD",
+            &initial_continue_timeout_record,
+        )
+        .env(
+            "PLANERADAR_DELAY_INITIAL_CONTINUE",
+            if post_reap_signal.is_some() { "1" } else { "0" },
         )
         .env("PLANERADAR_PTY_RESULT_RECORD", &pty_result_record)
         .env("PLANERADAR_ARGV_RECORD", &argv_record)
@@ -2409,6 +2478,10 @@ printf '%s %s %s\n' "$original_pgid" "$installer_status" "$restored_tpgid" \
         post_reap_restore_marker_survived: post_reap_signal_record.exists(),
         stale_control_action_recorded: stale_control_action_record.exists(),
         completion_group_was_stopped: completion_group_stopped_record.exists(),
+        initial_continue_was_intercepted: initial_continue_intercept_record.exists(),
+        initial_stopped_state_was_observed: initial_stopped_observation_record.exists(),
+        initial_continue_followed_observation: initial_continue_ack_record.exists(),
+        initial_continue_handshake_timed_out: initial_continue_timeout_record.exists(),
     }
 }
 
@@ -3083,6 +3156,22 @@ fn bootstrap_real_pty_post_reap_signals_restore_foreground_before_conventional_e
         assert!(
             outcome.post_reap_restore_marker_survived,
             "signal did not land after authenticated completion became observable"
+        );
+        assert!(
+            outcome.initial_continue_was_intercepted,
+            "fixture did not intercept the initial control-group continuation"
+        );
+        assert!(
+            outcome.initial_stopped_state_was_observed,
+            "installer did not observe the supervisor stopped before continuation"
+        );
+        assert!(
+            outcome.initial_continue_followed_observation,
+            "fixture did not continue the supervisor after observing it stopped"
+        );
+        assert!(
+            !outcome.initial_continue_handshake_timed_out,
+            "fixture timed out before observing the stopped supervisor"
         );
         assert_eq!(outcome.unrelated_process_survived, Some(true));
         assert!(
