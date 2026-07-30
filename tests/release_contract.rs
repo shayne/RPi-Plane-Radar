@@ -356,6 +356,20 @@ fn installer_is_a_verified_mac_bootstrap_with_typed_forwarding() {
             "bootstrap is missing {required:?}"
         );
     }
+    let retirement_window_start = installer
+        .find("{\n  retire_completed_control_group || retire_status=$?")
+        .expect("control retirement must begin inside a stderr-suppressed compound command");
+    let retirement_window_end = installer[retirement_window_start..]
+        .find("} 2>/dev/null")
+        .map(|offset| retirement_window_start + offset)
+        .expect("control retirement suppression must have a bounded end");
+    let retirement_window = &installer[retirement_window_start..retirement_window_end];
+    assert!(
+        retirement_window.contains(
+            "control_reap_pid=$control_pid control_reap_pending=1 control_retire_pending=0 control_group_owned=0 control_pid=\"\""
+        ) && retirement_window.contains("wait_retired_control || reap_status=$?"),
+        "the suppressed retirement window must span group termination, authority transfer, and reap"
+    );
     assert!(
         !installer.contains("ssh "),
         "bootstrap must delegate Pi mutation to planeradarctl"

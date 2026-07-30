@@ -591,9 +591,24 @@ fi
 # are sent, so no descendant can survive past the authority transition.
 control_retire_pending=1
 # Bash can report deliberate background-job SIGKILL asynchronously while the
-# retirement function returns. Suppress only that scoped shell notification;
-# the worker's inherited stderr has already been delivered unchanged.
-if ! retire_completed_control_group 2>/dev/null; then
+# retirement function returns. Keep termination, authority transfer, and reap
+# in one redirected compound command so that delayed shell notification cannot
+# escape between commands. The worker's stderr has already been delivered.
+retire_status=0
+restore_status=0
+reap_status=0
+{
+  retire_completed_control_group || retire_status=$?
+  if [[ $retire_status -eq 0 ]]; then
+    # One assignment-only command moves the killed retained root into the reap
+    # phase, leaves retirement mode, and removes every authority to signal its
+    # process group. DEBUG traps can run before or after, never between.
+    control_reap_pid=$control_pid control_reap_pending=1 control_retire_pending=0 control_group_owned=0 control_pid=""
+    restore_control_terminal || restore_status=$?
+    wait_retired_control || reap_status=$?
+  fi
+} 2>/dev/null
+if [[ $retire_status -ne 0 ]]; then
   abort_status=0
   abort_uncommitted_control || abort_status=$?
   [[ $control_cancel_status -eq 0 ]] ||
@@ -602,16 +617,6 @@ if ! retire_completed_control_group 2>/dev/null; then
     die "verified control terminal foreground could not be restored"
   die "verified control process group could not be retired"
 fi
-# One assignment-only command moves the killed retained root into the reap
-# phase, leaves retirement mode, and removes every authority to signal its
-# process group. DEBUG traps can run before or after, never between.
-restore_status=0
-reap_status=0
-{
-  control_reap_pid=$control_pid control_reap_pending=1 control_retire_pending=0 control_group_owned=0 control_pid=""
-  restore_control_terminal || restore_status=$?
-  wait_retired_control || reap_status=$?
-} 2>/dev/null
 [[ $control_cancel_status -eq 0 ]] ||
   terminate_with_status "$control_cancel_status"
 [[ $restore_status -eq 0 ]] ||
