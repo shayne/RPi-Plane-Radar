@@ -157,7 +157,7 @@ jobs:
           mise run package-release -- "${VERSION#v}"
           diff -r "$RUNNER_TEMP/release-one" dist/release
           (cd dist/release && shasum -a 256 -c SHA256SUMS)
-          PLANERADAR_RELEASE_FIXTURE_DIR="$PWD/dist/release" mise exec -- cargo test --test release_contract
+          PLANERADAR_RELEASE_FIXTURE_DIR="$PWD/dist/release" mise exec -- cargo test --test release_contract -- --test-threads=1
 
       - name: Upload verified exact release
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

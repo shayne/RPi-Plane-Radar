@@ -31,7 +31,7 @@ jobs:
       - name: Verify source, release schema, driver lock, installer fixtures, and README commands
         run: |
           mise run verify
-          mise exec -- cargo test --test release_contract
+          mise exec -- cargo test --test release_contract -- --test-threads=1
           mise exec -- cargo test -p planeradarctl --test release
           mise exec -- cargo test -p planeradarctl --test install
           mise run readme-commands

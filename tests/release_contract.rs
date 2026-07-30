@@ -100,8 +100,9 @@ fn authoritative_verification_covers_every_workspace_package_and_target() {
             && nextest.contains(
                 "binary(=release_contract) | binary(=bootstrap) | binary(=bootstrap_pty)",
             )
-            && nextest.contains(r#"test-group = "bootstrap-processes""#),
-        "the process and PTY release binaries must share a serialized nextest group"
+            && nextest.contains(r#"test-group = "bootstrap-processes""#)
+            && nextest.contains(r#"threads-required = "num-test-threads""#),
+        "the process and PTY release binaries must run serially with the global nextest pool reserved"
     );
 }
 
@@ -436,7 +437,10 @@ fn ordinary_ci_is_read_only_and_covers_the_supported_build_matrix() {
     assert!(ci.contains("macos-15\n"));
     assert!(ci.contains("macos-15-intel"));
     assert!(ci.contains("mise run verify"));
-    assert!(ci.contains("cargo test --test release_contract"));
+    assert!(
+        ci.contains("mise exec -- cargo test --test release_contract -- --test-threads=1"),
+        "ordinary CI must serialize the explicit release-contract rerun"
+    );
     assert!(ci.contains("README"));
 }
 
@@ -452,9 +456,9 @@ fn release_workflow_pins_actions_and_defers_all_write_authority_to_release_job()
     assert!(workflow.contains("prerelease: true"));
     assert!(
         workflow.contains(
-            "PLANERADAR_RELEASE_FIXTURE_DIR=\"$PWD/dist/release\" mise exec -- cargo test --test release_contract"
+            "PLANERADAR_RELEASE_FIXTURE_DIR=\"$PWD/dist/release\" mise exec -- cargo test --test release_contract -- --test-threads=1"
         ),
-        "release verification must execute the real assembled-archive inspector"
+        "release verification must serialize the real assembled-archive inspector"
     );
 
     let verify = workflow

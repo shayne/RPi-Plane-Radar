@@ -6,3 +6,4 @@ bootstrap-processes = { max-threads = 1 }
 [[profile.default.overrides]]
 filter = 'binary(=release_contract) | binary(=bootstrap) | binary(=bootstrap_pty)'
 test-group = "bootstrap-processes"
+threads-required = "num-test-threads"
