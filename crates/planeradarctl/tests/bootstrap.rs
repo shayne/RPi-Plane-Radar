@@ -34,13 +34,18 @@ impl Drop for ChildGuard {
         let Some(child) = self.0.as_mut() else {
             return;
         };
-        let pid = child.id().to_string();
-        let _ = Command::new("/bin/kill")
-            .args(["-KILL", &format!("-{pid}")])
-            .status();
+        let _ = signal_process_group(child.id(), libc::SIGKILL);
         let _ = child.kill();
         let _ = child.wait();
     }
+}
+
+fn signal_process_group(pgid: u32, signal: i32) -> bool {
+    let Ok(pgid) = i32::try_from(pgid) else {
+        return false;
+    };
+    // SAFETY: a negative, nonzero PID targets the process group with this ID.
+    unsafe { libc::kill(-pgid, signal) == 0 }
 }
 
 struct PrivateControl {
@@ -236,33 +241,15 @@ fn native_bootstrap_stops_before_cli_parsing_in_its_owned_process_group() {
     assert_eq!(pgid, pid);
     assert!(state.starts_with('T'), "bootstrap state was {state}");
 
-    assert!(
-        Command::new("/bin/kill")
-            .args(["-CONT", &format!("-{pid}")])
-            .status()
-            .expect("continue owned bootstrap group")
-            .success()
-    );
+    assert!(signal_process_group(pid, libc::SIGCONT));
     fs::write(&fixture.continue_marker, b"continue\n").expect("acknowledge bootstrap continue");
     wait_for_completion(&fixture.marker, child.child_mut(), 0);
     let (completion_ppid, completion_pgid, completion_state) = process_snapshot(pid);
     assert_eq!(completion_ppid, std::process::id());
     assert_eq!(completion_pgid, pid);
     assert!(completion_state.starts_with('T'));
-    assert!(
-        Command::new("/bin/kill")
-            .args(["-STOP", &format!("-{pid}")])
-            .status()
-            .expect("stop retained completion group")
-            .success()
-    );
-    assert!(
-        Command::new("/bin/kill")
-            .args(["-KILL", &format!("-{pid}")])
-            .status()
-            .expect("kill retained completion group")
-            .success()
-    );
+    assert!(signal_process_group(pid, libc::SIGSTOP));
+    assert!(signal_process_group(pid, libc::SIGKILL));
     assert_eq!(
         child.wait().signal(),
         Some(libc::SIGKILL),
@@ -284,13 +271,7 @@ fn native_bootstrap_owned_group_can_be_killed_while_still_stopped() {
     assert_eq!(pgid, pid);
     assert!(state.starts_with('T'));
 
-    assert!(
-        Command::new("/bin/kill")
-            .args(["-KILL", &format!("-{pid}")])
-            .status()
-            .expect("kill owned bootstrap group")
-            .success()
-    );
+    assert!(signal_process_group(pid, libc::SIGKILL));
     assert!(!child.wait().success(), "killed bootstrap child succeeded");
 }
 
