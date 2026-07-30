@@ -329,7 +329,7 @@ background_job=$!
 wait "$background_job"
 control_status=$?
 restored_tpgid="$(/bin/ps -o tpgid= -p "$$" | /usr/bin/tr -d '[:space:]')"
-marker_size="$(/usr/bin/stat -f '%z' "$PLANERADAR_MARKER")"
+marker_size="$(/usr/bin/wc -c <"$PLANERADAR_MARKER" | /usr/bin/tr -d '[:space:]')"
 printf '%s %s %s %s\n' \
   "$original_pgid" "$control_status" "$restored_tpgid" "$marker_size" \
   >"$PLANERADAR_RESULT_RECORD"
