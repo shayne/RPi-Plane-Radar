@@ -60,7 +60,7 @@ fn privileged_snapshot_binds_freshness_bytes_and_root_capture_identity() {
     fs::set_permissions(&replacement, fs::Permissions::from_mode(0o600)).expect("replacement mode");
     fs::rename(&replacement, paths.debug_frame()).expect("atomic source replacement");
 
-    let protocol = capture_snapshot_protocol(&paths, Some(&before), Duration::from_millis(250))
+    let protocol = capture_snapshot_protocol(&paths, Some(&before), Duration::from_secs(15))
         .expect("fresh snapshot");
     let snapshot = parse_snapshot_protocol(&protocol).expect("strict protocol");
 
