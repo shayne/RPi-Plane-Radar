@@ -8,6 +8,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const INTERNAL_BOOTSTRAP_ARG: &str = "--__planeradar-bootstrap-v1";
+const INTERNAL_FOREGROUND_ARG: &str = "--__planeradar-foreground-tty-v1";
 const INTERNAL_RESTORE_ARG: &str = "--__planeradar-restore-tty-v1";
 const MARKER_NAME: &str = "control-bootstrap.ready";
 
@@ -46,6 +47,7 @@ struct PrivateControl {
     _temporary: tempfile::TempDir,
     executable: PathBuf,
     marker: PathBuf,
+    continue_marker: PathBuf,
 }
 
 fn private_control() -> PrivateControl {
@@ -73,18 +75,28 @@ fn private_control() -> PrivateControl {
         .open(&marker)
         .expect("precreate bootstrap marker");
     drop(marker_file);
+    let continue_marker = directory.join("control-bootstrap.continue");
+    let continue_file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&continue_marker)
+        .expect("precreate continue marker");
+    drop(continue_file);
     PrivateControl {
         _temporary: temporary,
         executable: directory.join("planeradarctl"),
         marker,
+        continue_marker,
     }
 }
 
-fn spawn_control(executable: &Path, marker: &Path) -> ChildGuard {
+fn spawn_control(executable: &Path, marker: &Path, continue_marker: &Path) -> ChildGuard {
     ChildGuard::new(
         Command::new(executable)
             .arg(INTERNAL_BOOTSTRAP_ARG)
             .arg(marker)
+            .arg(continue_marker)
             .arg("--help")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -211,7 +223,11 @@ fn wait_promptly(mut child: ChildGuard) -> std::process::ExitStatus {
 #[test]
 fn native_bootstrap_stops_before_cli_parsing_in_its_owned_process_group() {
     let fixture = private_control();
-    let mut child = spawn_control(&fixture.executable, &fixture.marker);
+    let mut child = spawn_control(
+        &fixture.executable,
+        &fixture.marker,
+        &fixture.continue_marker,
+    );
     let pid = child.child_mut().id();
     wait_for_marker(&fixture.marker, child.child_mut());
 
@@ -227,6 +243,7 @@ fn native_bootstrap_stops_before_cli_parsing_in_its_owned_process_group() {
             .expect("continue owned bootstrap group")
             .success()
     );
+    fs::write(&fixture.continue_marker, b"continue\n").expect("acknowledge bootstrap continue");
     wait_for_completion(&fixture.marker, child.child_mut(), 0);
     let (completion_ppid, completion_pgid, completion_state) = process_snapshot(pid);
     assert_eq!(completion_ppid, std::process::id());
@@ -256,7 +273,11 @@ fn native_bootstrap_stops_before_cli_parsing_in_its_owned_process_group() {
 #[test]
 fn native_bootstrap_owned_group_can_be_killed_while_still_stopped() {
     let fixture = private_control();
-    let mut child = spawn_control(&fixture.executable, &fixture.marker);
+    let mut child = spawn_control(
+        &fixture.executable,
+        &fixture.marker,
+        &fixture.continue_marker,
+    );
     let pid = child.child_mut().id();
     wait_for_marker(&fixture.marker, child.child_mut());
     let (_, pgid, state) = wait_for_stopped_snapshot(pid);
@@ -279,7 +300,14 @@ fn native_bootstrap_rejects_marker_paths_outside_its_private_executable_director
     let outside = fixture._temporary.path().join("outside");
     fs::write(&outside, b"").expect("outside marker");
     fs::set_permissions(&outside, fs::Permissions::from_mode(0o600)).expect("outside marker mode");
-    assert!(!wait_promptly(spawn_control(&fixture.executable, &outside)).success());
+    assert!(
+        !wait_promptly(spawn_control(
+            &fixture.executable,
+            &outside,
+            &fixture.continue_marker
+        ))
+        .success()
+    );
 }
 
 #[test]
@@ -290,7 +318,14 @@ fn native_bootstrap_rejects_symlink_marker_without_touching_its_target() {
     fs::write(&target, b"untouched").expect("symlink target");
     symlink(&target, &fixture.marker).expect("bootstrap marker symlink");
 
-    assert!(!wait_promptly(spawn_control(&fixture.executable, &fixture.marker)).success());
+    assert!(
+        !wait_promptly(spawn_control(
+            &fixture.executable,
+            &fixture.marker,
+            &fixture.continue_marker
+        ))
+        .success()
+    );
     assert_eq!(
         fs::read(&target).expect("read symlink target"),
         b"untouched"
@@ -306,7 +341,14 @@ fn native_bootstrap_rejects_hardlinked_marker_without_touching_its_peer() {
     fs::set_permissions(&peer, fs::Permissions::from_mode(0o600)).expect("hardlink peer mode");
     fs::hard_link(&peer, &fixture.marker).expect("hardlinked bootstrap marker");
 
-    assert!(!wait_promptly(spawn_control(&fixture.executable, &fixture.marker)).success());
+    assert!(
+        !wait_promptly(spawn_control(
+            &fixture.executable,
+            &fixture.marker,
+            &fixture.continue_marker
+        ))
+        .success()
+    );
     assert_eq!(fs::read(&peer).expect("read hardlink peer"), b"");
 }
 
@@ -324,7 +366,14 @@ fn native_bootstrap_rejects_non_private_marker_and_directory_modes() {
             fs::set_permissions(&fixture.marker, fs::Permissions::from_mode(0o644))
                 .expect("weaken marker mode");
         }
-        assert!(!wait_promptly(spawn_control(&fixture.executable, &fixture.marker)).success());
+        assert!(
+            !wait_promptly(spawn_control(
+                &fixture.executable,
+                &fixture.marker,
+                &fixture.continue_marker
+            ))
+            .success()
+        );
     }
 }
 
@@ -346,26 +395,35 @@ fn native_bootstrap_rejects_nonempty_or_wrongly_named_markers() {
             fs::write(&fixture.marker, b"occupied").expect("nonempty marker");
             fixture.marker.clone()
         };
-        assert!(!wait_promptly(spawn_control(&fixture.executable, &marker)).success());
+        assert!(
+            !wait_promptly(spawn_control(
+                &fixture.executable,
+                &marker,
+                &fixture.continue_marker
+            ))
+            .success()
+        );
     }
 }
 
 #[test]
-fn native_terminal_restore_rejects_untrusted_saved_process_groups() {
-    let fixture = private_control();
-    fs::write(&fixture.marker, b"ready tty 1 2\n").expect("hostile saved process groups");
-    let output = Command::new(&fixture.executable)
-        .arg(INTERNAL_RESTORE_ARG)
-        .arg(&fixture.marker)
-        .stdin(Stdio::null())
-        .output()
-        .expect("run native terminal restore");
-    assert!(
-        !output.status.success(),
-        "hostile terminal restore succeeded"
-    );
-    assert_eq!(
-        fs::read(&fixture.marker).expect("read hostile marker"),
-        b"ready tty 1 2\n"
-    );
+fn native_terminal_helpers_reject_untrusted_saved_process_groups() {
+    for action in [INTERNAL_FOREGROUND_ARG, INTERNAL_RESTORE_ARG] {
+        let fixture = private_control();
+        fs::write(&fixture.marker, b"ready tty 1 2\n").expect("hostile saved process groups");
+        let output = Command::new(&fixture.executable)
+            .arg(action)
+            .arg(&fixture.marker)
+            .stdin(Stdio::null())
+            .output()
+            .expect("run native terminal helper");
+        assert!(
+            !output.status.success(),
+            "hostile terminal helper {action} succeeded"
+        );
+        assert_eq!(
+            fs::read(&fixture.marker).expect("read hostile marker"),
+            b"ready tty 1 2\n"
+        );
+    }
 }

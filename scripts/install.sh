@@ -4,8 +4,10 @@ set -euo pipefail
 readonly REPOSITORY="shayne/RPi-Plane-Radar"
 readonly SIGNER_WORKFLOW="shayne/RPi-Plane-Radar/.github/workflows/release.yml"
 readonly CONTROL_BOOTSTRAP_ARG="--__planeradar-bootstrap-v1"
+readonly CONTROL_FOREGROUND_TTY_ARG="--__planeradar-foreground-tty-v1"
 readonly CONTROL_RESTORE_TTY_ARG="--__planeradar-restore-tty-v1"
 readonly CONTROL_BOOTSTRAP_MARKER="control-bootstrap.ready"
+readonly CONTROL_CONTINUE_MARKER="control-bootstrap.continue"
 readonly MAX_INSTALLER_METADATA_BYTES=$((64 * 1024))
 readonly MAX_MANIFEST_METADATA_BYTES=$((64 * 1024))
 readonly MAX_CHECKSUMS_METADATA_BYTES=$((16 * 1024))
@@ -167,6 +169,7 @@ control_retire_pending=0
 control_cancel_status=0
 control_launch_pending=0
 control_barrier="$private/$CONTROL_BOOTSTRAP_MARKER"
+control_continue_barrier="$private/$CONTROL_CONTINUE_MARKER"
 control_barrier_claimed=0
 control_group_owned=0
 control_terminal_restored=0
@@ -210,6 +213,12 @@ restore_control_terminal() {
     restore_status=$?
   [[ $restore_status -eq 0 ]] || return "$restore_status"
   control_terminal_restored=1
+}
+foreground_control_terminal() {
+  [[ $control_barrier_claimed -eq 1 && $control_group_owned -eq 1 ]] ||
+    return 1
+  [[ -n "$control" && -x "$control" ]] || return 1
+  "$control" "$CONTROL_FOREGROUND_TTY_ARG" "$control_barrier" <&0 >&1 2>&2
 }
 abort_uncommitted_control() {
   local restore_status=0
@@ -550,13 +559,17 @@ chmod 0700 "$control"
 argv=(install "$target" --version "$manifest_version")
 [[ -z "$hostname" ]] || argv+=(--hostname "$hostname")
 [[ $non_interactive -eq 0 ]] || argv+=(--non-interactive)
-(umask 077 && set -o noclobber && : >"$control_barrier") ||
-  die "could not create the private control bootstrap marker"
-[[ -f "$control_barrier" && ! -L "$control_barrier" ]] ||
-  die "control bootstrap marker is not a private regular file"
+(umask 077 && set -o noclobber &&
+  : >"$control_barrier" &&
+  : >"$control_continue_barrier") ||
+  die "could not create the private control bootstrap markers"
+[[ -f "$control_barrier" && ! -L "$control_barrier" &&
+   -f "$control_continue_barrier" && ! -L "$control_continue_barrier" ]] ||
+  die "control bootstrap markers are not private regular files"
 control_status=0
 control_launch_pending=1
-"$control" "$CONTROL_BOOTSTRAP_ARG" "$control_barrier" "${argv[@]}" <&0 >&1 2>&2 &
+"$control" "$CONTROL_BOOTSTRAP_ARG" "$control_barrier" \
+  "$control_continue_barrier" "${argv[@]}" <&0 >&1 2>&2 &
 control_pid=$!
 control_launch_pending=0
 if ! await_control_barrier; then
@@ -573,9 +586,34 @@ if [[ $control_cancel_status -ne 0 ]]; then
 elif ! kill -CONT -- "-$control_pid" 2>/dev/null; then
   abort_status=0
   abort_uncommitted_control || abort_status=$?
+  [[ $control_cancel_status -eq 0 ]] ||
+    terminate_with_status "$control_cancel_status"
   [[ $abort_status -eq 0 ]] ||
     die "verified control terminal foreground could not be restored"
   die "verified control bootstrap could not start"
+fi
+# The resumed child waits on a separate private marker and cannot expose
+# inherited stdin yet. Complete the launcher-side handoff, return to Bash,
+# then acknowledge it so the child performs the final verified handoff.
+if [[ $control_cancel_status -eq 0 ]] &&
+  ! foreground_control_terminal; then
+  abort_status=0
+  abort_uncommitted_control || abort_status=$?
+  [[ $control_cancel_status -eq 0 ]] ||
+    terminate_with_status "$control_cancel_status"
+  [[ $abort_status -eq 0 ]] ||
+    die "verified control terminal foreground could not be restored"
+  die "verified control terminal foreground handoff failed"
+fi
+if [[ $control_cancel_status -eq 0 ]] &&
+  ! printf 'continue\n' >"$control_continue_barrier"; then
+  abort_status=0
+  abort_uncommitted_control || abort_status=$?
+  [[ $control_cancel_status -eq 0 ]] ||
+    terminate_with_status "$control_cancel_status"
+  [[ $abort_status -eq 0 ]] ||
+    die "verified control terminal foreground could not be restored"
+  die "verified control continue acknowledgement failed"
 fi
 if ! await_control_completion 2>/dev/null; then
   abort_status=0

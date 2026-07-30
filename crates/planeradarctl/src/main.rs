@@ -2,7 +2,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::io;
-use std::io::{IsTerminal, Read, Write};
+use std::io::{IsTerminal, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
@@ -60,9 +60,13 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 const INTERNAL_BOOTSTRAP_ARG: &str = "--__planeradar-bootstrap-v1";
+const INTERNAL_FOREGROUND_TTY_ARG: &str = "--__planeradar-foreground-tty-v1";
 const INTERNAL_RESTORE_TTY_ARG: &str = "--__planeradar-restore-tty-v1";
 const INTERNAL_BOOTSTRAP_MARKER: &str = "control-bootstrap.ready";
+const INTERNAL_CONTINUE_MARKER: &str = "control-bootstrap.continue";
 const INTERNAL_MARKER_MAX_BYTES: u64 = 96;
+const INTERNAL_CONTINUE_TIMEOUT: Duration = Duration::from_secs(3);
+const INTERNAL_CONTINUE_POLL_INTERVAL: Duration = Duration::from_millis(5);
 static TERMINAL_SIGNAL_PARENT: AtomicI32 = AtomicI32::new(0);
 
 extern "C" fn relay_terminal_signal(signal: libc::c_int) {
@@ -97,7 +101,7 @@ fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
                 arguments, bootstrap,
             )?));
         }
-        BootstrapAction::Restored => return Ok(ExitCode::SUCCESS),
+        BootstrapAction::TerminalAdjusted => return Ok(ExitCode::SUCCESS),
     };
     let cli = Cli::parse_from(arguments);
     if let Command::Driver { command } = cli.command.clone() {
@@ -174,7 +178,7 @@ enum BootstrapAction {
         arguments: Vec<OsString>,
         bootstrap: InternalBootstrap,
     },
-    Restored,
+    TerminalAdjusted,
 }
 
 struct ForegroundTerminalGuard {
@@ -225,6 +229,18 @@ enum SavedTerminal {
 fn bootstrap_action() -> Result<BootstrapAction, Box<dyn std::error::Error>> {
     let mut arguments = env::args_os().collect::<Vec<_>>();
     match arguments.get(1).and_then(|value| value.to_str()) {
+        Some(INTERNAL_FOREGROUND_TTY_ARG) => {
+            block_sigttou_permanently()?;
+            if arguments.len() != 3 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "internal terminal foreground marker is required",
+                )
+                .into());
+            }
+            foreground_internal_terminal(Path::new(&arguments[2]))?;
+            Ok(BootstrapAction::TerminalAdjusted)
+        }
         Some(INTERNAL_RESTORE_TTY_ARG) => {
             block_sigttou_permanently()?;
             if arguments.len() != 3 {
@@ -235,19 +251,20 @@ fn bootstrap_action() -> Result<BootstrapAction, Box<dyn std::error::Error>> {
                 .into());
             }
             restore_internal_terminal(Path::new(&arguments[2]))?;
-            Ok(BootstrapAction::Restored)
+            Ok(BootstrapAction::TerminalAdjusted)
         }
         Some(INTERNAL_BOOTSTRAP_ARG) => {
-            if arguments.len() < 3 {
+            if arguments.len() < 4 {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    "internal bootstrap marker is required",
+                    "internal bootstrap markers are required",
                 )
                 .into());
             }
             let marker = PathBuf::from(arguments.remove(2));
+            let continue_marker = PathBuf::from(arguments.remove(2));
             arguments.remove(1);
-            let bootstrap = enter_internal_bootstrap(&marker)?;
+            let bootstrap = enter_internal_bootstrap(&marker, &continue_marker)?;
             Ok(BootstrapAction::Supervise {
                 arguments,
                 bootstrap,
@@ -298,9 +315,13 @@ fn worker_exit_code(status: std::process::ExitStatus) -> u8 {
     }
 }
 
-fn validate_internal_marker(marker: &Path, require_empty: bool) -> io::Result<fs::File> {
+fn validate_internal_private_file(
+    marker: &Path,
+    expected_name: &str,
+    require_empty: bool,
+) -> io::Result<fs::File> {
     if !marker.is_absolute()
-        || marker.file_name().and_then(|name| name.to_str()) != Some(INTERNAL_BOOTSTRAP_MARKER)
+        || marker.file_name().and_then(|name| name.to_str()) != Some(expected_name)
     {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -375,6 +396,10 @@ fn validate_internal_marker(marker: &Path, require_empty: bool) -> io::Result<fs
     }
 
     Ok(marker_file)
+}
+
+fn validate_internal_marker(marker: &Path, require_empty: bool) -> io::Result<fs::File> {
+    validate_internal_private_file(marker, INTERNAL_BOOTSTRAP_MARKER, require_empty)
 }
 
 fn inherited_foreground_terminal() -> io::Result<Option<Pid>> {
@@ -453,16 +478,18 @@ fn hand_off_terminal_foreground(
                 "internal bootstrap terminal handoff inspection failed: {error}"
             ))
         })?;
-        if foreground != original_pgid {
-            return Err(io::Error::other(
-                "internal bootstrap terminal foreground changed before handoff",
-            ));
+        if foreground != control_pgid {
+            if foreground != original_pgid {
+                return Err(io::Error::other(
+                    "internal bootstrap terminal foreground changed before handoff",
+                ));
+            }
+            tcsetpgrp(io::stdin(), control_pgid).map_err(|error| {
+                io::Error::other(format!(
+                    "internal bootstrap terminal foreground handoff failed: {error}"
+                ))
+            })?;
         }
-        tcsetpgrp(io::stdin(), control_pgid).map_err(|error| {
-            io::Error::other(format!(
-                "internal bootstrap terminal foreground handoff failed: {error}"
-            ))
-        })?;
         if tcgetpgrp(io::stdin()).map_err(|error| {
             io::Error::other(format!(
                 "internal bootstrap terminal handoff verification failed: {error}"
@@ -611,8 +638,105 @@ fn restore_internal_terminal(marker: &Path) -> io::Result<()> {
     }
 }
 
-fn enter_internal_bootstrap(marker: &Path) -> io::Result<InternalBootstrap> {
+fn foreground_internal_terminal(marker: &Path) -> io::Result<()> {
+    let mut marker_file = validate_internal_marker(marker, false)?;
+    let mut contents = String::new();
+    Read::by_ref(&mut marker_file)
+        .take(INTERNAL_MARKER_MAX_BYTES + 1)
+        .read_to_string(&mut contents)?;
+    if contents.len() as u64 != marker_file.metadata()?.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "internal terminal marker length changed",
+        ));
+    }
+    match parse_saved_terminal(&contents)? {
+        SavedTerminal::None => Ok(()),
+        SavedTerminal::Foreground {
+            original_pgid,
+            control_pgid,
+        } => {
+            let parent_pgid = getpgid(Some(getppid())).map_err(|error| {
+                io::Error::other(format!(
+                    "internal terminal foreground parent inspection failed: {error}"
+                ))
+            })?;
+            if parent_pgid != original_pgid || getpgrp() != original_pgid {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "internal terminal foreground parent process group is invalid",
+                ));
+            }
+            with_sigttou_blocked(|| {
+                let foreground = tcgetpgrp(io::stdin()).map_err(|error| {
+                    io::Error::other(format!(
+                        "internal terminal foreground inspection failed: {error}"
+                    ))
+                })?;
+                if foreground == control_pgid {
+                    return Ok(());
+                }
+                if foreground != original_pgid {
+                    return Err(io::Error::other(
+                        "internal terminal foreground refused an unrelated process group",
+                    ));
+                }
+                tcsetpgrp(io::stdin(), control_pgid).map_err(|error| {
+                    io::Error::other(format!(
+                        "internal terminal foreground handoff failed: {error}"
+                    ))
+                })?;
+                if tcgetpgrp(io::stdin()).map_err(|error| {
+                    io::Error::other(format!(
+                        "internal terminal foreground verification failed: {error}"
+                    ))
+                })? != control_pgid
+                {
+                    return Err(io::Error::other(
+                        "internal terminal foreground handoff was not retained",
+                    ));
+                }
+                Ok(())
+            })
+        }
+    }
+}
+
+fn await_internal_continue(continue_file: &mut fs::File) -> io::Result<()> {
+    const EXPECTED: &[u8] = b"continue\n";
+    let deadline = std::time::Instant::now() + INTERNAL_CONTINUE_TIMEOUT;
+    loop {
+        continue_file.seek(SeekFrom::Start(0))?;
+        let mut contents = Vec::new();
+        Read::by_ref(continue_file)
+            .take(EXPECTED.len() as u64 + 1)
+            .read_to_end(&mut contents)?;
+        if contents == EXPECTED {
+            return Ok(());
+        }
+        if !EXPECTED.starts_with(&contents) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "internal continue marker is malformed",
+            ));
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "internal continue acknowledgement timed out",
+            ));
+        }
+        std::thread::sleep(INTERNAL_CONTINUE_POLL_INTERVAL);
+    }
+}
+
+fn enter_internal_bootstrap(
+    marker: &Path,
+    continue_marker: &Path,
+) -> io::Result<InternalBootstrap> {
     let mut marker_file = validate_internal_marker(marker, true)?;
+    let mut continue_file =
+        validate_internal_private_file(continue_marker, INTERNAL_CONTINUE_MARKER, true)?;
     let inherited_terminal = inherited_foreground_terminal()?;
     let pid = getpid();
     setpgid(Pid::from_raw(0), Pid::from_raw(0))
@@ -633,6 +757,7 @@ fn enter_internal_bootstrap(marker: &Path) -> io::Result<InternalBootstrap> {
     marker_file.sync_all()?;
     raise(Signal::SIGSTOP)
         .map_err(|error| io::Error::other(format!("internal bootstrap stop failed: {error}")))?;
+    await_internal_continue(&mut continue_file)?;
     let terminal_guard = inherited_terminal
         .map(|original_pgid| hand_off_terminal_foreground(original_pgid, pid))
         .transpose()?;

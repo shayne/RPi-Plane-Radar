@@ -9,6 +9,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const INTERNAL_BOOTSTRAP_ARG: &str = "--__planeradar-bootstrap-v1";
+const INTERNAL_FOREGROUND_ARG: &str = "--__planeradar-foreground-tty-v1";
 const INTERNAL_RESTORE_ARG: &str = "--__planeradar-restore-tty-v1";
 const MARKER_NAME: &str = "control-bootstrap.ready";
 
@@ -16,6 +17,7 @@ struct PtyFixture {
     _temporary: tempfile::TempDir,
     executable: PathBuf,
     marker: PathBuf,
+    continue_marker: PathBuf,
     bin: PathBuf,
     input_record: PathBuf,
     continued_record: PathBuf,
@@ -25,6 +27,7 @@ struct PtyFixture {
     ssh_process_record: PathBuf,
     mutation_record: PathBuf,
     result_record: PathBuf,
+    handoff_trace_record: PathBuf,
 }
 
 fn pty_fixture() -> PtyFixture {
@@ -51,6 +54,13 @@ fn pty_fixture() -> PtyFixture {
         .mode(0o600)
         .open(&marker)
         .expect("private bootstrap marker");
+    let continue_marker = private.join("control-bootstrap.continue");
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&continue_marker)
+        .expect("private continue marker");
     let input_record = temporary.path().join("input");
     let fake_ssh = bin.join("ssh");
     fs::write(
@@ -129,9 +139,11 @@ printf '# Host %s found\n%s ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAAAAAAAAAAAAAAA
         ssh_process_record: temporary.path().join("ssh-process"),
         mutation_record: temporary.path().join("mutation"),
         result_record: temporary.path().join("result"),
+        handoff_trace_record: temporary.path().join("handoff-trace"),
         _temporary: temporary,
         executable,
         marker,
+        continue_marker,
         bin,
         input_record,
     }
@@ -166,6 +178,7 @@ fn spawn_wrapper(fixture: &PtyFixture, slave: &File) -> Child {
 set -u
 original_pgid="$(/bin/ps -o pgid= -p "$$" | /usr/bin/tr -d '[:space:]')"
 "$PLANERADAR_CONTROL" "$PLANERADAR_BOOTSTRAP_ARG" "$PLANERADAR_MARKER" \
+  "$PLANERADAR_CONTINUE_MARKER" \
   status pi@radar.local <&0 >&1 2>&2 &
 control_pid=$!
 printf '%s\n' "$control_pid" >"$PLANERADAR_CONTROL_PID_RECORD"
@@ -179,6 +192,14 @@ for attempt in $(/usr/bin/seq 1 300); do
   /bin/sleep 0.01
 done
 /bin/kill -CONT -- "-$control_pid"
+"$PLANERADAR_CONTROL" "$PLANERADAR_FOREGROUND_ARG" "$PLANERADAR_MARKER" <&0 >&1 2>&2
+foreground_status=$?
+parent_handoff_tpgid="$(/bin/ps -o tpgid= -p "$$" | /usr/bin/tr -d '[:space:]')"
+"$PLANERADAR_CONTROL" "$PLANERADAR_RESTORE_ARG" "$PLANERADAR_MARKER" <&0 >&1 2>&2
+reclaimed_tpgid="$(/bin/ps -o tpgid= -p "$$" | /usr/bin/tr -d '[:space:]')"
+printf '%s %s\n' "$parent_handoff_tpgid" "$reclaimed_tpgid" \
+  >"$PLANERADAR_HANDOFF_TRACE_RECORD"
+printf 'continue\n' >"$PLANERADAR_CONTINUE_MARKER"
 printf 'continued\n' >"$PLANERADAR_CONTINUED_RECORD"
 for attempt in $(/usr/bin/seq 1 300); do
   completion="$(/usr/bin/awk 'NR == 2 { print }' "$PLANERADAR_MARKER")"
@@ -226,8 +247,8 @@ mutation_present=0
 [[ ! -e "$PLANERADAR_PTY_MUTATION_RECORD" ]] || mutation_present=1
 read -r ssh_pid ssh_pgid worker_pid worker_pgid <"$PLANERADAR_PTY_SSH_PROCESS_RECORD"
 restored_tpgid="$(/bin/ps -o tpgid= -p "$$" | /usr/bin/tr -d '[:space:]')"
-printf '%s %s %s %s %s %s %s %s %s %s %s %s %s %s\n' \
-  "$original_pgid" "$control_status" "$restore_status" "$restored_tpgid" \
+printf '%s %s %s %s %s %s %s %s %s %s %s %s %s %s %s\n' \
+  "$original_pgid" "$control_status" "$foreground_status" "$restore_status" "$restored_tpgid" \
   "$descendant_state" "$grandchild_state" "$descendants_alive" "$mutation_present" \
   "$descendant_pgid" "$grandchild_pgid" \
   "$ssh_pid" "$ssh_pgid" "$worker_pid" "$worker_pgid" \
@@ -242,8 +263,14 @@ printf '%s %s %s %s %s %s %s %s %s %s %s %s %s %s\n' \
         .env("PATH", fixture_path)
         .env("PLANERADAR_CONTROL", &fixture.executable)
         .env("PLANERADAR_BOOTSTRAP_ARG", INTERNAL_BOOTSTRAP_ARG)
+        .env("PLANERADAR_FOREGROUND_ARG", INTERNAL_FOREGROUND_ARG)
         .env("PLANERADAR_RESTORE_ARG", INTERNAL_RESTORE_ARG)
         .env("PLANERADAR_MARKER", &fixture.marker)
+        .env("PLANERADAR_CONTINUE_MARKER", &fixture.continue_marker)
+        .env(
+            "PLANERADAR_HANDOFF_TRACE_RECORD",
+            &fixture.handoff_trace_record,
+        )
         .env("PLANERADAR_PTY_INPUT_RECORD", &fixture.input_record)
         .env("PLANERADAR_CONTINUED_RECORD", &fixture.continued_record)
         .env("PLANERADAR_CONTROL_PID_RECORD", &fixture.control_pid_record)
@@ -295,6 +322,7 @@ set -m
 original_pgid="$(/bin/ps -o pgid= -p "$$" | /usr/bin/tr -d '[:space:]')"
 (
   "$PLANERADAR_CONTROL" "$PLANERADAR_BOOTSTRAP_ARG" "$PLANERADAR_MARKER" \
+    "$PLANERADAR_CONTINUE_MARKER" \
     --help <&0 >&1 2>&2
 ) &
 background_job=$!
@@ -313,6 +341,7 @@ printf '%s %s %s %s\n' \
         .env("PLANERADAR_CONTROL", &fixture.executable)
         .env("PLANERADAR_BOOTSTRAP_ARG", INTERNAL_BOOTSTRAP_ARG)
         .env("PLANERADAR_MARKER", &fixture.marker)
+        .env("PLANERADAR_CONTINUE_MARKER", &fixture.continue_marker)
         .env("PLANERADAR_RESULT_RECORD", &fixture.result_record)
         .stdin(Stdio::from(
             slave.try_clone().expect("clone PTY slave stdin"),
@@ -433,24 +462,36 @@ fn native_bootstrap_hands_off_a_controlling_tty_before_inherited_stdin_and_resto
     );
     let result = fs::read_to_string(&fixture.result_record).expect("PTY result record");
     let fields = result.split_whitespace().collect::<Vec<_>>();
-    assert_eq!(fields.len(), 14, "unexpected PTY result: {result:?}");
+    assert_eq!(fields.len(), 15, "unexpected PTY result: {result:?}");
     assert_eq!(fields[1], "137", "supervisor was not killed: {result:?}");
-    assert_eq!(fields[2], "0", "native restore failed: {result:?}");
-    assert_eq!(fields[0], fields[3], "foreground PGID was not restored");
+    assert_eq!(
+        fields[2], "0",
+        "native foreground handoff failed: {result:?}"
+    );
+    assert_eq!(fields[3], "0", "native restore failed: {result:?}");
+    assert_eq!(fields[0], fields[4], "foreground PGID was not restored");
     assert!(
-        fields[4].starts_with('T') && fields[5].starts_with('T'),
+        fields[5].starts_with('T') && fields[6].starts_with('T'),
         "native completion did not stop the whole owned group: {result:?}"
     );
     assert_eq!(
-        fields[6], "0",
+        fields[7], "0",
         "completion descendants survived: {result:?}"
     );
-    assert_eq!(fields[7], "0", "completion descendant mutated: {result:?}");
+    assert_eq!(fields[8], "0", "completion descendant mutated: {result:?}");
     let control_pid = fs::read_to_string(&fixture.control_pid_record).expect("control PID record");
-    assert_eq!(fields[8], control_pid.trim(), "descendant escaped group");
-    assert_eq!(fields[9], control_pid.trim(), "grandchild escaped group");
-    assert_eq!(fields[11], control_pid.trim(), "SSH escaped group");
-    assert_eq!(fields[13], control_pid.trim(), "worker escaped group");
+    let handoff_trace =
+        fs::read_to_string(&fixture.handoff_trace_record).expect("handoff trace record");
+    let handoff_fields = handoff_trace.split_whitespace().collect::<Vec<_>>();
+    assert_eq!(
+        handoff_fields,
+        [control_pid.trim(), fields[0]],
+        "fixture did not force control-to-installer foreground reclaim"
+    );
+    assert_eq!(fields[9], control_pid.trim(), "descendant escaped group");
+    assert_eq!(fields[10], control_pid.trim(), "grandchild escaped group");
+    assert_eq!(fields[12], control_pid.trim(), "SSH escaped group");
+    assert_eq!(fields[14], control_pid.trim(), "worker escaped group");
     assert!(
         output.contains("planeradarctl: target operation transport failed"),
         "missing native PTY stderr: {output}"

@@ -345,6 +345,9 @@ fn installer_is_a_verified_mac_bootstrap_with_typed_forwarding() {
         "ulimit -f",
         "df -Pk",
         "planeradarctl install",
+        "control-bootstrap.continue",
+        "--__planeradar-foreground-tty-v1",
+        "foreground_control_terminal",
         "--__planeradar-restore-tty-v1",
         "restore_control_terminal",
         "await_control_completion",
@@ -389,6 +392,7 @@ fn installer_is_a_verified_mac_bootstrap_with_typed_forwarding() {
         "tcsetpgrp",
         "Signal::SIGTTOU",
         "relay_terminal_signal",
+        "foreground_internal_terminal",
         "restore_internal_terminal",
         "supervise_internal_control",
         "complete {worker_status}",
@@ -920,6 +924,7 @@ enum BootstrapScenario {
     ControlSignalWithUnrelatedProcess,
     PtySuccess,
     PtySlowSuccess,
+    PtyForegroundHandoff,
     PtyMalformedCompletion,
     PtyControlFailure,
     PtyCompletionDescendantSuccess,
@@ -994,6 +999,8 @@ struct BootstrapOutcome {
     initial_stopped_state_was_observed: bool,
     initial_continue_followed_observation: bool,
     initial_continue_handshake_timed_out: bool,
+    terminal_handoff_observed: bool,
+    control_terminal_trace: String,
 }
 
 fn open_release_pty() -> (File, File) {
@@ -1094,10 +1101,13 @@ fn bootstrap_fixture_outcome(scenario: BootstrapScenario) -> BootstrapOutcome {
     let initial_stopped_observation_record = temporary.path().join("initial-stopped-observation");
     let initial_continue_ack_record = temporary.path().join("initial-continue-ack");
     let initial_continue_timeout_record = temporary.path().join("initial-continue-timeout");
+    let terminal_handoff_record = temporary.path().join("terminal-handoff");
+    let control_terminal_trace_record = temporary.path().join("control-terminal-trace");
     let pty_scenario = matches!(
         scenario,
         BootstrapScenario::PtySuccess
             | BootstrapScenario::PtySlowSuccess
+            | BootstrapScenario::PtyForegroundHandoff
             | BootstrapScenario::PtyMalformedCompletion
             | BootstrapScenario::PtyControlFailure
             | BootstrapScenario::PtyCompletionDescendantSuccess
@@ -1195,13 +1205,43 @@ if arguments and arguments[0] == "--__planeradar-restore-tty-v1":
     restore_terminal()
     sys.exit(0)
 
+if arguments and arguments[0] == "--__planeradar-foreground-tty-v1":
+    marker = arguments[1]
+    with open(marker, "r", encoding="utf-8") as ready:
+        fields = ready.readline().strip().split(" ")
+    if fields == ["ready", "none"]:
+        with open(os.environ["PLANERADAR_TERMINAL_HANDOFF_RECORD"], "w", encoding="utf-8") as record:
+            record.write("none\n")
+        sys.exit(0)
+    if len(fields) != 4 or fields[:2] != ["ready", "tty"]:
+        sys.exit(74)
+    saved_terminal = (int(fields[2]), int(fields[3]))
+    if os.getpgid(os.getppid()) != saved_terminal[0] or os.getpgrp() != saved_terminal[0]:
+        sys.exit(75)
+    block_sigttou()
+    foreground = os.tcgetpgrp(0)
+    if foreground not in saved_terminal:
+        sys.exit(76)
+    if foreground != saved_terminal[1]:
+        os.tcsetpgrp(0, saved_terminal[1])
+    if os.tcgetpgrp(0) != saved_terminal[1]:
+        sys.exit(77)
+    with open(os.environ["PLANERADAR_TERMINAL_HANDOFF_RECORD"], "w", encoding="utf-8") as record:
+        record.write("foreground\n")
+    if os.environ.get("PLANERADAR_FORCE_RECLAIM_AFTER_PARENT_HANDOFF", "0") == "1":
+        os.tcsetpgrp(0, saved_terminal[0])
+        with open(os.environ["PLANERADAR_CONTROL_TERMINAL_TRACE_RECORD"], "a", encoding="utf-8") as record:
+            record.write(f"reclaimer {{os.getpgrp()}} {{os.tcgetpgrp(0)}}\n")
+    sys.exit(0)
+
 if arguments and arguments[0] == "--__planeradar-bootstrap-v1":
     with open(os.environ["PLANERADAR_BARRIER_ENTRY_RECORD"], "w", encoding="utf-8") as record:
         record.write("entered\n")
     if mode == "barrier-exit":
         sys.exit(73)
     marker = arguments[1]
-    arguments = arguments[2:]
+    continue_marker = arguments[2]
+    arguments = arguments[3:]
     try:
         original_pgid = os.tcgetpgrp(0)
     except OSError as error:
@@ -1225,11 +1265,36 @@ if arguments and arguments[0] == "--__planeradar-bootstrap-v1":
     ready.flush()
     os.fsync(ready.fileno())
     os.kill(os.getpid(), signal.SIGSTOP)
+    continue_deadline = time.monotonic() + 3
+    while True:
+        try:
+            with open(continue_marker, "rb") as acknowledgement:
+                continue_contents = acknowledgement.read(10)
+        except OSError:
+            continue_contents = b""
+        if continue_contents == b"continue\n":
+            break
+        if not b"continue\n".startswith(continue_contents):
+            sys.exit(78)
+        if time.monotonic() >= continue_deadline:
+            sys.exit(78)
+        time.sleep(0.005)
+    if (
+        os.environ.get("PLANERADAR_REQUIRE_TERMINAL_HANDOFF", "0") == "1"
+        and not os.path.exists(os.environ["PLANERADAR_TERMINAL_HANDOFF_RECORD"])
+    ):
+        sys.exit(78)
     if saved_terminal is not None:
         block_sigttou()
-        if os.tcgetpgrp(0) != saved_terminal[0]:
+        foreground = os.tcgetpgrp(0)
+        if foreground not in saved_terminal:
             sys.exit(77)
-        os.tcsetpgrp(0, saved_terminal[1])
+        if foreground != saved_terminal[1]:
+            os.tcsetpgrp(0, saved_terminal[1])
+        if os.tcgetpgrp(0) != saved_terminal[1]:
+            sys.exit(77)
+        with open(os.environ["PLANERADAR_CONTROL_TERMINAL_TRACE_RECORD"], "a", encoding="utf-8") as record:
+            record.write(f"supervisor {{os.getpgrp()}} {{os.tcgetpgrp(0)}}\n")
         if os.environ.get("PLANERADAR_CONTROL_DEFAULT_SIGINT", "0") == "1":
             signal.signal(signal.SIGHUP, relay_terminal_signal)
             signal.signal(signal.SIGINT, relay_terminal_signal)
@@ -1261,6 +1326,12 @@ try:
             record.write("delayed startup mutation\n")
         sys.exit(0)
 
+    try:
+        worker_foreground_pgid = os.tcgetpgrp(0)
+    except OSError:
+        worker_foreground_pgid = -1
+    with open(os.environ["PLANERADAR_CONTROL_TERMINAL_TRACE_RECORD"], "a", encoding="utf-8") as record:
+        record.write(f"worker {{os.getpgrp()}} {{worker_foreground_pgid}}\n")
     control_input = sys.stdin.readline().rstrip("\n")
     print(f"control stdin={{control_input}}", flush=True)
     print("control stdout", flush=True)
@@ -2039,6 +2110,30 @@ printf '%s %s %s\n' "$original_pgid" "$installer_status" "$restored_tpgid" \
             &initial_continue_timeout_record,
         )
         .env(
+            "PLANERADAR_TERMINAL_HANDOFF_RECORD",
+            &terminal_handoff_record,
+        )
+        .env(
+            "PLANERADAR_CONTROL_TERMINAL_TRACE_RECORD",
+            &control_terminal_trace_record,
+        )
+        .env(
+            "PLANERADAR_REQUIRE_TERMINAL_HANDOFF",
+            if matches!(scenario, BootstrapScenario::PtyForegroundHandoff) {
+                "1"
+            } else {
+                "0"
+            },
+        )
+        .env(
+            "PLANERADAR_FORCE_RECLAIM_AFTER_PARENT_HANDOFF",
+            if matches!(scenario, BootstrapScenario::PtyForegroundHandoff) {
+                "1"
+            } else {
+                "0"
+            },
+        )
+        .env(
             "PLANERADAR_DELAY_INITIAL_CONTINUE",
             if post_reap_signal.is_some() { "1" } else { "0" },
         )
@@ -2518,6 +2613,9 @@ printf '%s %s %s\n' "$original_pgid" "$installer_status" "$restored_tpgid" \
         initial_stopped_state_was_observed: initial_stopped_observation_record.exists(),
         initial_continue_followed_observation: initial_continue_ack_record.exists(),
         initial_continue_handshake_timed_out: initial_continue_timeout_record.exists(),
+        terminal_handoff_observed: terminal_handoff_record.exists(),
+        control_terminal_trace: fs::read_to_string(control_terminal_trace_record)
+            .unwrap_or_default(),
     }
 }
 
@@ -3073,6 +3171,44 @@ fn bootstrap_real_pty_allows_verified_control_to_run_longer_than_startup_timeout
 }
 
 #[test]
+fn bootstrap_real_pty_hands_off_before_continue_and_recovers_delayed_foreground_reclaim() {
+    let outcome = bootstrap_fixture_outcome(BootstrapScenario::PtyForegroundHandoff);
+    assert!(
+        outcome.terminal_handoff_observed,
+        "installer did not authenticate the parent-side terminal handoff"
+    );
+    assert_eq!(
+        outcome.status_code,
+        Some(0),
+        "control was continued before its parent-side terminal handoff; stdout={} stderr={} terminal_trace={}",
+        outcome.stdout,
+        outcome.stderr,
+        outcome.control_terminal_trace
+    );
+    assert!(outcome.success);
+    assert!(outcome.control_processes_alive.is_empty());
+    let trace = outcome
+        .control_terminal_trace
+        .lines()
+        .map(|line| line.split_whitespace().collect::<Vec<_>>())
+        .collect::<Vec<_>>();
+    assert_eq!(trace.len(), 3, "unexpected terminal trace: {trace:?}");
+    assert_eq!(trace[0][0], "reclaimer");
+    assert_eq!(trace[0][1], trace[0][2]);
+    assert_eq!(
+        trace[0][2].parse::<u32>().ok(),
+        outcome.original_terminal_pgid,
+        "fixture did not restore the original foreground group"
+    );
+    assert_eq!(trace[1][0], "supervisor");
+    assert_eq!(trace[1][1], trace[1][2]);
+    assert_eq!(trace[2][0], "worker");
+    assert_eq!(trace[2][1], trace[1][1]);
+    assert_eq!(trace[2][2], trace[1][2]);
+    assert_pty_foreground_restored(&outcome);
+}
+
+#[test]
 fn bootstrap_real_pty_rejects_a_stopped_control_with_malformed_completion() {
     let outcome = bootstrap_fixture_outcome(BootstrapScenario::PtyMalformedCompletion);
     assert_eq!(
@@ -3225,9 +3361,10 @@ fn bootstrap_real_pty_post_clear_signal_only_latches_status_before_supervisor_re
     assert_eq!(
         outcome.status_code,
         Some(143),
-        "unexpected post-clear status; stdout={} stderr={}",
+        "unexpected post-clear status; stdout={} stderr={} terminal_trace={}",
         outcome.stdout,
-        outcome.stderr
+        outcome.stderr,
+        outcome.control_terminal_trace
     );
     assert!(
         outcome.post_reap_restore_marker_survived,
