@@ -119,10 +119,7 @@ version="${1:-}"
 [[ $# -eq 1 ]] || die "usage: scripts/package-release.sh VERSION"
 version="$(canonical_version "$version")"
 
-for command in git docker cargo file lipo shasum awk find python3; do
-  require_command "$command"
-done
-
+require_command git
 repo_root="$(git rev-parse --show-toplevel 2>/dev/null)" ||
   die "run this command from a Plane Radar clone"
 cd "$repo_root"
@@ -176,6 +173,7 @@ fi
 [[ "$resolved_workflow_commit" == "$workflow_commit" ]] ||
   die "workflow ref does not resolve to workflow commit"
 
+require_command awk
 package_version="$(awk -F ' *= *' '
   /^\[package\]$/ { package = 1; next }
   /^\[/ { package = 0 }
@@ -183,6 +181,10 @@ package_version="$(awk -F ' *= *' '
 ' Cargo.toml)"
 [[ "${version%%-*}" == "$package_version" ]] ||
   die "version does not match Cargo.toml package version"
+
+for command in docker cargo file lipo shasum find python3; do
+  require_command "$command"
+done
 
 work="$(mktemp -d "${TMPDIR:-/tmp}/planeradar-release.XXXXXX")"
 cleanup() {

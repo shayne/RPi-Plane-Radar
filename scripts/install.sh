@@ -261,39 +261,49 @@ await_control_barrier() {
   done
   return 1
 }
-await_control_completion() {
-  local attempt completion completion_status snapshot early_state
-  for ((attempt = 0; attempt < 200; attempt++)); do
-    completion="$(awk -v readiness="$control_readiness" '
-      NR == 1 && $0 != readiness { exit 1 }
-      NR == 2 { completion = $0 }
-      NR > 2 { exit 1 }
-      END {
-        if (NR == 2) {
-          print completion
-        } else {
-          exit 1
-        }
+read_control_completion() {
+  awk -v readiness="$control_readiness" '
+    NR == 1 && $0 != readiness { exit 1 }
+    NR == 2 { completion = $0 }
+    NR > 2 { exit 1 }
+    END {
+      if (NR == 2) {
+        print completion
+      } else {
+        exit 1
       }
-    ' "$control_barrier" 2>/dev/null)" || completion=""
+    }
+  ' "$control_barrier" 2>/dev/null
+}
+await_control_completion() {
+  local completion completion_status snapshot
+  while :; do
+    completion_status=""
+    completion="$(read_control_completion)" || completion=""
     if [[ "$completion" =~ ^complete\ ([0-9]|[1-9][0-9]|1[0-9][0-9]|2[0-4][0-9]|25[0-5])$ ]]; then
       completion_status=${BASH_REMATCH[1]}
-      snapshot="$(ps -o ppid= -o pgid= -o state= -p "$control_pid" 2>/dev/null)" ||
-        return 1
-      set -- $snapshot
-      [[ $# -eq 3 && "$1" == "$$" && "$2" == "$control_pid" ]] || return 1
-      [[ "$3" != Z* ]] || return 1
-      if [[ "$3" == T* ]]; then
-        control_status=$completion_status
-        return 0
-      fi
     fi
-    early_state="$(ps -o state= -p "$control_pid" 2>/dev/null | tr -d '[:space:]')" ||
+    snapshot="$(ps -o ppid= -o pgid= -o state= -p "$control_pid" 2>/dev/null)" ||
       return 1
-    [[ "$early_state" != Z* ]] || return 1
-    /bin/sleep 0.01
+    set -- $snapshot
+    [[ $# -eq 3 && "$1" == "$$" && "$2" == "$control_pid" ]] || return 1
+    [[ "$3" != Z* ]] || return 1
+    if [[ "$3" == T* ]]; then
+      if [[ -z "$completion_status" ]]; then
+        # The child can stop after the first record read but before the
+        # process-table snapshot. Once stopped, its synced record is stable;
+        # read it once more before deciding that completion is malformed.
+        completion="$(read_control_completion)" || completion=""
+        [[ "$completion" =~ ^complete\ ([0-9]|[1-9][0-9]|1[0-9][0-9]|2[0-4][0-9]|25[0-5])$ ]] ||
+          return 1
+        completion_status=${BASH_REMATCH[1]}
+      fi
+      [[ -n "$completion_status" ]] || return 1
+      control_status=$completion_status
+      return 0
+    fi
+    /bin/sleep 0.05
   done
-  return 1
 }
 wait_retired_control() {
   local wait_status=0

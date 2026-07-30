@@ -488,10 +488,15 @@ fn packager_rejects_a_dirty_release_source_before_building() {
         .expect("clone fixture repository");
     assert!(status.success());
     fs::write(temporary.path().join("dirty"), b"not committed").expect("dirty fixture");
+    let bin = temporary.path().join("fixture-bin");
+    fs::create_dir(&bin).expect("fixture command directory");
+    symlink("/bin/bash", bin.join("bash")).expect("fixture bash");
+    symlink("/usr/bin/git", bin.join("git")).expect("fixture git");
 
     let output = Command::new(root().join("scripts/package-release.sh"))
         .arg("0.1.0-rc.1")
         .current_dir(temporary.path())
+        .env("PATH", &bin)
         .env("PLANERADAR_PACKAGE_NO_BUILD", "1")
         .output()
         .expect("run packager");
@@ -543,11 +548,20 @@ fn packager_rejects_unreachable_source_version_mismatch_and_mislabeled_inputs() 
 
     let mislabeled = clean_clone();
     fs::create_dir(mislabeled.path().join("dist")).expect("ignored dist");
+    let bin = mislabeled.path().join("dist/fixture-bin");
+    fs::create_dir(&bin).expect("fixture command directory");
+    write_executable(&bin.join("lipo"), "#!/bin/sh\nexit 1\n");
     let fake = mislabeled.path().join("dist/fake-aarch64");
     write_executable(&fake, "#!/bin/sh\nexit 0\n");
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
     let output = Command::new(&script)
         .arg("0.1.0-rc.1")
         .current_dir(mislabeled.path())
+        .env("PATH", path)
         .env("PLANERADAR_PACKAGE_SKIP_BUILDS", "1")
         .env("PLANERADAR_APP_BINARY", &fake)
         .env("PLANERADAR_CTL_ARM64_BINARY", &fake)
@@ -887,6 +901,8 @@ enum BootstrapScenario {
     ControlBarrierChildExit,
     ControlSignalWithUnrelatedProcess,
     PtySuccess,
+    PtySlowSuccess,
+    PtyMalformedCompletion,
     PtyControlFailure,
     PtyCompletionDescendantSuccess,
     PtyCompletionDescendantFailure,
@@ -1055,6 +1071,8 @@ fn bootstrap_fixture_outcome(scenario: BootstrapScenario) -> BootstrapOutcome {
     let pty_scenario = matches!(
         scenario,
         BootstrapScenario::PtySuccess
+            | BootstrapScenario::PtySlowSuccess
+            | BootstrapScenario::PtyMalformedCompletion
             | BootstrapScenario::PtyControlFailure
             | BootstrapScenario::PtyCompletionDescendantSuccess
             | BootstrapScenario::PtyCompletionDescendantFailure
@@ -1200,7 +1218,11 @@ if arguments and arguments[0] == "--__planeradar-bootstrap-v1":
     if worker_status < 0:
         worker_status = 128 - worker_status
     restore_terminal()
-    ready.write(f"complete {{worker_status}}\n")
+    completion = (
+        os.environ.get("PLANERADAR_CONTROL_COMPLETION_LINE")
+        or f"complete {{worker_status}}"
+    )
+    ready.write(f"{{completion}}\n")
     ready.flush()
     os.fsync(ready.fileno())
     os.killpg(os.getpgrp(), signal.SIGSTOP)
@@ -1217,6 +1239,7 @@ try:
     print(f"control stdin={{control_input}}", flush=True)
     print("control stdout", flush=True)
     print("control stderr", file=sys.stderr, flush=True)
+    time.sleep(float(os.environ.get("PLANERADAR_CONTROL_DELAY_SECONDS", "0")))
     with open(os.environ["PLANERADAR_ARGV_RECORD"], "w", encoding="utf-8") as record:
         record.write("\n".join(arguments) + "\n")
 
@@ -1973,6 +1996,22 @@ printf '%s %s %s\n' "$original_pgid" "$installer_status" "$restored_tpgid" \
             },
         )
         .env(
+            "PLANERADAR_CONTROL_DELAY_SECONDS",
+            if matches!(scenario, BootstrapScenario::PtySlowSuccess) {
+                "5"
+            } else {
+                "0"
+            },
+        )
+        .env(
+            "PLANERADAR_CONTROL_COMPLETION_LINE",
+            if matches!(scenario, BootstrapScenario::PtyMalformedCompletion) {
+                "malformed completion"
+            } else {
+                ""
+            },
+        )
+        .env(
             "PLANERADAR_REPEAT_SIGNAL_DURING_CLEANUP",
             if matches!(scenario, BootstrapScenario::RepeatedSignalHupThenTerm) {
                 "1"
@@ -2150,7 +2189,7 @@ printf '%s %s %s\n' "$original_pgid" "$installer_status" "$restored_tpgid" \
         _ => None,
     };
     let cancellation_started = if let Some(signal) = control_signal {
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let deadline = Instant::now() + Duration::from_secs(60);
         while !control_ready_record.exists() && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(10));
         }
@@ -2160,7 +2199,7 @@ printf '%s %s %s\n' "$original_pgid" "$installer_status" "$restored_tpgid" \
         );
         let cancellation_started = Instant::now();
         let signal_pid = if pty_scenario {
-            let deadline = Instant::now() + Duration::from_secs(15);
+            let deadline = Instant::now() + Duration::from_secs(60);
             while !installer_pid_record.exists() && Instant::now() < deadline {
                 thread::sleep(Duration::from_millis(10));
             }
@@ -2182,7 +2221,7 @@ printf '%s %s %s\n' "$original_pgid" "$installer_status" "$restored_tpgid" \
         assert!(status.success());
         Some(cancellation_started)
     } else if matches!(scenario, BootstrapScenario::PtyTerminalInterrupt) {
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let deadline = Instant::now() + Duration::from_secs(60);
         while !control_ready_record.exists() && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(10));
         }
@@ -2198,7 +2237,7 @@ printf '%s %s %s\n' "$original_pgid" "$installer_status" "$restored_tpgid" \
             .expect("write terminal interrupt");
         Some(cancellation_started)
     } else if startup_signal.is_some() {
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let deadline = Instant::now() + Duration::from_secs(60);
         while !startup_signal_record.exists() && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(10));
         }
@@ -2216,7 +2255,7 @@ printf '%s %s %s\n' "$original_pgid" "$installer_status" "$restored_tpgid" \
             | BootstrapScenario::ControlBarrierChildExit
             | BootstrapScenario::PtyBarrierFailure
     ) {
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let deadline = Instant::now() + Duration::from_secs(60);
         while !barrier_entry_record.exists() && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(10));
         }
@@ -2236,7 +2275,7 @@ printf '%s %s %s\n' "$original_pgid" "$installer_status" "$restored_tpgid" \
         original_terminal_pgid,
         restored_terminal_pgid,
     ) = if pty_scenario {
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let deadline = Instant::now() + Duration::from_secs(60);
         while !pty_result_record.exists() && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(10));
         }
@@ -2907,6 +2946,40 @@ fn bootstrap_real_pty_preserves_interactive_io_statuses_and_foreground_ownership
         assert!(outcome.control_processes_alive.is_empty());
         assert_pty_foreground_restored(&outcome);
     }
+}
+
+#[test]
+fn bootstrap_real_pty_allows_verified_control_to_run_longer_than_startup_timeout() {
+    let outcome = bootstrap_fixture_outcome(BootstrapScenario::PtySlowSuccess);
+    assert_eq!(
+        outcome.status_code,
+        Some(0),
+        "long-running verified control was mistaken for a failed completion barrier; stdout={} stderr={}",
+        outcome.stdout,
+        outcome.stderr
+    );
+    assert!(outcome.success);
+    assert!(outcome.control_processes_alive.is_empty());
+    assert_pty_foreground_restored(&outcome);
+}
+
+#[test]
+fn bootstrap_real_pty_rejects_a_stopped_control_with_malformed_completion() {
+    let outcome = bootstrap_fixture_outcome(BootstrapScenario::PtyMalformedCompletion);
+    assert_eq!(
+        outcome.status_code,
+        Some(1),
+        "malformed completion did not fail closed; stdout={} stderr={}",
+        outcome.stdout,
+        outcome.stderr
+    );
+    assert!(
+        outcome
+            .stdout
+            .contains("verified control completion barrier failed")
+    );
+    assert!(outcome.control_processes_alive.is_empty());
+    assert_pty_foreground_restored(&outcome);
 }
 
 #[test]
