@@ -411,6 +411,29 @@ fn installer_preserves_an_accepted_custom_overlay_and_requests_no_reboot() {
 }
 
 #[test]
+fn installer_preserves_the_versioned_external_driver_overlay_and_requests_no_reboot() {
+    let source = "[all]\ndtoverlay=hyperpixel2r-kms-224cc7ab7817.dtbo\n";
+    let fixture = Fixture::new(source);
+    let runner = RecordingRunner::for_root(&fixture.root);
+    let result = Installer::new(&runner)
+        .install(&fixture.options(true))
+        .expect("install over the accepted external driver display");
+
+    assert!(!result.boot_config_changed);
+    assert!(!result.reboot_required);
+    assert_eq!(
+        fs::read_to_string(&fixture.boot_config).expect("preserved boot config"),
+        source
+    );
+    assert!(
+        !runner
+            .commands()
+            .iter()
+            .any(|(program, args)| program == "systemctl" && args.as_slice() == ["reboot"])
+    );
+}
+
+#[test]
 fn installer_preserves_inline_calibration_and_existing_private_settings() {
     let source = "[all]\ndtoverlay=vc4-kms-dpi-hyperpixel2r,rotate=180\n";
     let fixture = Fixture::new(source);

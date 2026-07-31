@@ -14,6 +14,8 @@ use thiserror::Error;
 pub const STOCK_HYPERPIXEL_DECLARATION: &str = "dtoverlay=vc4-kms-dpi-hyperpixel2r";
 pub const DEFAULT_HYPERPIXEL_DECLARATION: &str = STOCK_HYPERPIXEL_DECLARATION;
 pub const PLANERADAR_HYPERPIXEL_PREFIX: &str = "planeradar-hyperpixel2r-";
+const EXTERNAL_HYPERPIXEL_PREFIX: &str = "hyperpixel2r-kms-";
+const EXTERNAL_HYPERPIXEL_SUFFIX: &str = ".dtbo";
 pub const MAX_BOOT_CONFIG_LINE_BYTES: usize = 98;
 pub const PLANERADAR_SERVICE: &str = include_str!("../packaging/planeradar.service");
 
@@ -2046,7 +2048,7 @@ fn is_install_hyperpixel_declaration(line: &str) -> bool {
     };
     let overlay = selection.split(',').next().unwrap_or_default();
     overlay == STOCK_HYPERPIXEL_DECLARATION.trim_start_matches("dtoverlay=")
-        || overlay.starts_with(PLANERADAR_HYPERPIXEL_PREFIX)
+        || versioned_overlay_revision(overlay).is_some()
 }
 
 fn require_regular_file(path: &Path) -> Result<(), InstallError> {
@@ -2504,22 +2506,34 @@ fn selection_lines(selection: DisplaySelection<'_>) -> Result<Vec<String>, Insta
 }
 
 fn validate_overlay_name(overlay: &str) -> Result<(), InstallError> {
-    let Some(revision) = overlay.strip_prefix(PLANERADAR_HYPERPIXEL_PREFIX) else {
+    let Some(_revision) = versioned_overlay_revision(overlay) else {
         return Err(InstallError::InvalidOverlayName(overlay.to_owned()));
     };
-    if revision.len() != 12
-        || !revision
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
-        return Err(InstallError::InvalidOverlayName(overlay.to_owned()));
-    }
     Ok(())
 }
 
+fn versioned_overlay_revision(overlay: &str) -> Option<&str> {
+    let revision = overlay
+        .strip_prefix(PLANERADAR_HYPERPIXEL_PREFIX)
+        .or_else(|| {
+            overlay
+                .strip_prefix(EXTERNAL_HYPERPIXEL_PREFIX)
+                .and_then(|value| value.strip_suffix(EXTERNAL_HYPERPIXEL_SUFFIX))
+        })?;
+    (revision.len() == 12
+        && revision
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
+    .then_some(revision)
+}
+
 fn is_hyperpixel_declaration(trimmed: &str) -> bool {
-    trimmed.starts_with(STOCK_HYPERPIXEL_DECLARATION)
-        || trimmed.starts_with(&format!("dtoverlay={PLANERADAR_HYPERPIXEL_PREFIX}"))
+    let Some(selection) = trimmed.strip_prefix("dtoverlay=") else {
+        return false;
+    };
+    let overlay = selection.split(',').next().unwrap_or_default();
+    overlay == STOCK_HYPERPIXEL_DECLARATION.trim_start_matches("dtoverlay=")
+        || versioned_overlay_revision(overlay).is_some()
 }
 
 fn is_supported_parameter_line(trimmed: &str) -> bool {
