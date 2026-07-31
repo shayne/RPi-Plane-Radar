@@ -244,18 +244,18 @@ fn maintainer_driver_commands_parse_exact_sync_and_update_forms() {
 }
 
 #[test]
-fn driver_lock_matches_the_next_release_candidate_gate() {
+fn driver_lock_matches_the_accepted_stable_release_gate() {
     let lock = DriverLock::parse(LOCK).expect("parse driver lock");
 
     assert_eq!(
         lock.repository,
         "https://github.com/shayne/hyperpixel2r-kms"
     );
-    assert_eq!(lock.version.to_string(), "0.1.0-rc.16");
-    assert_eq!(lock.commit, "58c42896c8829a034f42a4bc92886dd6f21775a8");
+    assert_eq!(lock.version.to_string(), "0.1.0");
+    assert_eq!(lock.commit, "224cc7ab781710c2edb43e4b5dbf0aedee5ee4d7");
     assert_eq!(
         lock.manifest_sha256,
-        "5494a9f7f5c4a3214fff669efa26574b7d2602bafda5992472cd94b90885573c"
+        "7a10d873c49858e5066f7120189068ff446c4c926bda5a2883070d9230e6994d"
     );
 }
 
