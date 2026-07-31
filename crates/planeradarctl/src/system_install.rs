@@ -142,7 +142,7 @@ impl<T: Transport> DriverActions<T> for SystemDriverActions {
                         .join("kernel-export")
                         .join(&facts.kernel_release),
                     artifacts: self.cache_root.join("driver-artifacts"),
-                    replace_overlay: "vc4-kms-dpi-hyperpixel2r".into(),
+                    replace_overlay: facts.replace_overlay.clone(),
                 },
             )
             .map_err(|_| BackendFailure::OperationFailed)?;

@@ -35,13 +35,13 @@ pub const TARGET_FACTS_SCRIPT: &str = concat!(
     r#"kernel8_image=/boot/firmware/kernel8.img; boot_selected_kernel_match_count=0; boot_selected_kernel_release=; if test ! -L "$kernel8_image" && test -f "$kernel8_image" && test "$(stat -c '%U:%G' "$kernel8_image")" = root:root; then kernel8_sha=$(sha256sum -- "$kernel8_image" | awk '{print $1}'); for candidate_image in /boot/vmlinuz-*; do test ! -L "$candidate_image" && test -f "$candidate_image" || continue; test "$(stat -c '%U:%G' "$candidate_image")" = root:root || continue; candidate_release=${candidate_image#/boot/vmlinuz-}; case "$candidate_release" in ''|*[!A-Za-z0-9._+-]*) continue;; esac; test "$(sha256sum -- "$candidate_image" | awk '{print $1}')" = "$kernel8_sha" || continue; boot_selected_kernel_match_count=$((boot_selected_kernel_match_count + 1)); boot_selected_kernel_release=$candidate_release; done; fi; "#,
     r#"installed_kernel_header_pair_count=0; installed_kernel_release=; installed_headers_release=; for module_dir in /lib/modules/*; do test -d "$module_dir" || continue; candidate=${module_dir##*/}; candidate_headers=; if test -r "$module_dir/build/include/config/kernel.release"; then candidate_headers=$(tr -d '\r\n' <"$module_dir/build/include/config/kernel.release"); fi; if test "$candidate" = "$candidate_headers" && test "$candidate" = "$boot_selected_kernel_release"; then installed_kernel_header_pair_count=$((installed_kernel_header_pair_count + 1)); installed_kernel_release=$candidate; installed_headers_release=$candidate_headers; fi; done; "#,
     r#"boot_kernel_override_conflicting=$(if awk '{ line=$0; sub(/^[[:space:]]+/, "", line); if (line == "" || line ~ /^#/) next; split(line, pieces, "="); key=pieces[1]; gsub(/[[:space:]]/, "", key); if (key != "kernel") next; sub(/^[^=]*=/, "", line); sub(/^[[:space:]]+/, "", line); sub(/[[:space:]]+$/, "", line); if (line != "kernel8.img") exit 1 }' "$boot_config"; then printf false; else printf true; fi); "#,
-    r#"overlay_lines=$(awk '{ line=$0; sub(/^[[:space:]]+/, "", line); sub(/[[:space:]]+$/, "", line); if (line ~ /^dtoverlay=/) print line }' "$boot_config"); external_hyperpixel_overlay_count=$(printf '%s\n' "$overlay_lines" | grep -Ec '^dtoverlay=hyperpixel2r-kms-[0-9a-f]{12}\.dtbo$' || true); hyperpixel_declaration_count=$(printf '%s\n' "$overlay_lines" | grep -Ec '^dtoverlay=(vc4-kms-dpi-hyperpixel2r|planeradar-hyperpixel2r-[0-9a-f]{12}|hyperpixel2r-kms-[0-9a-f]{12}\.dtbo)$' || true); conflicting_overlay_lines=$(printf '%s\n' "$overlay_lines" | grep -E '^dtoverlay=(.*hyperpixel.*|vc4-kms-dpi.*|dpi[0-9].*)$' || true); unsafe_overlay_present=$(if printf '%s\n' "$conflicting_overlay_lines" | grep -Ev '^(|dtoverlay=vc4-kms-dpi-hyperpixel2r|dtoverlay=planeradar-hyperpixel2r-[0-9a-f]{12}|dtoverlay=hyperpixel2r-kms-[0-9a-f]{12}\.dtbo)$' | grep -q . || test "$hyperpixel_declaration_count" -gt 1; then printf true; else printf false; fi); "#,
+    r#"overlay_lines=$(awk '{ line=$0; sub(/^[[:space:]]+/, "", line); sub(/[[:space:]]+$/, "", line); if (line ~ /^dtoverlay=/) print line }' "$boot_config"); external_hyperpixel_overlay_count=$(printf '%s\n' "$overlay_lines" | grep -Ec '^dtoverlay=hyperpixel2r-kms-[0-9a-f]{12}\.dtbo$' || true); hyperpixel_declaration_count=$(printf '%s\n' "$overlay_lines" | grep -Ec '^dtoverlay=(vc4-kms-dpi-hyperpixel2r|planeradar-hyperpixel2r-[0-9a-f]{12}|hyperpixel2r-kms-[0-9a-f]{12}\.dtbo)$' || true); replace_overlay=; if test "$hyperpixel_declaration_count" = 1; then replace_overlay=$(printf '%s\n' "$overlay_lines" | awk -F= '$0 ~ /^dtoverlay=(vc4-kms-dpi-hyperpixel2r|planeradar-hyperpixel2r-[0-9a-f]{12}|hyperpixel2r-kms-[0-9a-f]{12}\.dtbo)$/ { print $2 }'); fi; conflicting_overlay_lines=$(printf '%s\n' "$overlay_lines" | grep -E '^dtoverlay=(.*hyperpixel.*|vc4-kms-dpi.*|dpi[0-9].*)$' || true); unsafe_overlay_present=$(if printf '%s\n' "$conflicting_overlay_lines" | grep -Ev '^(|dtoverlay=vc4-kms-dpi-hyperpixel2r|dtoverlay=planeradar-hyperpixel2r-[0-9a-f]{12}|dtoverlay=hyperpixel2r-kms-[0-9a-f]{12}\.dtbo)$' | grep -q . || test "$hyperpixel_declaration_count" -gt 1; then printf true; else printf false; fi); "#,
     r#"hyperpixel_state_dir=/var/lib/hyperpixel2r-kms; hyperpixel_state_dir_safe=$(if test -L "$hyperpixel_state_dir"; then printf false; elif test -e "$hyperpixel_state_dir"; then if test ! -d "$hyperpixel_state_dir" || test "$(stat -c '%a:%U:%G' "$hyperpixel_state_dir")" != 755:root:root; then printf false; else printf true; fi; else printf true; fi); hyperpixel_transaction_active=false; if test "$hyperpixel_state_dir_safe" = false; then hyperpixel_transaction_active=true; elif test -L /var/lib/hyperpixel2r-kms/tryboot-state || test -e /var/lib/hyperpixel2r-kms/tryboot-state; then hyperpixel_transaction_active=true; else for transaction_path in /var/lib/hyperpixel2r-kms/.tryboot-state-hold.* /var/lib/hyperpixel2r-kms/.hp2r-transaction.*; do if test -L "$transaction_path" || test -e "$transaction_path"; then hyperpixel_transaction_active=true; break; fi; done; fi; legacy_checkpoint_active=$(bool systemctl is-active --quiet planeradar-hyperpixel-checkpoint.service); "#,
     r#"external_hyperpixel_module_count=$(awk '$1 == "hyperpixel2r_kms" { count++ } END { print count + 0 }' /proc/modules); external_hyperpixel_module_loaded=$(if test "$external_hyperpixel_module_count" = 1; then printf true; else printf false; fi); unexpected_hyperpixel_module_loaded=$(if awk '$1 ~ /hyperpixel/ && $1 != "hyperpixel2r_kms" { found=1 } END { exit !found }' /proc/modules; then printf true; else printf false; fi); "#,
     r#"external_hyperpixel_binding_count=0; generic_driver=/sys/bus/platform/drivers/hyperpixel2r-kms; if test ! -L "$generic_driver" && test -d "$generic_driver"; then for binding in "$generic_driver"/*; do test -L "$binding" || continue; resolved_binding=$(readlink -f -- "$binding") || continue; case "$resolved_binding" in /sys/devices/platform/*) ;; *) continue;; esac; compatible="$resolved_binding/of_node/compatible"; test ! -L "$compatible" && test -f "$compatible" || continue; if tr '\000' '\n' <"$compatible" | grep -Fxq shayne,hyperpixel2r-kms; then external_hyperpixel_binding_count=$((external_hyperpixel_binding_count + 1)); fi; done; fi; "#,
     r#"gpio_display_state_safe=$(if test "$hyperpixel_transaction_active" = false && test "$legacy_checkpoint_active" = false && test "$unexpected_hyperpixel_module_loaded" = false && { { test "$external_hyperpixel_overlay_count" = 0 && test "$external_hyperpixel_module_loaded" = false && test "$external_hyperpixel_binding_count" = 0; } || { test "$external_hyperpixel_overlay_count" = 1 && test "$external_hyperpixel_module_loaded" = true && test "$external_hyperpixel_binding_count" = 1; }; }; then printf true; else printf false; fi); "#,
-    r#"printf '{"model":"%s","os_id":"%s","os_version":"%s","architecture":"%s","kernel_release":"%s","kernel_vermagic":"%s","default_target":"%s","display_manager_active":%s,"boot_config":"%s","boot_config_regular":%s,"tryboot_supported":%s,"clock_synchronized":%s,"system_time_unix":%s,"package_repository_reachable":%s,"port_80_free":%s,"root_available_bytes":%s,"boot_available_bytes":%s,"running_headers_available":%s,"running_headers_release":"%s","installed_kernel_header_pair_count":%s,"installed_kernel_release":"%s","installed_headers_release":"%s","boot_selected_kernel_match_count":%s,"boot_selected_kernel_release":"%s","boot_kernel_override_conflicting":%s,"unsafe_overlay_present":%s,"external_hyperpixel_overlay_count":%s,"external_hyperpixel_module_loaded":%s,"unexpected_hyperpixel_module_loaded":%s,"hyperpixel_state_dir_safe":%s,"hyperpixel_transaction_active":%s,"legacy_checkpoint_active":%s,"external_hyperpixel_binding_count":%s,"gpio_display_state_safe":%s}' "#,
-    r#""$model" "$os_id" "$os_version" "$architecture" "$kernel_release" "$kernel_vermagic" "$default_target" "$display_manager_active" "$boot_config" "$boot_config_regular" "$tryboot_supported" "$clock_synchronized" "$system_time_unix" "$package_repository_reachable" "$port_80_free" "$root_available_bytes" "$boot_available_bytes" "$running_headers_available" "$running_headers_release" "$installed_kernel_header_pair_count" "$installed_kernel_release" "$installed_headers_release" "$boot_selected_kernel_match_count" "$boot_selected_kernel_release" "$boot_kernel_override_conflicting" "$unsafe_overlay_present" "$external_hyperpixel_overlay_count" "$external_hyperpixel_module_loaded" "$unexpected_hyperpixel_module_loaded" "$hyperpixel_state_dir_safe" "$hyperpixel_transaction_active" "$legacy_checkpoint_active" "$external_hyperpixel_binding_count" "$gpio_display_state_safe""#,
+    r#"printf '{"model":"%s","os_id":"%s","os_version":"%s","architecture":"%s","kernel_release":"%s","kernel_vermagic":"%s","default_target":"%s","display_manager_active":%s,"boot_config":"%s","boot_config_regular":%s,"tryboot_supported":%s,"clock_synchronized":%s,"system_time_unix":%s,"package_repository_reachable":%s,"port_80_free":%s,"root_available_bytes":%s,"boot_available_bytes":%s,"running_headers_available":%s,"running_headers_release":"%s","installed_kernel_header_pair_count":%s,"installed_kernel_release":"%s","installed_headers_release":"%s","boot_selected_kernel_match_count":%s,"boot_selected_kernel_release":"%s","boot_kernel_override_conflicting":%s,"unsafe_overlay_present":%s,"hyperpixel_declaration_count":%s,"replace_overlay":"%s","external_hyperpixel_overlay_count":%s,"external_hyperpixel_module_loaded":%s,"unexpected_hyperpixel_module_loaded":%s,"hyperpixel_state_dir_safe":%s,"hyperpixel_transaction_active":%s,"legacy_checkpoint_active":%s,"external_hyperpixel_binding_count":%s,"gpio_display_state_safe":%s}' "#,
+    r#""$model" "$os_id" "$os_version" "$architecture" "$kernel_release" "$kernel_vermagic" "$default_target" "$display_manager_active" "$boot_config" "$boot_config_regular" "$tryboot_supported" "$clock_synchronized" "$system_time_unix" "$package_repository_reachable" "$port_80_free" "$root_available_bytes" "$boot_available_bytes" "$running_headers_available" "$running_headers_release" "$installed_kernel_header_pair_count" "$installed_kernel_release" "$installed_headers_release" "$boot_selected_kernel_match_count" "$boot_selected_kernel_release" "$boot_kernel_override_conflicting" "$unsafe_overlay_present" "$hyperpixel_declaration_count" "$replace_overlay" "$external_hyperpixel_overlay_count" "$external_hyperpixel_module_loaded" "$unexpected_hyperpixel_module_loaded" "$hyperpixel_state_dir_safe" "$hyperpixel_transaction_active" "$legacy_checkpoint_active" "$external_hyperpixel_binding_count" "$gpio_display_state_safe""#,
 );
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -557,6 +557,8 @@ pub struct TargetFacts {
     pub boot_selected_kernel_release: String,
     pub boot_kernel_override_conflicting: bool,
     pub unsafe_overlay_present: bool,
+    pub hyperpixel_declaration_count: u8,
+    pub replace_overlay: String,
     pub external_hyperpixel_overlay_count: u8,
     pub external_hyperpixel_module_loaded: bool,
     pub unexpected_hyperpixel_module_loaded: bool,
@@ -571,7 +573,7 @@ impl fmt::Debug for TargetFacts {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("TargetFacts")
-            .field("field_count", &34)
+            .field("field_count", &36)
             .finish_non_exhaustive()
     }
 }
@@ -604,6 +606,10 @@ impl TargetFacts {
             &self.running_headers_release,
             !self.running_headers_available,
         )?;
+        require_canonical_field(&self.replace_overlay, true)?;
+        if !is_supported_hyperpixel_overlay(&self.replace_overlay) {
+            return Err(TargetFactsError::NoncanonicalField);
+        }
         require_kernel_release(&self.kernel_release)?;
         crate::driver::TargetProbe::new(self.kernel_release.clone(), self.kernel_vermagic.clone())
             .map_err(|_| TargetFactsError::NoncanonicalField)?;
@@ -615,6 +621,7 @@ impl TargetFacts {
             || self.boot_available_bytes > MAX_REPORTED_FREE_BYTES
             || self.installed_kernel_header_pair_count > 16
             || self.boot_selected_kernel_match_count > 16
+            || self.hyperpixel_declaration_count > 16
             || self.external_hyperpixel_overlay_count > 16
             || self.external_hyperpixel_binding_count > 16
         {
@@ -643,11 +650,48 @@ impl TargetFacts {
             }
             _ => return Err(TargetFactsError::NoncanonicalField),
         }
+        match self.hyperpixel_declaration_count {
+            0 if self.replace_overlay.is_empty() => {}
+            1 if !self.replace_overlay.is_empty() => {}
+            count if count > 1 && self.replace_overlay.is_empty() => {}
+            _ => return Err(TargetFactsError::NoncanonicalField),
+        }
+        if self.hyperpixel_declaration_count > 1 && !self.unsafe_overlay_present {
+            return Err(TargetFactsError::NoncanonicalField);
+        }
+        if !self.unsafe_overlay_present {
+            let expected_external = u8::from(
+                self.replace_overlay
+                    .strip_prefix("hyperpixel2r-kms-")
+                    .and_then(|suffix| suffix.strip_suffix(".dtbo"))
+                    .is_some(),
+            );
+            if self.external_hyperpixel_overlay_count != expected_external {
+                return Err(TargetFactsError::NoncanonicalField);
+            }
+        }
         if self.gpio_display_state_safe != gpio_display_state_is_safe(self) {
             return Err(TargetFactsError::NoncanonicalField);
         }
         Ok(())
     }
+}
+
+pub(crate) fn is_supported_hyperpixel_overlay(value: &str) -> bool {
+    if value.is_empty() || value == "vc4-kms-dpi-hyperpixel2r" {
+        return true;
+    }
+    let revision = value.strip_prefix("planeradar-hyperpixel2r-").or_else(|| {
+        value
+            .strip_prefix("hyperpixel2r-kms-")
+            .and_then(|suffix| suffix.strip_suffix(".dtbo"))
+    });
+    revision.is_some_and(|revision| {
+        revision.len() == 12
+            && revision
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    })
 }
 
 fn require_canonical_field(value: &str, allow_empty: bool) -> Result<(), TargetFactsError> {

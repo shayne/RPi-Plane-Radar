@@ -83,6 +83,8 @@ fn valid_target_json() -> Vec<u8> {
       "boot_selected_kernel_release":"6.18.34+rpt-rpi-v8",
       "boot_kernel_override_conflicting":false,
       "unsafe_overlay_present":false,
+      "hyperpixel_declaration_count":0,
+      "replace_overlay":"",
       "external_hyperpixel_overlay_count":0,
       "external_hyperpixel_module_loaded":false,
       "unexpected_hyperpixel_module_loaded":false,
@@ -117,6 +119,79 @@ fn target_facts_accept_one_complete_canonical_json_value() {
         facts.kernel_vermagic,
         "6.18.34+rpt-rpi-v8 SMP preempt mod_unload modversions aarch64"
     );
+    assert_eq!(facts.hyperpixel_declaration_count, 0);
+    assert_eq!(facts.replace_overlay, "");
+}
+
+#[test]
+fn target_facts_bind_the_exact_supported_overlay_that_driver_staging_must_replace() {
+    let valid = String::from_utf8(valid_target_json()).expect("fixture utf8");
+    for overlay in [
+        "vc4-kms-dpi-hyperpixel2r",
+        "planeradar-hyperpixel2r-eefaf3ae40fd",
+        "hyperpixel2r-kms-224cc7ab7817.dtbo",
+    ] {
+        let mut existing = valid
+            .replacen(
+                "\"hyperpixel_declaration_count\":0",
+                "\"hyperpixel_declaration_count\":1",
+                1,
+            )
+            .replacen(
+                "\"replace_overlay\":\"\"",
+                &format!("\"replace_overlay\":\"{overlay}\""),
+                1,
+            );
+        if overlay.starts_with("hyperpixel2r-kms-") {
+            existing = existing
+                .replacen(
+                    "\"external_hyperpixel_overlay_count\":0",
+                    "\"external_hyperpixel_overlay_count\":1",
+                    1,
+                )
+                .replacen(
+                    "\"external_hyperpixel_module_loaded\":false",
+                    "\"external_hyperpixel_module_loaded\":true",
+                    1,
+                )
+                .replacen(
+                    "\"external_hyperpixel_binding_count\":0",
+                    "\"external_hyperpixel_binding_count\":1",
+                    1,
+                );
+        }
+        let facts = TargetFacts::parse(existing.as_bytes()).expect("supported existing overlay");
+        assert_eq!(facts.replace_overlay, overlay);
+    }
+
+    for hostile in [
+        valid.replacen(
+            "\"replace_overlay\":\"\"",
+            "\"replace_overlay\":\"foreign-overlay\"",
+            1,
+        ),
+        valid
+            .replacen(
+                "\"hyperpixel_declaration_count\":0",
+                "\"hyperpixel_declaration_count\":1",
+                1,
+            )
+            .replacen(
+                "\"replace_overlay\":\"\"",
+                "\"replace_overlay\":\"hyperpixel2r-kms-224cc7ab7817.dtbo,rotate=90\"",
+                1,
+            ),
+        valid.replacen(
+            "\"hyperpixel_declaration_count\":0",
+            "\"hyperpixel_declaration_count\":1",
+            1,
+        ),
+    ] {
+        assert_eq!(
+            TargetFacts::parse(hostile.as_bytes()),
+            Err(TargetFactsError::NoncanonicalField)
+        );
+    }
 }
 
 #[test]
@@ -453,6 +528,8 @@ fn target_gpio_state_accepts_only_pristine_or_coherent_external_driver() {
     );
 
     let mut external = pristine.clone();
+    external.hyperpixel_declaration_count = 1;
+    external.replace_overlay = "hyperpixel2r-kms-224cc7ab7817.dtbo".into();
     external.external_hyperpixel_overlay_count = 1;
     external.external_hyperpixel_module_loaded = true;
     external.external_hyperpixel_binding_count = 1;
@@ -577,6 +654,8 @@ fn target_gpio_state_accepts_only_pristine_or_coherent_external_driver() {
 fn target_external_hyperpixel_probe_matches_the_driver_lifecycle_contract() {
     for fragment in [
         r#"hyperpixel2r-kms-[0-9a-f]{12}\.dtbo"#,
+        r#"hyperpixel_declaration_count"#,
+        r#"replace_overlay"#,
         r#"hyperpixel_state_dir=/var/lib/hyperpixel2r-kms"#,
         r#"test -L "$hyperpixel_state_dir""#,
         r#"test ! -d "$hyperpixel_state_dir""#,

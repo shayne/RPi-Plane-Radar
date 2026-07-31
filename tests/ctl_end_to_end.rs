@@ -299,6 +299,8 @@ impl FixtureSystem {
             "boot_selected_kernel_release": "6.12.47+rpt-rpi-v8",
             "boot_kernel_override_conflicting": false,
             "unsafe_overlay_present": false,
+            "hyperpixel_declaration_count": 0,
+            "replace_overlay": "",
             "external_hyperpixel_overlay_count": 0,
             "external_hyperpixel_module_loaded": false,
             "unexpected_hyperpixel_module_loaded": false,

@@ -1377,6 +1377,68 @@ fn lifecycle_tools_preserve_bounded_nonzero_and_spawn_diagnostics() {
     ));
 }
 
+#[test]
+fn driver_staging_accepts_only_an_absent_or_exact_supported_overlay_replacement() {
+    for replacement in [
+        "",
+        "vc4-kms-dpi-hyperpixel2r",
+        "planeradar-hyperpixel2r-eefaf3ae40fd",
+        "hyperpixel2r-kms-224cc7ab7817.dtbo",
+    ] {
+        let runner = RecordingRunner::default();
+        let tool = DriverTool::new(
+            runner.clone(),
+            PathBuf::from("/cache/source"),
+            DriverPlan::CrossBuild {
+                source: PathBuf::from("/cache/source"),
+            },
+            DriverContext {
+                target: "pi@raspberrypi.local".into(),
+                kernel_release: "6.18.34+rpt-rpi-v8".into(),
+                kernel_export: PathBuf::from("/cache/kernel"),
+                artifacts: PathBuf::from("/cache/artifacts"),
+                replace_overlay: replacement.into(),
+            },
+            "0.1.0".into(),
+            DRIVER_COMMIT.into(),
+        )
+        .expect("supported replacement context");
+        tool.run(DriverAction::StageTryboot)
+            .expect("stage invocation");
+        let invocations = runner.invocations.lock().expect("invocation lock");
+        assert!(
+            invocations[0]
+                .arguments()
+                .windows(2)
+                .any(|pair| { pair[0] == "--replace-overlay" && pair[1] == replacement })
+        );
+    }
+
+    for replacement in [
+        "foreign-overlay",
+        "hyperpixel2r-kms-224cc7ab7817.dtbo,rotate=90",
+        "../hyperpixel2r-kms-224cc7ab7817.dtbo",
+    ] {
+        let result = DriverTool::new(
+            RecordingRunner::default(),
+            PathBuf::from("/cache/source"),
+            DriverPlan::CrossBuild {
+                source: PathBuf::from("/cache/source"),
+            },
+            DriverContext {
+                target: "pi@raspberrypi.local".into(),
+                kernel_release: "6.18.34+rpt-rpi-v8".into(),
+                kernel_export: PathBuf::from("/cache/kernel"),
+                artifacts: PathBuf::from("/cache/artifacts"),
+                replace_overlay: replacement.into(),
+            },
+            "0.1.0".into(),
+            DRIVER_COMMIT.into(),
+        );
+        assert!(result.is_err(), "accepted replacement {replacement:?}");
+    }
+}
+
 #[derive(Clone, Default)]
 struct RecordingRunner {
     invocations: Arc<Mutex<Vec<Invocation>>>,

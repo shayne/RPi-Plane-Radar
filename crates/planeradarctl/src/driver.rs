@@ -1447,7 +1447,7 @@ impl<R> DriverTool<R> {
             || !context.artifacts.is_absolute()
             || context.target.is_empty()
             || context.target.contains(['\0', '\r', '\n'])
-            || context.replace_overlay.is_empty()
+            || !crate::preflight::is_supported_hyperpixel_overlay(&context.replace_overlay)
             || Version::parse(&driver_version).ok().is_none_or(|version| {
                 !version.pre.is_empty() || version.to_string() != driver_version
             })

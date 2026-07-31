@@ -1057,7 +1057,7 @@ impl<R: TransportCommandRunner, C: Clock> SystemLifecycleBackend<R, C> {
                         .join("kernel-export")
                         .join(&facts.kernel_release),
                     artifacts: self.cache_root.join("driver-artifacts"),
-                    replace_overlay: "vc4-kms-dpi-hyperpixel2r".into(),
+                    replace_overlay: facts.replace_overlay.clone(),
                 },
             )
             .map_err(|_| LifecycleError::Backend)?;
@@ -1093,7 +1093,7 @@ impl<R: TransportCommandRunner, C: Clock> SystemLifecycleBackend<R, C> {
                         .join("kernel-export")
                         .join(&facts.kernel_release),
                     artifacts: self.cache_root.join("driver-artifacts"),
-                    replace_overlay: "vc4-kms-dpi-hyperpixel2r".into(),
+                    replace_overlay: facts.replace_overlay.clone(),
                 },
             )
             .map_err(|_| LifecycleError::Backend)?;
