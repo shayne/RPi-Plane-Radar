@@ -780,22 +780,14 @@ fn release_workflow_pins_actions_and_defers_all_write_authority_to_release_job()
 
 #[test]
 fn packager_rejects_a_dirty_release_source_before_building() {
-    let temporary = tempfile::tempdir().expect("temporary repository");
-    let status = Command::new("git")
-        .args(["clone", "--quiet"])
-        .arg(root())
-        .arg(".")
-        .current_dir(temporary.path())
-        .status()
-        .expect("clone fixture repository");
-    assert!(status.success());
+    let temporary = clean_clone();
     fs::write(temporary.path().join("dirty"), b"not committed").expect("dirty fixture");
     let bin = temporary.path().join("fixture-bin");
     fs::create_dir(&bin).expect("fixture command directory");
     symlink("/bin/bash", bin.join("bash")).expect("fixture bash");
     symlink("/usr/bin/git", bin.join("git")).expect("fixture git");
 
-    let output = Command::new(root().join("scripts/package-release.sh"))
+    let output = package_release_fixture_command()
         .arg("0.1.0-rc.1")
         .current_dir(temporary.path())
         .env("PATH", &bin)
@@ -810,22 +802,47 @@ fn packager_rejects_a_dirty_release_source_before_building() {
     );
 }
 
+fn package_release_fixture_command() -> Command {
+    let mut command = Command::new(root().join("scripts/package-release.sh"));
+    command
+        .env_remove("PLANERADAR_WORKFLOW_REF")
+        .env_remove("PLANERADAR_WORKFLOW_COMMIT");
+    command
+}
+
+#[test]
+fn packager_fixture_commands_clear_outer_workflow_identity() {
+    let command = package_release_fixture_command();
+    for key in ["PLANERADAR_WORKFLOW_REF", "PLANERADAR_WORKFLOW_COMMIT"] {
+        assert!(
+            command
+                .get_envs()
+                .any(|(name, value)| name == key && value.is_none()),
+            "fixture command must clear inherited {key}"
+        );
+    }
+}
+
 fn clean_clone_from(source: &Path) -> tempfile::TempDir {
     let temporary = tempfile::tempdir().expect("temporary repository");
-    let status = Command::new("git")
+    let clone = Command::new("git")
         .args(["clone", "--quiet"])
         .arg(source)
         .arg(".")
         .current_dir(temporary.path())
-        .status()
+        .output()
         .expect("clone fixture repository");
-    assert!(status.success());
+    assert!(
+        clone.status.success(),
+        "fixture clone failed: {}",
+        String::from_utf8_lossy(&clone.stderr)
+    );
     let symbolic_head = Command::new("git")
         .args(["symbolic-ref", "-q", "HEAD"])
         .current_dir(temporary.path())
-        .status()
+        .output()
         .expect("inspect fixture repository HEAD");
-    if !symbolic_head.success() {
+    if !symbolic_head.status.success() {
         let status = Command::new("git")
             .args(["switch", "--create", "fixture-source", "--quiet"])
             .current_dir(temporary.path())
@@ -864,10 +881,8 @@ fn packager_fixture_clone_has_an_attached_head_when_its_source_is_detached() {
 
 #[test]
 fn packager_rejects_unreachable_source_version_mismatch_and_mislabeled_inputs() {
-    let script = root().join("scripts/package-release.sh");
-
     let unreachable = clean_clone();
-    let output = Command::new(&script)
+    let output = package_release_fixture_command()
         .arg("0.1.0-rc.1")
         .current_dir(unreachable.path())
         .env("PLANERADAR_SOURCE_REF", "f".repeat(40))
@@ -878,7 +893,7 @@ fn packager_rejects_unreachable_source_version_mismatch_and_mislabeled_inputs() 
     assert!(String::from_utf8_lossy(&output.stderr).contains("reachable commit"));
 
     let mismatched = clean_clone();
-    let output = Command::new(&script)
+    let output = package_release_fixture_command()
         .arg("9.9.9")
         .current_dir(mismatched.path())
         .env("PLANERADAR_PACKAGE_SKIP_BUILDS", "1")
@@ -899,7 +914,7 @@ fn packager_rejects_unreachable_source_version_mismatch_and_mislabeled_inputs() 
         bin.display(),
         std::env::var("PATH").unwrap_or_default()
     );
-    let output = Command::new(&script)
+    let output = package_release_fixture_command()
         .arg("0.1.0-rc.1")
         .current_dir(mislabeled.path())
         .env("PATH", path)
@@ -916,7 +931,7 @@ fn packager_rejects_unreachable_source_version_mismatch_and_mislabeled_inputs() 
 #[test]
 fn packager_rejects_an_ancestor_that_is_not_the_checked_out_source() {
     let checked_out = clean_clone();
-    let output = Command::new(root().join("scripts/package-release.sh"))
+    let output = package_release_fixture_command()
         .arg("0.1.0-rc.1")
         .current_dir(checked_out.path())
         .env("PLANERADAR_SOURCE_REF", "HEAD^")
@@ -1077,7 +1092,7 @@ tar -cf - -C "$input" "$member" |
         bin.display(),
         std::env::var("PATH").unwrap_or_default()
     );
-    let mut command = Command::new(root().join("scripts/package-release.sh"));
+    let mut command = package_release_fixture_command();
     command
         .arg("0.1.0-rc.1")
         .current_dir(directory)
