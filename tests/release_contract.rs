@@ -1289,6 +1289,8 @@ enum BootstrapScenario {
     PtyPostReapSignalInt,
     PtyPostReapSignalTerm,
     PtyPostClearSignalTerm,
+    PtyTransientCompletionSnapshotFailure,
+    PtyPermanentCompletionSnapshotFailure,
     RepeatedSignalHupThenTerm,
     ExtraArchiveMember,
     DuplicateArchiveMember,
@@ -1351,6 +1353,7 @@ struct BootstrapOutcome {
     initial_continue_handshake_timed_out: bool,
     terminal_handoff_observed: bool,
     control_terminal_trace: String,
+    completion_snapshot_fault_was_injected: bool,
 }
 
 fn open_release_pty() -> (File, File) {
@@ -1453,6 +1456,8 @@ fn bootstrap_fixture_outcome(scenario: BootstrapScenario) -> BootstrapOutcome {
     let initial_continue_timeout_record = temporary.path().join("initial-continue-timeout");
     let terminal_handoff_record = temporary.path().join("terminal-handoff");
     let control_terminal_trace_record = temporary.path().join("control-terminal-trace");
+    let completion_published_record = temporary.path().join("completion-published");
+    let completion_snapshot_fault_record = temporary.path().join("completion-snapshot-fault");
     let pty_scenario = matches!(
         scenario,
         BootstrapScenario::PtySuccess
@@ -1472,6 +1477,8 @@ fn bootstrap_fixture_outcome(scenario: BootstrapScenario) -> BootstrapOutcome {
             | BootstrapScenario::PtyPostReapSignalInt
             | BootstrapScenario::PtyPostReapSignalTerm
             | BootstrapScenario::PtyPostClearSignalTerm
+            | BootstrapScenario::PtyTransientCompletionSnapshotFailure
+            | BootstrapScenario::PtyPermanentCompletionSnapshotFailure
     );
 
     let control_mode = if matches!(
@@ -1666,6 +1673,8 @@ if arguments and arguments[0] == "--__planeradar-bootstrap-v1":
     ready.write(f"{{completion}}\n")
     ready.flush()
     os.fsync(ready.fileno())
+    with open(os.environ["PLANERADAR_COMPLETION_PUBLISHED_RECORD"], "w", encoding="utf-8") as record:
+        record.write("published\n")
     os.killpg(os.getpgrp(), signal.SIGSTOP)
     os._exit(worker_status)
 
@@ -2050,6 +2059,23 @@ finally:
         r#"#!/bin/sh
 case "$*" in
   *"ppid= -o pgid= -o state="*)
+    if test -f "$PLANERADAR_COMPLETION_PUBLISHED_RECORD"; then
+      case "${PLANERADAR_COMPLETION_PS_SCENARIO:-}" in
+        transient)
+          attempts=0
+          if test -f "$PLANERADAR_COMPLETION_SNAPSHOT_FAULT_RECORD"; then
+            attempts="$(cat "$PLANERADAR_COMPLETION_SNAPSHOT_FAULT_RECORD")"
+          fi
+          attempts=$((attempts + 1))
+          printf '%s\n' "$attempts" >"$PLANERADAR_COMPLETION_SNAPSHOT_FAULT_RECORD"
+          test "$attempts" -gt 3 || exit 71
+          ;;
+        permanent)
+          printf 'permanent\n' >"$PLANERADAR_COMPLETION_SNAPSHOT_FAULT_RECORD"
+          exit 71
+          ;;
+      esac
+    fi
     case "${PLANERADAR_BARRIER_PS_SCENARIO:-}" in
       failure) exit 71 ;;
       parent)
@@ -2466,6 +2492,22 @@ printf '%s %s %s\n' "$original_pgid" "$installer_status" "$restored_tpgid" \
         .env(
             "PLANERADAR_CONTROL_TERMINAL_TRACE_RECORD",
             &control_terminal_trace_record,
+        )
+        .env(
+            "PLANERADAR_COMPLETION_PUBLISHED_RECORD",
+            &completion_published_record,
+        )
+        .env(
+            "PLANERADAR_COMPLETION_SNAPSHOT_FAULT_RECORD",
+            &completion_snapshot_fault_record,
+        )
+        .env(
+            "PLANERADAR_COMPLETION_PS_SCENARIO",
+            match scenario {
+                BootstrapScenario::PtyTransientCompletionSnapshotFailure => "transient",
+                BootstrapScenario::PtyPermanentCompletionSnapshotFailure => "permanent",
+                _ => "",
+            },
         )
         .env(
             "PLANERADAR_REQUIRE_TERMINAL_HANDOFF",
@@ -2966,6 +3008,7 @@ printf '%s %s %s\n' "$original_pgid" "$installer_status" "$restored_tpgid" \
         terminal_handoff_observed: terminal_handoff_record.exists(),
         control_terminal_trace: fs::read_to_string(control_terminal_trace_record)
             .unwrap_or_default(),
+        completion_snapshot_fault_was_injected: completion_snapshot_fault_record.exists(),
     }
 }
 
@@ -3703,6 +3746,41 @@ fn bootstrap_real_pty_post_reap_signals_restore_foreground_before_conventional_e
         assert!(outcome.control_processes_alive.is_empty());
         assert_pty_foreground_restored(&outcome);
     }
+}
+
+#[test]
+fn bootstrap_real_pty_retries_transient_authenticated_completion_snapshot_failures() {
+    let outcome =
+        bootstrap_fixture_outcome(BootstrapScenario::PtyTransientCompletionSnapshotFailure);
+    assert_eq!(
+        outcome.status_code,
+        Some(0),
+        "transient completion sampling failed; stdout={} stderr={} terminal_trace={}",
+        outcome.stdout,
+        outcome.stderr,
+        outcome.control_terminal_trace
+    );
+    assert!(
+        outcome.completion_snapshot_fault_was_injected,
+        "fixture did not inject the authenticated completion sampling fault"
+    );
+    assert!(outcome.control_processes_alive.is_empty());
+    assert!(outcome.private_residue.is_empty());
+    assert_pty_foreground_restored(&outcome);
+}
+
+#[test]
+fn bootstrap_real_pty_permanent_authenticated_completion_snapshot_failure_fails_closed() {
+    let outcome =
+        bootstrap_fixture_outcome(BootstrapScenario::PtyPermanentCompletionSnapshotFailure);
+    assert_eq!(outcome.status_code, Some(1));
+    assert!(
+        outcome.completion_snapshot_fault_was_injected,
+        "fixture did not inject the permanent completion sampling fault"
+    );
+    assert!(outcome.control_processes_alive.is_empty());
+    assert!(outcome.private_residue.is_empty());
+    assert_pty_foreground_restored(&outcome);
 }
 
 #[test]

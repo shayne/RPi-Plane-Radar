@@ -281,34 +281,52 @@ await_control_barrier() {
   return 1
 }
 read_control_completion() {
-  awk -v readiness="$control_readiness" '
-    NR == 1 && $0 != readiness { exit 1 }
-    NR == 2 { completion = $0 }
-    NR > 2 { exit 1 }
-    END {
-      if (NR == 2) {
-        print completion
-      } else {
-        exit 1
-      }
-    }
-  ' "$control_barrier" 2>/dev/null
+  local readiness completion extra
+  {
+    IFS= read -r readiness || return 1
+    IFS= read -r completion || return 1
+    extra=""
+    if IFS= read -r extra || [[ -n "$extra" ]]; then
+      return 1
+    fi
+  } <"$control_barrier" 2>/dev/null
+  [[ "$readiness" == "$control_readiness" ]] || return 1
+  printf '%s\n' "$completion"
 }
 await_control_completion() {
   local completion completion_status snapshot
-  local control_started=0 resume_attempt=0
+  local authenticated_completion_status=""
+  local control_started=0 resume_attempt=0 completion_snapshot_attempt=0
   while :; do
     completion_status=""
     completion="$(read_control_completion)" || completion=""
     if [[ "$completion" =~ ^complete\ ([0-9]|[1-9][0-9]|1[0-9][0-9]|2[0-4][0-9]|25[0-5])$ ]]; then
       completion_status=${BASH_REMATCH[1]}
+      if [[ -n "$authenticated_completion_status" &&
+            "$completion_status" != "$authenticated_completion_status" ]]; then
+        return 1
+      fi
+      authenticated_completion_status=$completion_status
+    elif [[ -n "$authenticated_completion_status" ]]; then
+      completion_status=$authenticated_completion_status
     fi
-    snapshot="$(ps -o ppid= -o pgid= -o state= -p "$control_pid" 2>/dev/null)" ||
-      return 1
+    if ! snapshot="$(ps -o ppid= -o pgid= -o state= -p "$control_pid" 2>/dev/null)"; then
+      [[ -n "$authenticated_completion_status" ]] || return 1
+      ((completion_snapshot_attempt += 1))
+      [[ $completion_snapshot_attempt -lt 200 ]] || return 1
+      /bin/sleep 0.01
+      continue
+    fi
     set -- $snapshot
     [[ $# -eq 3 && "$1" == "$$" && "$2" == "$control_pid" ]] || return 1
     [[ "$3" != Z* ]] || return 1
     if [[ "$3" == T* ]]; then
+      if [[ -n "$authenticated_completion_status" ]]; then
+        completion="$(read_control_completion)" || return 1
+        [[ "$completion" =~ ^complete\ ([0-9]|[1-9][0-9]|1[0-9][0-9]|2[0-4][0-9]|25[0-5])$ &&
+           "${BASH_REMATCH[1]}" == "$authenticated_completion_status" ]] || return 1
+        completion_status=$authenticated_completion_status
+      fi
       if [[ -z "$completion_status" ]]; then
         if [[ $control_started -eq 0 && -z "$completion" ]]; then
           ((resume_attempt += 1))
@@ -329,6 +347,12 @@ await_control_completion() {
       return 0
     fi
     control_started=1
+    if [[ -n "$authenticated_completion_status" ]]; then
+      ((completion_snapshot_attempt += 1))
+      [[ $completion_snapshot_attempt -lt 200 ]] || return 1
+      /bin/sleep 0.01
+      continue
+    fi
     /bin/sleep 0.05
   done
 }
