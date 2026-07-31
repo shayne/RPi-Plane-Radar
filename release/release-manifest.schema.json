@@ -58,7 +58,10 @@
           "const": "shayne/RPi-Plane-Radar"
         },
         "path": {
-          "const": ".github/workflows/release.yml"
+          "enum": [
+            ".github/workflows/release.yml",
+            ".github/workflows/stable-draft.yml"
+          ]
         },
         "ref": {
           "type": "string",

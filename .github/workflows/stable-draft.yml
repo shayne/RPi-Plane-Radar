@@ -1,14 +1,14 @@
-name: Publish Plane Radar release candidate
+name: Create unpublished stable app draft
 
 on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Unused semantic release tag, for example v0.1.0-rc.1
+        description: Canonical stable tag, for example v0.1.0
         required: true
         type: string
       source_ref:
-        description: Exact source branch, tag, or commit to release
+        description: Exact stable source branch
         default: main
         required: true
         type: string
@@ -32,19 +32,19 @@ jobs:
         id: source
         env:
           TAG: ${{ inputs.tag }}
+          SOURCE_REF: ${{ inputs.source_ref }}
         run: |
           git diff --quiet
           git diff --cached --quiet
           git fetch --no-tags origin "$GITHUB_SHA"
-          git cat-file -e "$GITHUB_SHA:.github/workflows/release.yml"
+          git cat-file -e "$GITHUB_SHA:.github/workflows/stable-draft.yml"
           source_commit="$(git rev-parse 'HEAD^{commit}')"
           test "$source_commit" = "$GITHUB_SHA"
-          git cat-file -e "$source_commit:.github/workflows/release.yml"
-          version="${TAG#v}"
-          test "$TAG" = "v$version"
-          [[ "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-rc\.([1-9][0-9]*)$ ]]
-          package_version="$(sed -n '/^\[package\]$/,/^\[/s/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)"
-          test "${version%%-*}" = "$package_version"
+          git cat-file -e "$source_commit:.github/workflows/stable-draft.yml"
+          test "$GITHUB_REPOSITORY" = shayne/RPi-Plane-Radar
+          test "$GITHUB_REF" = refs/heads/main
+          test "$SOURCE_REF" = main
+          ./scripts/validate-stable-release-tag.sh "$TAG" "$source_commit"
           git fetch --tags --force
           ! git rev-parse --verify --quiet "refs/tags/$TAG"
           printf 'commit=%s\n' "$source_commit" >>"$GITHUB_OUTPUT"
@@ -82,6 +82,30 @@ jobs:
             dist/planeradar.sha256
           if-no-files-found: error
           retention-days: 1
+
+  verify-source:
+    needs: resolve
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: Check out exact source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.resolve.outputs.commit }}
+
+      - name: Set up mise
+        uses: jdx/mise-action@9e7f7633ff6f6d6048a9418a68d48f288f50eb14 # v4.2.3
+
+      - name: Install native verification dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes libsdl2-dev pkg-config zstd
+
+      - name: Verify exact stable source
+        env:
+          RELEASE_COMMIT: ${{ needs.resolve.outputs.commit }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$RELEASE_COMMIT"
+          mise run verify
 
   control:
     needs: resolve
@@ -121,7 +145,7 @@ jobs:
           retention-days: 1
 
   verify-release:
-    needs: [resolve, linux, control]
+    needs: [resolve, verify-source, linux, control]
     runs-on: macos-15
     steps:
       - name: Check out exact source
@@ -138,7 +162,7 @@ jobs:
         with:
           path: dist/inputs
 
-      - name: Verify complete release twice
+      - name: Verify complete stable release twice
         env:
           RELEASE_COMMIT: ${{ needs.resolve.outputs.commit }}
           VERSION: ${{ inputs.tag }}
@@ -159,7 +183,7 @@ jobs:
           (cd dist/release && shasum -a 256 -c SHA256SUMS)
           PLANERADAR_RELEASE_FIXTURE_DIR="$PWD/dist/release" mise exec -- cargo test --test release_contract -- --test-threads=1
 
-      - name: Upload verified exact release
+      - name: Upload verified exact stable release
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: verified-release
@@ -167,7 +191,7 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-  release:
+  draft:
     needs: [resolve, verify-release]
     runs-on: ubuntu-24.04
     permissions:
@@ -175,19 +199,19 @@ jobs:
       id-token: write
       attestations: write
     steps:
-      - name: Check out exact verified source without running it
+      - name: Check out exact verified stable source without running it
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.resolve.outputs.commit }}
           fetch-depth: 0
 
-      - name: Download verified release
+      - name: Download verified stable release
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: verified-release
           path: dist/release
 
-      - name: Verify complete release
+      - name: Verify complete stable release
         env:
           RELEASE_COMMIT: ${{ needs.resolve.outputs.commit }}
         run: |
@@ -198,62 +222,39 @@ jobs:
             dist/release/release-manifest.json \
             dist/release/SBOM.spdx.json
           test "$(jq -r .source_commit dist/release/release-manifest.json)" = "$RELEASE_COMMIT"
-          test "$(jq -r .workflow.path dist/release/release-manifest.json)" = ".github/workflows/release.yml"
+          test "$(jq -r .workflow.path dist/release/release-manifest.json)" = ".github/workflows/stable-draft.yml"
 
-      - name: Create annotated tag
-        id: tag
-        env:
-          TAG: ${{ inputs.tag }}
-          RELEASE_COMMIT: ${{ needs.resolve.outputs.commit }}
-        run: |
-          git fetch --tags --force
-          ! git rev-parse --verify --quiet "refs/tags/$TAG"
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git tag --annotate "$TAG" "$RELEASE_COMMIT" --message "RPi Plane Radar $TAG"
-          git push origin "refs/tags/$TAG:refs/tags/$TAG"
-          test "$(git rev-parse "$TAG^{}")" = "$RELEASE_COMMIT"
-
-      - name: Attest release subjects
+      - name: Attest every stable draft subject
         uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
         with:
           subject-checksums: dist/release/SHA256SUMS
 
-      - name: Attest release checksum manifest
+      - name: Attest stable checksum manifest
         uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
         with:
           subject-path: dist/release/SHA256SUMS
 
-      - name: Attest SPDX SBOM for every runnable archive
+      - name: Attest SPDX SBOM for every runnable stable archive
         uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
         with:
           subject-path: dist/release/*.tar.zst
           sbom-path: dist/release/SBOM.spdx.json
 
-      - name: Create draft prerelease
-        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
-        with:
-          tag_name: ${{ inputs.tag }}
-          target_commitish: ${{ needs.resolve.outputs.commit }}
-          name: RPi Plane Radar ${{ inputs.tag }}
-          draft: true
-          prerelease: true
-          fail_on_unmatched_files: true
-          files: dist/release/*
-
-      - name: Publish the verified prerelease
+      - name: Create unpublished stable draft without a tag
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ inputs.tag }}
+          RELEASE_COMMIT: ${{ needs.resolve.outputs.commit }}
         run: |
-          publish_status=0
-          gh release edit "$TAG" --draft=false --prerelease \
-            --title "RPi Plane Radar $TAG" || publish_status=$?
-          release_state="$(gh release view "$TAG" \
-            --json tagName,isDraft,isPrerelease)"
-          test "$(jq -r .tagName <<<"$release_state")" = "$TAG"
-          test "$(jq -r .isDraft <<<"$release_state")" = false
-          test "$(jq -r .isPrerelease <<<"$release_state")" = true
-          if test "$publish_status" -ne 0; then
-            printf 'The publication response was lost after the exact prerelease became public.\n'
-          fi
+          record="$RUNNER_TEMP/stable-draft-record.json"
+          python3 scripts/stable_release.py draft \
+            --tag "$TAG" \
+            --commit "$RELEASE_COMMIT" \
+            --assets dist/release \
+            --record "$record"
+          PLANERADAR_STABLE_DRAFT_RELEASE_ID="$(jq -r .release_id "$record")"
+          PLANERADAR_STABLE_DRAFT_ASSET_FINGERPRINT="$(jq -r .asset_fingerprint "$record")"
+          {
+            printf 'Stable draft release ID: `%s`\n\n' "$PLANERADAR_STABLE_DRAFT_RELEASE_ID"
+            printf 'Stable draft asset fingerprint: `%s`\n' "$PLANERADAR_STABLE_DRAFT_ASSET_FINGERPRINT"
+          } >> "$GITHUB_STEP_SUMMARY"

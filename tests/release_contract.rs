@@ -59,11 +59,15 @@ fn release_entrypoints_and_mise_task_are_checked_in() {
     for path in [
         "scripts/package-release.sh",
         "scripts/install.sh",
+        "scripts/stable_release.py",
         "scripts/validate-release-metadata.sh",
+        "scripts/validate-stable-release-tag.sh",
         "release/validator-requirements.in",
         "release/validator-requirements.txt",
         ".config/nextest.toml",
         ".github/workflows/release.yml",
+        ".github/workflows/stable-draft.yml",
+        ".github/workflows/stable-promote.yml",
     ] {
         let metadata = fs::metadata(root().join(path)).expect(path);
         assert!(metadata.is_file(), "{path} must be a regular file");
@@ -74,11 +78,92 @@ fn release_entrypoints_and_mise_task_are_checked_in() {
     assert!(mise.contains("./scripts/package-release.sh"));
     assert!(mise.contains("[tasks.validate-release-metadata]"));
     assert!(mise.contains("./scripts/validate-release-metadata.sh"));
+    assert!(mise.contains("[tasks.validate-stable-release-tag]"));
+    assert!(mise.contains("./scripts/validate-stable-release-tag.sh"));
     assert!(
         mise.contains("CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER = \"/usr/bin/clang\"")
             && mise.contains("CARGO_TARGET_X86_64_APPLE_DARWIN_LINKER = \"/usr/bin/clang\""),
         "both native macOS release targets must bypass non-Apple cc shims"
     );
+}
+
+#[test]
+fn stable_release_state_machine_is_hostile_state_tested() {
+    let output = Command::new("python3")
+        .arg(root().join("tests/stable_release_contract.py"))
+        .output()
+        .expect("run stable release state-machine contract");
+    assert!(
+        output.status.success(),
+        "stable release state-machine contract failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn stable_workflows_promote_the_exact_accepted_draft_without_rebuilding() {
+    let draft = read(".github/workflows/stable-draft.yml");
+    let promote = read(".github/workflows/stable-promote.yml");
+
+    for required in [
+        "Create unpublished stable app draft",
+        "refs/heads/main",
+        "mise run verify",
+        "mise run package-release",
+        "diff -r",
+        "Attest every stable draft subject",
+        "subject-path: dist/release/SHA256SUMS",
+        "Create unpublished stable draft without a tag",
+        "scripts/stable_release.py draft",
+    ] {
+        assert!(
+            draft.contains(required),
+            "stable draft workflow is missing {required:?}"
+        );
+    }
+    for required in [
+        "Promote accepted stable app draft",
+        "source_commit",
+        "release_id",
+        "asset_fingerprint",
+        "scripts/stable_release.py verify",
+        "gh attestation verify",
+        "gh attestation verify \"$downloads/SHA256SUMS\"",
+        "scripts/stable_release.py publish",
+        "scripts/stable_release.py confirm",
+        "gh release verify \"$TAG\"",
+        "gh release verify-asset \"$TAG\"",
+    ] {
+        assert!(
+            promote.contains(required),
+            "stable promotion workflow is missing {required:?}"
+        );
+    }
+    assert!(
+        !promote.contains("cargo build")
+            && !promote.contains("mise run build-pi")
+            && !promote.contains("mise run package-release")
+            && !promote.contains("actions/upload-artifact"),
+        "stable promotion must verify and publish the accepted draft without rebuilding or reuploading"
+    );
+    for workflow in [&draft, &promote] {
+        for line in workflow
+            .lines()
+            .filter(|line| line.trim().starts_with("uses:"))
+        {
+            let revision = line
+                .split_once('@')
+                .map(|(_, revision)| revision.split_whitespace().next().unwrap_or(""))
+                .expect("stable action pin");
+            assert_eq!(
+                revision.len(),
+                40,
+                "stable third-party action must use a full commit SHA: {line}"
+            );
+            assert!(revision.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        }
+    }
 }
 
 #[test]
@@ -459,6 +544,20 @@ fn release_workflow_pins_actions_and_defers_all_write_authority_to_release_job()
     assert!(workflow.contains("draft: true"));
     assert!(workflow.contains("prerelease: true"));
     assert!(
+        workflow.contains(r#"[[ "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-rc\.([1-9][0-9]*)$ ]]"#),
+        "the candidate workflow must reject stable-looking and unnumbered tags"
+    );
+    assert!(
+        workflow.contains(
+            r#"test "$(jq -r .workflow.path dist/release/release-manifest.json)" = ".github/workflows/release.yml""#
+        ),
+        "the candidate workflow must prove the packaged signer path before tagging"
+    );
+    assert!(
+        workflow.contains("subject-path: dist/release/SHA256SUMS"),
+        "the checksum manifest is a public asset and needs its own provenance attestation"
+    );
+    assert!(
         workflow.contains(
             "PLANERADAR_RELEASE_FIXTURE_DIR=\"$PWD/dist/release\" mise exec -- cargo test --test release_contract -- --test-threads=1"
         ),
@@ -475,7 +574,14 @@ fn release_workflow_pins_actions_and_defers_all_write_authority_to_release_job()
     let release = workflow
         .find("Create draft prerelease")
         .expect("draft release");
-    assert!(verify < tag && tag < attest && attest < release);
+    let publish = workflow
+        .find("Publish the verified prerelease")
+        .expect("prerelease publication");
+    assert!(verify < tag && tag < attest && attest < release && release < publish);
+    assert!(
+        workflow.contains("gh release edit \"$TAG\" --draft=false --prerelease"),
+        "the successful release workflow must make the verified candidate installable"
+    );
 
     for line in workflow
         .lines()
@@ -1566,7 +1672,7 @@ finally:
     fs::write(
         fixture.join("release-manifest.json"),
         format!(
-            r#"{{"version":"0.1.0","source_commit":"{manifest_commit}","workflow":{{"ref":"refs/heads/main","commit":"{manifest_commit}"}},"artifacts":{{"planeradarctl-aarch64-apple-darwin.tar.zst":{{"kind":"control","platform":"apple-darwin","architecture":"aarch64","size":{archive_size},"sha256":"{archive_digest}"}}}}}}"#
+            r#"{{"version":"0.1.0","source_commit":"{manifest_commit}","workflow":{{"path":".github/workflows/stable-draft.yml","ref":"refs/heads/main","commit":"{manifest_commit}"}},"artifacts":{{"planeradarctl-aarch64-apple-darwin.tar.zst":{{"kind":"control","platform":"apple-darwin","architecture":"aarch64","size":{archive_size},"sha256":"{archive_digest}"}}}}}}"#
         ),
     )
     .expect("manifest fixture");

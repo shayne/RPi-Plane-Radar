@@ -1,0 +1,173 @@
+name: Promote accepted stable app draft
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Canonical accepted stable tag
+        required: true
+        type: string
+      source_commit:
+        description: Full accepted source commit
+        required: true
+        type: string
+      release_id:
+        description: Durable GitHub draft release ID
+        required: true
+        type: string
+      asset_fingerprint:
+        description: Accepted ID, name, size, and digest fingerprint
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  promote:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out accepted stable source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.source_commit }}
+          fetch-depth: 0
+
+      - name: Set up mise
+        uses: jdx/mise-action@9e7f7633ff6f6d6048a9418a68d48f288f50eb14 # v4.2.3
+
+      - name: Install stable verification tools
+        run: sudo apt-get update && sudo apt-get install --yes zstd
+
+      - name: Confirm promotion inputs
+        env:
+          TAG: ${{ inputs.tag }}
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+          RELEASE_ID: ${{ inputs.release_id }}
+          ASSET_FINGERPRINT: ${{ inputs.asset_fingerprint }}
+          DISPATCH_COMMIT: ${{ github.sha }}
+        run: |
+          test "$GITHUB_REPOSITORY" = shayne/RPi-Plane-Radar
+          test "$GITHUB_REF" = refs/heads/main
+          test "$(git rev-parse 'HEAD^{commit}')" = "$SOURCE_COMMIT"
+          git cat-file -e "$DISPATCH_COMMIT:.github/workflows/stable-promote.yml"
+          ./scripts/validate-stable-release-tag.sh "$TAG" "$SOURCE_COMMIT"
+          [[ "$RELEASE_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$ASSET_FINGERPRINT" =~ ^[0-9a-f]{64}$ ]]
+
+      - name: Download the exact accepted stable draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+          RELEASE_ID: ${{ inputs.release_id }}
+          ASSET_FINGERPRINT: ${{ inputs.asset_fingerprint }}
+        run: |
+          python3 scripts/stable_release.py verify \
+            --tag "$TAG" \
+            --commit "$SOURCE_COMMIT" \
+            --release-id "$RELEASE_ID" \
+            --asset-fingerprint "$ASSET_FINGERPRINT" \
+            --downloads "$RUNNER_TEMP/stable-accepted" \
+            --record "$RUNNER_TEMP/stable-verification.json"
+
+      - name: Verify stable checksums, schema, SPDX, archives, and source identity
+        env:
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+        run: |
+          downloads="$RUNNER_TEMP/stable-accepted"
+          (
+            cd "$downloads"
+            sha256sum -c SHA256SUMS
+          )
+          mise run validate-release-metadata -- \
+            "$downloads/release-manifest.json" \
+            "$downloads/SBOM.spdx.json"
+          source_tree="$(git rev-parse "$SOURCE_COMMIT^{tree}")"
+          jq -e --arg commit "$SOURCE_COMMIT" --arg tree "$source_tree" \
+            '.source_commit == $commit
+             and .source_tree == $tree
+             and .workflow.path == ".github/workflows/stable-draft.yml"' \
+            "$downloads/release-manifest.json" >/dev/null
+          for archive in "$downloads"/*.tar.zst; do
+            expanded="$RUNNER_TEMP/$(basename "${archive%.zst}")"
+            zstd -q -d -c "$archive" > "$expanded"
+            python3 - "$expanded" <<'PY'
+          import pathlib
+          import sys
+          import tarfile
+          with tarfile.open(sys.argv[1]) as archive:
+              members = archive.getmembers()
+              assert members
+              for member in members:
+                  path = pathlib.PurePosixPath(member.name)
+                  assert not path.is_absolute()
+                  assert ".." not in path.parts
+                  assert not member.issym()
+                  assert not member.islnk()
+          PY
+          done
+
+      - name: Verify stable draft attestations
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+        run: |
+          downloads="$RUNNER_TEMP/stable-accepted"
+          gh attestation verify "$downloads/SHA256SUMS" \
+            --repo shayne/RPi-Plane-Radar \
+            --signer-repo shayne/RPi-Plane-Radar \
+            --signer-workflow shayne/RPi-Plane-Radar/.github/workflows/stable-draft.yml \
+            --source-ref refs/heads/main \
+            --source-digest "$SOURCE_COMMIT" \
+            --deny-self-hosted-runners
+          while read -r digest name extra; do
+            test -z "$extra"
+            test -n "$digest" && test -n "$name"
+            gh attestation verify "$downloads/$name" \
+              --repo shayne/RPi-Plane-Radar \
+              --signer-repo shayne/RPi-Plane-Radar \
+              --signer-workflow shayne/RPi-Plane-Radar/.github/workflows/stable-draft.yml \
+              --source-ref refs/heads/main \
+              --source-digest "$SOURCE_COMMIT" \
+              --deny-self-hosted-runners
+          done < "$downloads/SHA256SUMS"
+          for archive in "$downloads"/*.tar.zst; do
+            gh attestation verify "$archive" \
+              --repo shayne/RPi-Plane-Radar \
+              --signer-repo shayne/RPi-Plane-Radar \
+              --signer-workflow shayne/RPi-Plane-Radar/.github/workflows/stable-draft.yml \
+              --source-ref refs/heads/main \
+              --source-digest "$SOURCE_COMMIT" \
+              --predicate-type https://spdx.dev/Document/v2.3 \
+              --deny-self-hosted-runners
+          done
+
+      - name: Create annotated tag and publish the unchanged draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          python3 scripts/stable_release.py publish \
+            --record "$RUNNER_TEMP/stable-verification.json" \
+            --downloads "$RUNNER_TEMP/stable-accepted" \
+            --result "$RUNNER_TEMP/stable-publication.json"
+
+      - name: Verify published stable identity
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          python3 scripts/stable_release.py confirm \
+            --record "$RUNNER_TEMP/stable-publication.json"
+          downloads="$RUNNER_TEMP/stable-accepted"
+          gh release verify "$TAG" --repo shayne/RPi-Plane-Radar
+          gh release verify-asset "$TAG" "$downloads/SHA256SUMS" \
+            --repo shayne/RPi-Plane-Radar
+          while read -r digest name extra; do
+            test -z "$extra"
+            test -n "$digest" && test -n "$name"
+            gh release verify-asset "$TAG" "$downloads/$name" \
+              --repo shayne/RPi-Plane-Radar
+          done < "$downloads/SHA256SUMS"

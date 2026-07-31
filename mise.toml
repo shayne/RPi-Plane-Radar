@@ -35,6 +35,9 @@ run = './scripts/package-release.sh "$@"'
 [tasks.validate-release-metadata]
 run = './scripts/validate-release-metadata.sh "$@"'
 
+[tasks.validate-stable-release-tag]
+run = './scripts/validate-stable-release-tag.sh "$@"'
+
 [tasks.docs-check]
 run = "cargo test --locked --test docs_contract"
 

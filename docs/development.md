@@ -117,6 +117,9 @@ Stable publication is a separate acceptance decision. A green archive build
 does not prove a round panel displayed the right colors or that a tryboot
 survived a cold power cycle.
 
+[Releasing](releasing.md) documents the candidate, tagless stable draft, exact
+hardware acceptance, and no-rebuild promotion commands.
+
 ## Fixture and live smoke
 
 The fixture end-to-end test is part of normal verification:

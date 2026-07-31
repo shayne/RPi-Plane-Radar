@@ -431,6 +431,48 @@ fn rejects_workflow_refs_that_cannot_be_the_dispatch_oidc_ref() {
 }
 
 #[test]
+fn release_kind_requires_its_exact_signing_workflow() {
+    let candidate = valid_value();
+    assert!(
+        parse_value(&candidate, "0.1.0-rc.1").is_ok(),
+        "release candidates must accept the candidate workflow"
+    );
+
+    let mut candidate_with_stable_workflow = candidate.clone();
+    set_path(
+        &mut candidate_with_stable_workflow,
+        "/workflow/path",
+        json!(".github/workflows/stable-draft.yml"),
+    );
+    assert!(
+        parse_value(&candidate_with_stable_workflow, "0.1.0-rc.1").is_err(),
+        "release candidates must reject the stable signer workflow"
+    );
+
+    let mut stable = candidate;
+    set_version(&mut stable, "0.1.0");
+    set_path(
+        &mut stable,
+        "/workflow/path",
+        json!(".github/workflows/stable-draft.yml"),
+    );
+    assert!(
+        parse_value(&stable, "0.1.0").is_ok(),
+        "stable releases must accept only the stable draft workflow"
+    );
+
+    set_path(
+        &mut stable,
+        "/workflow/path",
+        json!(".github/workflows/release.yml"),
+    );
+    assert!(
+        parse_value(&stable, "0.1.0").is_err(),
+        "stable releases must reject the candidate signer workflow"
+    );
+}
+
+#[test]
 fn rejects_wrong_supported_target_and_artifact_architecture() {
     for (pointer, replacement) in [
         ("/supported/model", json!("Raspberry Pi 4 Model B")),
@@ -1208,6 +1250,11 @@ fn production_release_source_builds_fixed_no_shell_gh_download_vectors() {
     let runner = RecordingStreamingRunner::default();
     let mut stable_manifest = valid_value();
     set_version(&mut stable_manifest, "0.1.0");
+    set_path(
+        &mut stable_manifest,
+        "/workflow/path",
+        json!(".github/workflows/stable-draft.yml"),
+    );
     runner.set(
         "release-manifest.json",
         serde_json::to_vec(&stable_manifest).expect("stable manifest"),
@@ -1346,6 +1393,11 @@ impl CommandRunner for &MutatingCommandRunner {
 fn stable_resolved(root: &Path) -> ResolvedRelease {
     let mut value = valid_value();
     set_version(&mut value, "0.1.0");
+    set_path(
+        &mut value,
+        "/workflow/path",
+        json!(".github/workflows/stable-draft.yml"),
+    );
     let manifest = parse_value(&value, "0.1.0").expect("stable manifest");
     resolved_from_manifest(root, manifest)
 }
@@ -1414,7 +1466,7 @@ fn stable_release_verification_uses_exact_gh_vectors_for_every_runnable_artifact
                 "-R".into(),
                 "shayne/RPi-Plane-Radar".into(),
                 "--signer-workflow".into(),
-                "shayne/RPi-Plane-Radar/.github/workflows/release.yml".into(),
+                "shayne/RPi-Plane-Radar/.github/workflows/stable-draft.yml".into(),
                 "--source-ref".into(),
                 "refs/heads/main".into(),
                 "--source-digest".into(),
@@ -1491,6 +1543,11 @@ fn stable_build_metadata_is_not_mistaken_for_a_prerelease() {
     let temporary = tempfile::tempdir().expect("temporary directory");
     let mut value = valid_value();
     set_version(&mut value, "0.1.0+build.7");
+    set_path(
+        &mut value,
+        "/workflow/path",
+        json!(".github/workflows/stable-draft.yml"),
+    );
     let manifest = parse_value(&value, "0.1.0+build.7").expect("build metadata manifest");
     let release = resolved_from_manifest(temporary.path(), manifest);
     let runner = RecordingCommandRunner::default();

@@ -3,7 +3,8 @@ set -euo pipefail
 
 readonly REPOSITORY_URL="https://github.com/shayne/RPi-Plane-Radar"
 readonly WORKFLOW_REPOSITORY="shayne/RPi-Plane-Radar"
-readonly WORKFLOW_PATH=".github/workflows/release.yml"
+readonly CANDIDATE_WORKFLOW_PATH=".github/workflows/release.yml"
+readonly STABLE_WORKFLOW_PATH=".github/workflows/stable-draft.yml"
 readonly APPLICATION_ARCHIVE="planeradar-aarch64-linux-gnu.tar.zst"
 readonly CONTROL_ARM64_ARCHIVE="planeradarctl-aarch64-apple-darwin.tar.zst"
 readonly CONTROL_X86_64_ARCHIVE="planeradarctl-x86_64-apple-darwin.tar.zst"
@@ -118,6 +119,11 @@ make_normalized_archive() {
 version="${1:-}"
 [[ $# -eq 1 ]] || die "usage: scripts/package-release.sh VERSION"
 version="$(canonical_version "$version")"
+if [[ "$version" == *-* ]]; then
+  workflow_path="$CANDIDATE_WORKFLOW_PATH"
+else
+  workflow_path="$STABLE_WORKFLOW_PATH"
+fi
 
 require_command git
 repo_root="$(git rev-parse --show-toplevel 2>/dev/null)" ||
@@ -181,6 +187,8 @@ package_version="$(awk -F ' *= *' '
 ' Cargo.toml)"
 [[ "${version%%-*}" == "$package_version" ]] ||
   die "version does not match Cargo.toml package version"
+git cat-file -e "$workflow_commit:$workflow_path" ||
+  die "selected source does not contain the required release workflow"
 
 for command in docker cargo file lipo shasum find python3; do
   require_command "$command"
@@ -242,6 +250,7 @@ export PLANERADAR_SOURCE_TREE="$source_tree"
 export PLANERADAR_SOURCE_EPOCH="$source_epoch"
 export PLANERADAR_WORKFLOW_REF="$workflow_ref"
 export PLANERADAR_WORKFLOW_COMMIT="$workflow_commit"
+export PLANERADAR_WORKFLOW_PATH="$workflow_path"
 export PLANERADAR_RELEASE_OUTPUT="$output"
 export PLANERADAR_APP_BINARY="$app_binary"
 export PLANERADAR_CTL_ARM64_BINARY="$control_arm64"
@@ -265,6 +274,7 @@ commit = os.environ["PLANERADAR_SOURCE_COMMIT"]
 tree = os.environ["PLANERADAR_SOURCE_TREE"]
 workflow_ref = os.environ["PLANERADAR_WORKFLOW_REF"]
 workflow_commit = os.environ["PLANERADAR_WORKFLOW_COMMIT"]
+workflow_path = os.environ["PLANERADAR_WORKFLOW_PATH"]
 epoch = int(os.environ["PLANERADAR_SOURCE_EPOCH"])
 timestamp = datetime.datetime.fromtimestamp(
     epoch, datetime.timezone.utc
@@ -438,7 +448,7 @@ manifest = {
     "repository": "https://github.com/shayne/RPi-Plane-Radar",
     "workflow": {
         "repository": "shayne/RPi-Plane-Radar",
-        "path": ".github/workflows/release.yml",
+        "path": workflow_path,
         "ref": workflow_ref,
         "commit": workflow_commit,
     },

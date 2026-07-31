@@ -104,7 +104,8 @@ const SUPPORTED_MODEL: &str = "Raspberry Pi Zero 2 W";
 const SUPPORTED_DISPLAY: &str = "HyperPixel 2.1 Round";
 const SUPPORTED_OS: &str = "Raspberry Pi OS Lite Trixie (64-bit)";
 const SUPPORTED_KERNEL_POLICY: &str = "driver-manifest-supported";
-const RELEASE_WORKFLOW_PATH: &str = ".github/workflows/release.yml";
+const CANDIDATE_RELEASE_WORKFLOW_PATH: &str = ".github/workflows/release.yml";
+const STABLE_RELEASE_WORKFLOW_PATH: &str = ".github/workflows/stable-draft.yml";
 const REQUIRED_TARGET_PACKAGES: &[&str] = &[
     "avahi-daemon",
     "build-essential",
@@ -227,6 +228,11 @@ impl ReleaseManifest {
         if raw.version != requested_version.to_string() || &version != requested_version {
             return Err(ReleaseError::VersionMismatch);
         }
+        let expected_workflow_path = if version.pre.is_empty() {
+            STABLE_RELEASE_WORKFLOW_PATH
+        } else {
+            CANDIDATE_RELEASE_WORKFLOW_PATH
+        };
         if !is_lower_hex(&raw.source_commit, 40) {
             return Err(ReleaseError::InvalidManifest);
         }
@@ -235,7 +241,7 @@ impl ReleaseManifest {
             || raw.source_date_epoch == 0
             || raw.repository != APP_REPOSITORY_URL
             || raw.workflow.repository != APP_REPOSITORY
-            || raw.workflow.path != RELEASE_WORKFLOW_PATH
+            || raw.workflow.path != expected_workflow_path
             || !is_safe_github_ref(&raw.workflow.source_ref)
             || raw.workflow.commit != raw.source_commit
         {
@@ -810,7 +816,7 @@ impl<R: CommandRunner> Verifier<R> {
                         "-R".into(),
                         APP_REPOSITORY.into(),
                         "--signer-workflow".into(),
-                        format!("{APP_REPOSITORY}/{RELEASE_WORKFLOW_PATH}").into(),
+                        format!("{APP_REPOSITORY}/{}", release.manifest.workflow.path).into(),
                         "--source-ref".into(),
                         release.manifest.workflow.source_ref.clone().into(),
                         "--source-digest".into(),

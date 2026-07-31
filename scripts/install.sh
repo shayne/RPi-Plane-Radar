@@ -2,7 +2,8 @@
 set -euo pipefail
 
 readonly REPOSITORY="shayne/RPi-Plane-Radar"
-readonly SIGNER_WORKFLOW="shayne/RPi-Plane-Radar/.github/workflows/release.yml"
+readonly CANDIDATE_SIGNER_WORKFLOW="shayne/RPi-Plane-Radar/.github/workflows/release.yml"
+readonly STABLE_SIGNER_WORKFLOW="shayne/RPi-Plane-Radar/.github/workflows/stable-draft.yml"
 readonly CONTROL_BOOTSTRAP_ARG="--__planeradar-bootstrap-v1"
 readonly CONTROL_FOREGROUND_TTY_ARG="--__planeradar-foreground-tty-v1"
 readonly CONTROL_RESTORE_TTY_ARG="--__planeradar-restore-tty-v1"
@@ -134,6 +135,15 @@ if [[ -z "$version" ]]; then
     die "the default installer only accepts a stable release"
 else
   [[ "$tag" == "v$version" ]] || die "requested version resolved to a different tag"
+fi
+if [[ "$release_json" == *'"isPrerelease":true'* ]]; then
+  signer_workflow="$CANDIDATE_SIGNER_WORKFLOW"
+  expected_manifest_workflow_path=".github/workflows/release.yml"
+else
+  [[ "$release_json" == *'"isPrerelease":false'* ]] ||
+    die "release prerelease state is malformed"
+  signer_workflow="$STABLE_SIGNER_WORKFLOW"
+  expected_manifest_workflow_path=".github/workflows/stable-draft.yml"
 fi
 
 ref_type="$(gh api "repos/$REPOSITORY/git/ref/tags/$tag" --jq .object.type)" ||
@@ -446,8 +456,11 @@ manifest_workflow_ref="$(plutil -extract workflow.ref raw "$release_dir/release-
   die "release manifest has no workflow ref"
 manifest_workflow_commit="$(plutil -extract workflow.commit raw "$release_dir/release-manifest.json" 2>/dev/null)" ||
   die "release manifest has no workflow commit"
+manifest_workflow_path="$(plutil -extract workflow.path raw "$release_dir/release-manifest.json" 2>/dev/null)" ||
+  die "release manifest has no workflow path"
 [[ "$tag" == "v$manifest_version" &&
    "$manifest_commit" == "$source_commit" &&
+   "$manifest_workflow_path" == "$expected_manifest_workflow_path" &&
    "$manifest_workflow_ref" =~ ^refs/(heads|tags)/[A-Za-z0-9]([A-Za-z0-9._/-]*[A-Za-z0-9])?$ &&
    "$manifest_workflow_ref" != *".."* &&
    "$manifest_workflow_ref" != *"//"* &&
@@ -505,7 +518,7 @@ actual_archive_size="$(stat -f '%z' "$release_dir/$control_archive")"
 for subject in install.sh "$control_archive"; do
   gh attestation verify "$release_dir/$subject" \
     --repo "$REPOSITORY" \
-    --signer-workflow "$SIGNER_WORKFLOW" \
+    --signer-workflow "$signer_workflow" \
     --source-ref "$manifest_workflow_ref" \
     --source-digest "$manifest_workflow_commit" \
     --deny-self-hosted-runners >/dev/null ||
