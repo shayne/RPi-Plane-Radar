@@ -167,6 +167,10 @@ fn stable_workflows_promote_the_exact_accepted_draft_without_rebuilding() {
             && !promote.contains("actions/upload-artifact"),
         "stable promotion must verify and publish the accepted draft without rebuilding or reuploading"
     );
+    assert!(
+        !promote.contains("--signer-repo"),
+        "gh attestation verification must not combine the mutually exclusive --signer-repo and --signer-workflow policies"
+    );
     for workflow in [&draft, &promote] {
         for line in workflow
             .lines()

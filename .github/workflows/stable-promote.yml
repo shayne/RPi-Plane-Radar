@@ -116,7 +116,6 @@ jobs:
           downloads="$RUNNER_TEMP/stable-accepted"
           gh attestation verify "$downloads/SHA256SUMS" \
             --repo shayne/RPi-Plane-Radar \
-            --signer-repo shayne/RPi-Plane-Radar \
             --signer-workflow shayne/RPi-Plane-Radar/.github/workflows/stable-draft.yml \
             --source-ref refs/heads/main \
             --source-digest "$SOURCE_COMMIT" \
@@ -126,7 +125,6 @@ jobs:
             test -n "$digest" && test -n "$name"
             gh attestation verify "$downloads/$name" \
               --repo shayne/RPi-Plane-Radar \
-              --signer-repo shayne/RPi-Plane-Radar \
               --signer-workflow shayne/RPi-Plane-Radar/.github/workflows/stable-draft.yml \
               --source-ref refs/heads/main \
               --source-digest "$SOURCE_COMMIT" \
@@ -135,7 +133,6 @@ jobs:
           for archive in "$downloads"/*.tar.zst; do
             gh attestation verify "$archive" \
               --repo shayne/RPi-Plane-Radar \
-              --signer-repo shayne/RPi-Plane-Radar \
               --signer-workflow shayne/RPi-Plane-Radar/.github/workflows/stable-draft.yml \
               --source-ref refs/heads/main \
               --source-digest "$SOURCE_COMMIT" \
