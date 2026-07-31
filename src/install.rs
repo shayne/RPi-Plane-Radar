@@ -36,6 +36,7 @@ const RUNTIME_PACKAGES: &[&str] = &[
     "libgles2",
     "libgl1-mesa-dri",
     "ca-certificates",
+    "curl",
     "avahi-daemon",
     "dkms",
     "kmod",

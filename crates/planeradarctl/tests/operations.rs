@@ -23,6 +23,8 @@ const APP_REVISION: &str = "1111111111111111111111111111111111111111";
 const APP_SHA256: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const DRIVER_REVISION: &str = "224cc7ab781710c2edb43e4b5dbf0aedee5ee4d7";
 const DRIVER_MANIFEST: &str = "7a10d873c49858e5066f7120189068ff446c4c926bda5a2883070d9230e6994d";
+const INSTALLED_DRIVER_MANIFEST: &str =
+    "37b40967b952de49bf7663ffdae48e4208d1a6618ffc966d84c7f7a2176d969e";
 const MODULE_SHA256: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 const OVERLAY_SHA256: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
 const BOOT_CONFIG_SHA256: &str = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
@@ -52,6 +54,7 @@ fn healthy_facts() -> DiagnosticFacts {
         expected_application: artifact("0.1.0", APP_REVISION, APP_SHA256),
         running_application_revision: APP_REVISION.into(),
         installed_driver: artifact("0.1.0", DRIVER_REVISION, DRIVER_MANIFEST),
+        accepted_driver_manifest_sha256: DRIVER_MANIFEST.into(),
         persisted_driver_manifest_sha256: DRIVER_MANIFEST.into(),
         expected_driver: artifact("0.1.0", DRIVER_REVISION, DRIVER_MANIFEST),
         running_kernel: KERNEL.into(),
@@ -351,6 +354,11 @@ fn every_required_health_mismatch_has_a_distinct_stable_diagnostic() {
         (
             "driver manifest",
             Box::new(|facts| facts.installed_driver.sha256 = "d".repeat(64)),
+            DiagnosticCode::DriverManifestMismatch,
+        ),
+        (
+            "accepted driver manifest",
+            Box::new(|facts| facts.accepted_driver_manifest_sha256 = "f".repeat(64)),
             DiagnosticCode::DriverManifestMismatch,
         ),
         (
@@ -1067,7 +1075,7 @@ fn diagnostic_probe_json() -> Vec<u8> {
         ),
     );
     format!(
-        r#"{{"schema_version":1,"os_id":"raspbian","os_version":"13","architecture":"arm64","application_version":"0.1.0","application_revision":"{APP_REVISION}","application_sha256":"{APP_SHA256}","driver_version":"0.1.0","driver_revision":"{DRIVER_REVISION}","driver_manifest_sha256":"{DRIVER_MANIFEST}","expected_kernel":"{KERNEL}","running_kernel":"{KERNEL}","module_loaded":true,"module_vermagic":"{VERMAGIC}","expected_module_vermagic":"{VERMAGIC}","module_sha256":"{MODULE_SHA256}","expected_module_sha256":"{MODULE_SHA256}","overlay_file":"hyperpixel2r-kms-224cc7ab7817.dtbo","expected_overlay_file":"hyperpixel2r-kms-224cc7ab7817.dtbo","overlay_sha256":"{OVERLAY_SHA256}","expected_overlay_sha256":"{OVERLAY_SHA256}","boot_config_sha256":"{BOOT_CONFIG_SHA256}","overlay_configured":true,"drm_device":"/dev/dri/card0","drm_mode":"480x480","renderer":"opengles2","touch_device":"HyperPixel 2.1 Round Touch","service_active":true,"service_restart_count":0,"health_base64":"{health}","hostname":"planeradar"}}"#
+        r#"{{"schema_version":1,"os_id":"raspbian","os_version":"13","architecture":"arm64","application_version":"0.1.0","application_revision":"{APP_REVISION}","application_sha256":"{APP_SHA256}","driver_version":"0.1.0","driver_revision":"{DRIVER_REVISION}","driver_manifest_sha256":"{DRIVER_MANIFEST}","accepted_driver_manifest_sha256":"{DRIVER_MANIFEST}","expected_kernel":"{KERNEL}","running_kernel":"{KERNEL}","module_loaded":true,"module_vermagic":"{VERMAGIC}","expected_module_vermagic":"{VERMAGIC}","module_sha256":"{MODULE_SHA256}","expected_module_sha256":"{MODULE_SHA256}","overlay_file":"hyperpixel2r-kms-224cc7ab7817.dtbo","expected_overlay_file":"hyperpixel2r-kms-224cc7ab7817.dtbo","overlay_sha256":"{OVERLAY_SHA256}","expected_overlay_sha256":"{OVERLAY_SHA256}","boot_config_sha256":"{BOOT_CONFIG_SHA256}","overlay_configured":true,"drm_device":"/dev/dri/card0","drm_mode":"480x480","renderer":"opengles2","touch_device":"HyperPixel 2.1 Round Touch","service_active":true,"service_restart_count":0,"health_base64":"{health}","hostname":"planeradar"}}"#
     )
     .into_bytes()
 }
@@ -1184,6 +1192,137 @@ fn production_doctor_observes_driver_artifact_hashes_and_strict_running_health()
     assert_eq!(report.facts.overlay_sha256, OVERLAY_SHA256);
     assert_eq!(report.facts.boot_config_sha256, BOOT_CONFIG_SHA256);
     assert_eq!(report.facts.running_application_revision, APP_REVISION);
+}
+
+#[test]
+fn production_doctor_distinguishes_release_manifest_from_accepted_bundle_manifest() {
+    let probe = String::from_utf8(diagnostic_probe_json())
+        .expect("probe JSON")
+        .replace(
+            &format!(
+                r#""driver_manifest_sha256":"{DRIVER_MANIFEST}","accepted_driver_manifest_sha256":"{DRIVER_MANIFEST}","#,
+            ),
+            &format!(
+                r#""driver_manifest_sha256":"{INSTALLED_DRIVER_MANIFEST}","accepted_driver_manifest_sha256":"{INSTALLED_DRIVER_MANIFEST}","#,
+            ),
+        )
+        .into_bytes();
+    let transport = RecordingTransport::default();
+    transport.outputs.borrow_mut().extend([
+        Ok(Output::success(target_state_json(), Vec::new())),
+        Ok(Output::success(probe, Vec::new())),
+    ]);
+    let backend = SshOperationsBackend::new(
+        &transport,
+        "pi@raspberrypi.local".parse().expect("target"),
+        DriverLock::checked_in().expect("driver lock"),
+    );
+
+    let report = OperationsClient::new(&backend, FakeClock::default())
+        .doctor()
+        .expect("distinct manifest identity layers");
+
+    assert!(report.healthy, "{report:?}");
+    assert_eq!(
+        report.facts.installed_driver.sha256,
+        INSTALLED_DRIVER_MANIFEST
+    );
+    assert_eq!(
+        report.facts.persisted_driver_manifest_sha256,
+        DRIVER_MANIFEST
+    );
+}
+
+#[test]
+fn production_doctor_uses_protected_release_state_for_prerelease_application_version() {
+    let target_state = String::from_utf8(target_state_json())
+        .expect("target state JSON")
+        .replace(
+            r#""application":{"version":"0.1.0""#,
+            r#""application":{"version":"0.1.0-rc.7""#,
+        )
+        .into_bytes();
+    let transport = RecordingTransport::default();
+    let probe = String::from_utf8(diagnostic_probe_json())
+        .expect("diagnostic probe JSON")
+        .replace(
+            r#""application_version":"0.1.0""#,
+            r#""application_version":"0.1.0-rc.7""#,
+        )
+        .into_bytes();
+    transport.outputs.borrow_mut().extend([
+        Ok(Output::success(target_state, Vec::new())),
+        Ok(Output::success(probe, Vec::new())),
+    ]);
+    let backend = SshOperationsBackend::new(
+        &transport,
+        "pi@raspberrypi.local".parse().expect("target"),
+        DriverLock::checked_in().expect("driver lock"),
+    );
+
+    let report = OperationsClient::new(&backend, FakeClock::default())
+        .doctor()
+        .expect("prerelease application identity");
+
+    assert!(report.healthy, "{report:?}");
+    assert_eq!(report.facts.installed_application.version, "0.1.0-rc.7");
+    assert_eq!(
+        transport.commands.borrow()[1].last().map(String::as_str),
+        Some("0.1.0-rc.7"),
+        "diagnostic script did not receive the protected release version"
+    );
+}
+
+#[test]
+fn production_doctor_recognizes_the_kernel_ft5x06_touch_device() {
+    let transport = RecordingTransport::default();
+    transport.outputs.borrow_mut().extend([
+        Ok(Output::success(target_state_json(), Vec::new())),
+        Ok(Output::success(diagnostic_probe_json(), Vec::new())),
+    ]);
+    let backend = SshOperationsBackend::new(
+        &transport,
+        "pi@raspberrypi.local".parse().expect("target"),
+        DriverLock::checked_in().expect("driver lock"),
+    );
+
+    OperationsClient::new(&backend, FakeClock::default())
+        .doctor()
+        .expect("doctor");
+
+    let commands = transport.commands.borrow();
+    let script = commands[1].join(" ");
+    assert!(
+        script.contains("generic ft5x06"),
+        "diagnostic probe ignored the actual kernel touch-device name"
+    );
+}
+
+#[test]
+fn production_doctor_accepts_root_owned_fat_boot_file_modes() {
+    let transport = RecordingTransport::default();
+    transport.outputs.borrow_mut().extend([
+        Ok(Output::success(target_state_json(), Vec::new())),
+        Ok(Output::success(diagnostic_probe_json(), Vec::new())),
+    ]);
+    let backend = SshOperationsBackend::new(
+        &transport,
+        "pi@raspberrypi.local".parse().expect("target"),
+        DriverLock::checked_in().expect("driver lock"),
+    );
+
+    OperationsClient::new(&backend, FakeClock::default())
+        .doctor()
+        .expect("doctor");
+
+    let commands = transport.commands.borrow();
+    let script = commands[1].join(" ");
+    assert!(
+        script.contains("644|755")
+            && script.contains(r#"boot_regular "$overlay""#)
+            && script.contains(r#"boot_regular "$config""#),
+        "diagnostic probe rejected the FAT-compatible boot-file mode policy"
+    );
 }
 
 #[test]

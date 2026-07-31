@@ -68,6 +68,7 @@ pub struct DiagnosticFacts {
     pub expected_application: ArtifactIdentity,
     pub running_application_revision: String,
     pub installed_driver: ArtifactIdentity,
+    pub accepted_driver_manifest_sha256: String,
     pub persisted_driver_manifest_sha256: String,
     pub expected_driver: ArtifactIdentity,
     pub running_kernel: String,
@@ -230,7 +231,7 @@ const DIAGNOSTIC_SCRIPT: &str = concat!(
     r#"os_id=$(sed -n 's/^ID=//p' /etc/os-release | tr -d '"'); os_version=$(sed -n 's/^VERSION_ID=//p' /etc/os-release | tr -d '"'); architecture=$(dpkg --print-architecture); "#,
     r#"app=/opt/planeradar/bin/planeradar; test ! -L "$app" && test -x "$app"; "#,
     r#"test ! -L /opt/planeradar/REVISION && test -f /opt/planeradar/REVISION; "#,
-    r#"application_line=$("$app" version); application_version=$(printf '%s\n' "$application_line" | awk 'NF == 3 && $1 == "planeradar" { print $2 }'); "#,
+    r#"application_version=$3; "#,
     r#"application_revision=$(tr -d '\r\n' </opt/planeradar/REVISION); application_sha256=$(sha256sum -- "$app" | awk '{print $1}'); "#,
     r#"driver_root="/usr/lib/hyperpixel2r-kms/$1/$2"; test ! -L "$driver_root" && test -d "$driver_root"; "#,
     r#"kernel_count=0; driver_dir=; for candidate in "$driver_root"/*; do test ! -L "$candidate" && test -d "$candidate" || continue; kernel_count=$((kernel_count + 1)); driver_dir=$candidate; done; test "$kernel_count" = 1; "#,
@@ -238,17 +239,18 @@ const DIAGNOSTIC_SCRIPT: &str = concat!(
     r#"field() { awk -F '\t' -v key="$1" '$1 == key { if (seen++) exit 2; value=$2 } END { if (!seen || value == "") exit 1; print value }' "$manifest"; }; "#,
     r#"driver_version=$(field driver_version); driver_revision=$(field source_revision); driver_manifest_sha256=$(sha256sum -- "$manifest" | awk '{print $1}'); expected_kernel=$(field kernel_release); expected_module_vermagic=$(field module_vermagic); module_file=$(field module_file); expected_module_sha256=$(field module_sha256); expected_overlay_file=$(field overlay_file); expected_overlay_sha256=$(field overlay_sha256); "#,
     r#"test "$driver_version" = "$1"; test "$driver_revision" = "$2"; test "$expected_overlay_file" = "hyperpixel2r-kms-${2%${2#????????????}}.dtbo"; test "$module_file" = hyperpixel2r_kms.ko; "#,
+    r#"accepted=/var/lib/hyperpixel2r-kms/accepted-state; test ! -L "$accepted" && test -f "$accepted" && test "$(stat -c '%u:%g:%a' -- "$accepted")" = 0:0:600; accepted_field() { awk -F= -v key="$1" '$1 == key { if (seen++) exit 2; value=$2 } END { if (!seen || value == "") exit 1; print value }' "$accepted"; }; accepted_driver_manifest_sha256=$(accepted_field manifest_sha256); test "$(accepted_field driver_version)" = "$driver_version"; test "$(accepted_field source_revision)" = "$driver_revision"; test "$(accepted_field kernel_release)" = "$expected_kernel"; test "$(accepted_field overlay_file)" = "$expected_overlay_file"; test "$accepted_driver_manifest_sha256" = "$driver_manifest_sha256"; "#,
     r#"running_kernel=$(uname -r); module_loaded=false; if awk '$1 == "hyperpixel2r_kms" { count++ } END { exit count != 1 }' /proc/modules; then module_loaded=true; fi; "#,
     r#"module_vermagic=$(/usr/sbin/modinfo -F vermagic hyperpixel2r_kms 2>/dev/null || printf unavailable); "#,
     r#"module_sha256=0000000000000000000000000000000000000000000000000000000000000000; module="/lib/modules/$expected_kernel/extra/$module_file"; if test ! -L "$module" && test -f "$module" && test "$(stat -c '%u:%g:%a' -- "$module")" = 0:0:644; then module_sha256=$(sha256sum -- "$module" | awk '{print $1}'); fi; "#,
-    r#"overlay_sha256=0000000000000000000000000000000000000000000000000000000000000000; overlay="/boot/firmware/overlays/$expected_overlay_file"; if test ! -L "$overlay" && test -f "$overlay" && test "$(stat -c '%u:%g:%a' -- "$overlay")" = 0:0:644; then overlay_sha256=$(sha256sum -- "$overlay" | awk '{print $1}'); fi; "#,
-    r#"config=/boot/firmware/config.txt; boot_config_sha256=0000000000000000000000000000000000000000000000000000000000000000; overlay_file=unavailable; overlay_configured=false; if test ! -L "$config" && test -f "$config" && test "$(stat -c '%u:%g:%a' -- "$config")" = 0:0:644; then boot_config_sha256=$(sha256sum -- "$config" | awk '{print $1}'); overlay_result=$(awk -v wanted="dtoverlay=$expected_overlay_file" '{ line=$0; sub(/^[[:space:]]+/, "", line); sub(/[[:space:]]+$/, "", line); if (line !~ /^dtoverlay=/) next; if (line == wanted) { count++; selected=line; next } if (line ~ /hyperpixel2r/) bad=1 } END { if (count == 1 && !bad) { sub(/^dtoverlay=/, "", selected); print "true:" selected } else print "false:unavailable" }' "$config"); overlay_configured=${overlay_result%%:*}; overlay_file=${overlay_result#*:}; fi; "#,
+    r#"boot_regular() { test ! -L "$1" && test -f "$1" && test "$(stat -c '%u:%g:%h' -- "$1")" = 0:0:1; case "$(stat -c '%a' -- "$1")" in 644|755) ;; *) return 1;; esac; }; overlay_sha256=0000000000000000000000000000000000000000000000000000000000000000; overlay="/boot/firmware/overlays/$expected_overlay_file"; if boot_regular "$overlay"; then overlay_sha256=$(sha256sum -- "$overlay" | awk '{print $1}'); fi; "#,
+    r#"config=/boot/firmware/config.txt; boot_config_sha256=0000000000000000000000000000000000000000000000000000000000000000; overlay_file=unavailable; overlay_configured=false; if boot_regular "$config"; then boot_config_sha256=$(sha256sum -- "$config" | awk '{print $1}'); overlay_result=$(awk -v wanted="dtoverlay=$expected_overlay_file" '{ line=$0; sub(/^[[:space:]]+/, "", line); sub(/[[:space:]]+$/, "", line); if (line !~ /^dtoverlay=/) next; if (line == wanted) { count++; selected=line; next } if (line ~ /hyperpixel2r/) bad=1 } END { if (count == 1 && !bad) { sub(/^dtoverlay=/, "", selected); print "true:" selected } else print "false:unavailable" }' "$config"); overlay_configured=${overlay_result%%:*}; overlay_file=${overlay_result#*:}; fi; "#,
     r#"service_active=false; if systemctl is-active --quiet planeradar.service; then service_active=true; fi; service_restart_count=$(systemctl show planeradar.service --property=NRestarts --value); service_main_pid=$(systemctl show planeradar.service --property=MainPID --value); service_invocation=$(systemctl show planeradar.service --property=InvocationID --value); "#,
     r#"drm_device=unavailable; drm_mode=unavailable; renderer=unavailable; case "$service_main_pid:$service_invocation" in 0:*|*[!0-9]*:*|*:*[!0-9a-f]*) ;; *) card_count=0; for fd in /proc/"$service_main_pid"/fd/*; do target=$(readlink -- "$fd" 2>/dev/null || true); case "$target" in /dev/dri/card[0-9]*) if test "$drm_device" != unavailable && test "$drm_device" != "$target"; then card_count=2; break; fi; drm_device=$target; card_count=1;; esac; done; if test "$card_count" = 1 && test -c "$drm_device"; then card_name=${drm_device#/dev/dri/}; mode_file="/sys/class/drm/$card_name-DPI-1/modes"; drm_mode=$(sed -n '1p' "$mode_file" 2>/dev/null || true); test -n "$drm_mode" || drm_mode=unavailable; else drm_device=unavailable; fi; renderer=$(journalctl -b -u planeradar.service "_PID=$service_main_pid" "_SYSTEMD_INVOCATION_ID=$service_invocation" --no-pager -o cat 2>/dev/null | awk 'match($0, /render_driver=[^ ]+/) { value=substr($0, RSTART+14, RLENGTH-14); count++ } END { if (count == 1) print value }'); test -n "$renderer" || renderer=unavailable;; esac; "#,
-    r#"touch_device=; touch_count=0; for name_file in /sys/class/input/event*/device/name; do test ! -L "$name_file" && test -f "$name_file" || continue; candidate=$(tr -d '\r\n' <"$name_file"); case "$candidate" in *HyperPixel*) touch_count=$((touch_count + 1)); touch_device=$candidate;; esac; done; test "$touch_count" -le 1; "#,
+    r#"touch_device=; touch_count=0; for name_file in /sys/class/input/event*/device/name; do test ! -L "$name_file" && test -f "$name_file" || continue; candidate=$(tr -d '\r\n' <"$name_file"); case "$candidate" in *HyperPixel*|*"generic ft5x06"*) touch_count=$((touch_count + 1)); touch_device=$candidate;; esac; done; test "$touch_count" -le 1; "#,
     r#"hostname=$(tr -d '\r\n' </etc/hostname); health_base64=; if health=$(curl --fail --silent --show-error --max-time 5 --max-filesize 4096 -H "Host: $hostname.local" http://127.0.0.1/healthz 2>/dev/null); then health_base64=$(printf %s "$health" | base64 -w0); fi; "#,
-    r#"printf '{"schema_version":1,"os_id":"%s","os_version":"%s","architecture":"%s","application_version":"%s","application_revision":"%s","application_sha256":"%s","driver_version":"%s","driver_revision":"%s","driver_manifest_sha256":"%s","expected_kernel":"%s","running_kernel":"%s","module_loaded":%s,"module_vermagic":"%s","expected_module_vermagic":"%s","module_sha256":"%s","expected_module_sha256":"%s","overlay_file":"%s","expected_overlay_file":"%s","overlay_sha256":"%s","expected_overlay_sha256":"%s","boot_config_sha256":"%s","overlay_configured":%s,"drm_device":"%s","drm_mode":"%s","renderer":"%s","touch_device":"%s","service_active":%s,"service_restart_count":%s,"health_base64":"%s","hostname":"%s"}' "#,
-    r#""$os_id" "$os_version" "$architecture" "$application_version" "$application_revision" "$application_sha256" "$driver_version" "$driver_revision" "$driver_manifest_sha256" "$expected_kernel" "$running_kernel" "$module_loaded" "$module_vermagic" "$expected_module_vermagic" "$module_sha256" "$expected_module_sha256" "$overlay_file" "$expected_overlay_file" "$overlay_sha256" "$expected_overlay_sha256" "$boot_config_sha256" "$overlay_configured" "$drm_device" "$drm_mode" "$renderer" "$touch_device" "$service_active" "$service_restart_count" "$health_base64" "$hostname""#,
+    r#"printf '{"schema_version":1,"os_id":"%s","os_version":"%s","architecture":"%s","application_version":"%s","application_revision":"%s","application_sha256":"%s","driver_version":"%s","driver_revision":"%s","driver_manifest_sha256":"%s","accepted_driver_manifest_sha256":"%s","expected_kernel":"%s","running_kernel":"%s","module_loaded":%s,"module_vermagic":"%s","expected_module_vermagic":"%s","module_sha256":"%s","expected_module_sha256":"%s","overlay_file":"%s","expected_overlay_file":"%s","overlay_sha256":"%s","expected_overlay_sha256":"%s","boot_config_sha256":"%s","overlay_configured":%s,"drm_device":"%s","drm_mode":"%s","renderer":"%s","touch_device":"%s","service_active":%s,"service_restart_count":%s,"health_base64":"%s","hostname":"%s"}' "#,
+    r#""$os_id" "$os_version" "$architecture" "$application_version" "$application_revision" "$application_sha256" "$driver_version" "$driver_revision" "$driver_manifest_sha256" "$accepted_driver_manifest_sha256" "$expected_kernel" "$running_kernel" "$module_loaded" "$module_vermagic" "$expected_module_vermagic" "$module_sha256" "$expected_module_sha256" "$overlay_file" "$expected_overlay_file" "$overlay_sha256" "$expected_overlay_sha256" "$boot_config_sha256" "$overlay_configured" "$drm_device" "$drm_mode" "$renderer" "$touch_device" "$service_active" "$service_restart_count" "$health_base64" "$hostname""#,
 );
 
 #[derive(Deserialize)]
@@ -264,6 +266,7 @@ struct DiagnosticProbe {
     driver_version: String,
     driver_revision: String,
     driver_manifest_sha256: String,
+    accepted_driver_manifest_sha256: String,
     expected_kernel: String,
     running_kernel: String,
     module_loaded: bool,
@@ -358,6 +361,7 @@ impl<'a, T: Transport> SshOperationsBackend<'a, T> {
     fn diagnostic_probe(
         &self,
         installed_driver: &ArtifactIdentity,
+        installed_application: &ArtifactIdentity,
     ) -> Result<DiagnosticProbe, OperationError> {
         let request = RemoteCommand::ordinary([
             "/usr/bin/timeout",
@@ -370,6 +374,7 @@ impl<'a, T: Transport> SshOperationsBackend<'a, T> {
             "planeradar-diagnostics",
             &installed_driver.version,
             &installed_driver.source_commit,
+            &installed_application.version,
         ])
         .map_err(|_| OperationError::Transport)?;
         let output = self.run_bounded(request, Duration::from_secs(15), MAX_PROBE_BYTES + 1)?;
@@ -404,7 +409,7 @@ impl<T: Transport> OperationsBackend for SshOperationsBackend<'_, T> {
         let state = self.target_state()?;
         let expected_application = state.application.ok_or(OperationError::MalformedFacts)?;
         let persisted_driver = state.driver.ok_or(OperationError::MalformedFacts)?;
-        let probe = self.diagnostic_probe(&persisted_driver)?;
+        let probe = self.diagnostic_probe(&persisted_driver, &expected_application)?;
         if probe.schema_version != DOCTOR_SCHEMA_VERSION {
             return Err(OperationError::MalformedFacts);
         }
@@ -437,6 +442,7 @@ impl<T: Transport> OperationsBackend for SshOperationsBackend<'_, T> {
                 source_commit: probe.driver_revision,
                 sha256: probe.driver_manifest_sha256,
             },
+            accepted_driver_manifest_sha256: probe.accepted_driver_manifest_sha256,
             persisted_driver_manifest_sha256: persisted_driver.sha256,
             expected_driver: ArtifactIdentity {
                 version: self.expected_driver.version.to_string(),
@@ -770,8 +776,8 @@ fn evaluate(facts: &DiagnosticFacts) -> Vec<DiagnosticCode> {
     if facts.installed_driver.source_commit != facts.expected_driver.source_commit {
         diagnostics.push(DiagnosticCode::DriverRevisionMismatch);
     }
-    if facts.installed_driver.sha256 != facts.persisted_driver_manifest_sha256
-        || facts.installed_driver.sha256 != facts.expected_driver.sha256
+    if facts.installed_driver.sha256 != facts.accepted_driver_manifest_sha256
+        || facts.persisted_driver_manifest_sha256 != facts.expected_driver.sha256
     {
         diagnostics.push(DiagnosticCode::DriverManifestMismatch);
     }
@@ -840,6 +846,7 @@ fn validate_facts(facts: &DiagnosticFacts) -> Result<(), OperationError> {
         &facts.installed_driver.version,
         &facts.installed_driver.source_commit,
         &facts.installed_driver.sha256,
+        &facts.accepted_driver_manifest_sha256,
         &facts.persisted_driver_manifest_sha256,
         &facts.expected_driver.version,
         &facts.expected_driver.source_commit,
@@ -856,6 +863,7 @@ fn validate_facts(facts: &DiagnosticFacts) -> Result<(), OperationError> {
         &facts.overlay_sha256,
         &facts.expected_overlay_sha256,
         &facts.boot_config_sha256,
+        &facts.accepted_driver_manifest_sha256,
         &facts.persisted_driver_manifest_sha256,
         &facts.drm_device,
         &facts.drm_mode,

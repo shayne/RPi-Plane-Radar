@@ -22,6 +22,7 @@
   "required_target_packages": [
     "avahi-daemon",
     "ca-certificates",
+    "curl",
     "device-tree-compiler",
     "dkms",
     "evtest",

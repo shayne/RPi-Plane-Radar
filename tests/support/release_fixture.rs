@@ -56,6 +56,7 @@ pub fn build_release_with_payload(directory: &Path, payload: Vec<u8>) -> Release
         "required_target_packages": [
             "avahi-daemon",
             "ca-certificates",
+            "curl",
             "device-tree-compiler",
             "dkms",
             "evtest",

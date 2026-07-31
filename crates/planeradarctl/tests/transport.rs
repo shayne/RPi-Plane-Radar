@@ -692,6 +692,149 @@ fn trusted_multi_algorithm_keys_prefer_ed25519_and_pin_strict_ssh_to_it() {
 }
 
 #[test]
+fn identity_bound_probe_scans_for_the_persisted_key_instead_of_using_stale_known_hosts() {
+    let scan = format!("planeradar.local ssh-ed25519 {TEST_PUBLIC_KEY}\n");
+    let runner = ScriptedRunner::new([
+        Ok(CommandOutput::success(scan.into_bytes(), Vec::new())),
+        Ok(CommandOutput::success(
+            b"Raspberry Pi Zero 2 W Rev 1.0\n".to_vec(),
+            Vec::new(),
+        )),
+        Ok(CommandOutput::success(
+            b"10000000abcdef01\n".to_vec(),
+            Vec::new(),
+        )),
+    ]);
+    let transport = OpenSshTransport::with_runner(
+        &runner,
+        TransportConfig::new(PathBuf::from("/private/trusted_known_hosts")).expect("config"),
+    );
+    let target = SshTarget::from_str("alice@planeradar.local").expect("target");
+    let expected = planeradarctl::target::TargetIdentity {
+        host_key_sha256: TEST_FINGERPRINT.into(),
+        model: "Raspberry Pi Zero 2 W Rev 1.0".into(),
+        serial: "10000000abcdef01".into(),
+    };
+
+    let reconnected = transport
+        .probe_identity_bound(&target, &expected)
+        .expect("probe through the exact scanned key");
+
+    assert_eq!(reconnected, target);
+    let invocations = runner.invocations();
+    assert_eq!(invocations[0].program(), "ssh-keyscan");
+    assert_eq!(
+        invocations[0].arguments(),
+        [
+            "-T",
+            "4",
+            "-t",
+            "ed25519,ecdsa,rsa",
+            "--",
+            "planeradar.local"
+        ]
+    );
+    assert!(
+        invocations.iter().all(|invocation| {
+            invocation.program() != "ssh-keygen"
+                && invocation
+                    .arguments()
+                    .iter()
+                    .all(|argument| argument != "/private/trusted_known_hosts")
+        }),
+        "identity-bound adoption must not select a stale key from known_hosts"
+    );
+}
+
+#[test]
+fn identity_bound_probe_resolves_macos_mdns_before_retrying_keyscan() {
+    let scan = format!("192.0.2.10 ssh-ed25519 {TEST_PUBLIC_KEY}\n");
+    let runner = ScriptedRunner::new([
+        Ok(CommandOutput::new(
+            1,
+            Vec::new(),
+            b"getaddrinfo planeradar.local: nodename nor servname provided".to_vec(),
+        )),
+        Ok(CommandOutput::success(
+            b"name: planeradar.local\nip_address: 192.0.2.10\n".to_vec(),
+            Vec::new(),
+        )),
+        Ok(CommandOutput::success(scan.into_bytes(), Vec::new())),
+        Ok(CommandOutput::success(
+            b"Raspberry Pi Zero 2 W Rev 1.0\n".to_vec(),
+            Vec::new(),
+        )),
+        Ok(CommandOutput::success(
+            b"10000000abcdef01\n".to_vec(),
+            Vec::new(),
+        )),
+        Ok(CommandOutput::success(Vec::new(), Vec::new())),
+    ]);
+    let transport = OpenSshTransport::with_runner(
+        &runner,
+        TransportConfig::new(PathBuf::from("/private/trusted_known_hosts")).expect("config"),
+    );
+    let target = SshTarget::from_str("alice@planeradar.local").expect("target");
+    let expected = planeradarctl::target::TargetIdentity {
+        host_key_sha256: TEST_FINGERPRINT.into(),
+        model: "Raspberry Pi Zero 2 W Rev 1.0".into(),
+        serial: "10000000abcdef01".into(),
+    };
+
+    let reconnected = transport
+        .probe_identity_bound(&target, &expected)
+        .expect("mDNS name resolved before the exact-key retry");
+
+    assert_eq!(
+        reconnected,
+        SshTarget::from_str("alice@planeradar.local").expect("requested target")
+    );
+    transport
+        .run(
+            &reconnected,
+            RemoteCommand::ordinary(["true"]).expect("remote command"),
+        )
+        .expect("the adopted exact-key trust remains available");
+    let invocations = runner.invocations();
+    assert_eq!(invocations[0].program(), "ssh-keyscan");
+    assert_eq!(invocations[1].program(), "dscacheutil");
+    assert_eq!(
+        invocations[1].arguments(),
+        ["-q", "host", "-a", "name", "planeradar.local"]
+    );
+    assert_eq!(invocations[2].program(), "ssh-keyscan");
+    assert_eq!(
+        invocations[2].arguments(),
+        ["-T", "4", "-t", "ed25519,ecdsa,rsa", "--", "192.0.2.10"]
+    );
+    assert!(
+        invocations[3]
+            .arguments()
+            .iter()
+            .any(|argument| argument == "alice@192.0.2.10"),
+        "the strict probe must keep using the verified numeric address"
+    );
+    assert!(
+        invocations[5]
+            .arguments()
+            .iter()
+            .any(|argument| argument == "alice@planeradar.local"),
+        "later commands must return to the requested hostname"
+    );
+    assert!(
+        invocations[5]
+            .arguments()
+            .iter()
+            .all(|argument| argument != "UserKnownHostsFile=/private/trusted_known_hosts")
+            && invocations[5]
+                .arguments()
+                .iter()
+                .any(|argument| argument == "HostKeyAlgorithms=ssh-ed25519"),
+        "later commands must retain only the adopted exact host key"
+    );
+}
+
+#[test]
 fn trusted_host_key_parser_rejects_missing_malformed_and_conflicting_entries() {
     for (name, output) in [
         ("missing", "# Host radar.local not found\n".to_owned()),
@@ -926,7 +1069,7 @@ fn reboot_wait_requires_disconnect_then_accepts_an_exact_new_local_hostname() {
         invocations[7].arguments(),
         [
             "-T",
-            "3",
+            "2",
             "-t",
             "ed25519,ecdsa,rsa",
             "--",
@@ -969,6 +1112,71 @@ fn reboot_wait_requires_disconnect_then_accepts_an_exact_new_local_hostname() {
         "alternate address must not weaken strict host-key policy"
     );
     assert_eq!(clock.sleeps(), Vec::<Duration>::new());
+}
+
+#[test]
+fn reboot_wait_uses_the_persisted_key_when_a_numeric_target_is_absent_from_known_hosts() {
+    let scan = format!("192.0.2.10 ssh-ed25519 {TEST_PUBLIC_KEY}\n");
+    let identity = planeradarctl::target::TargetIdentity {
+        host_key_sha256: TEST_FINGERPRINT.into(),
+        model: "Raspberry Pi Zero 2 W Rev 1.0".into(),
+        serial: "10000000abcdef01".into(),
+    };
+    let unavailable_trusted_key = || Ok(CommandOutput::new(1, Vec::new(), Vec::new()));
+    let matching_scan = || Ok(CommandOutput::success(scan.as_bytes().to_vec(), Vec::new()));
+    let model = || {
+        Ok(CommandOutput::success(
+            b"Raspberry Pi Zero 2 W Rev 1.0\n".to_vec(),
+            Vec::new(),
+        ))
+    };
+    let serial = || {
+        Ok(CommandOutput::success(
+            b"10000000abcdef01\n".to_vec(),
+            Vec::new(),
+        ))
+    };
+    let runner = ScriptedRunner::new([
+        unavailable_trusted_key(),
+        matching_scan(),
+        model(),
+        serial(),
+        Ok(CommandOutput::new(
+            255,
+            Vec::new(),
+            b"connection refused".to_vec(),
+        )),
+        model(),
+        serial(),
+    ]);
+    let clock = FakeClock::default();
+    let transport = OpenSshTransport::with_runner_and_clock(
+        &runner,
+        TransportConfig::new(PathBuf::from("/private/trusted_known_hosts")).expect("config"),
+        &clock,
+    );
+    let target = SshTarget::from_str("alice@192.0.2.10").expect("numeric target");
+
+    let reconnected = transport
+        .wait_for_reboot(&identity, std::slice::from_ref(&target), reconnect_policy())
+        .expect("identity-bound numeric reboot");
+
+    assert_eq!(reconnected, target);
+    assert_eq!(
+        runner
+            .invocations()
+            .iter()
+            .filter(|invocation| invocation.program() == "ssh-keyscan")
+            .count(),
+        1
+    );
+    assert!(
+        runner.invocations()[4]
+            .arguments()
+            .iter()
+            .all(|argument| argument != "UserKnownHostsFile=/private/trusted_known_hosts"),
+        "reboot polling must retain the adopted exact host key"
+    );
 }
 
 #[test]
@@ -1133,6 +1341,33 @@ fn reboot_wait_treats_open_ssh_connection_closed_by_address_as_a_disconnect() {
         "the reconnect probe must run after the observed disconnect"
     );
     assert!(clock.sleeps().is_empty());
+}
+
+#[test]
+fn preverified_reboot_accepts_disconnect_before_the_first_wait_probe() {
+    let mut responses = refusal_responses("radar.local");
+    responses.extend(matching_probe_responses("radar.local"));
+    let runner = ScriptedRunner::new(responses);
+    let clock = FakeClock::default();
+    let transport = OpenSshTransport::with_runner_and_clock(
+        &runner,
+        TransportConfig::new(PathBuf::from("/private/trusted_known_hosts")).expect("config"),
+        &clock,
+    );
+    let target = SshTarget::from_str("alice@radar.local").expect("target");
+    let expected = planeradarctl::target::TargetIdentity {
+        host_key_sha256: TEST_FINGERPRINT.into(),
+        model: "Raspberry Pi Zero 2 W Rev 1.0".into(),
+        serial: "10000000abcdef01".into(),
+    };
+    let policy = reconnect_policy().after_identity_verified();
+
+    assert_eq!(
+        transport
+            .wait_for_reboot(&expected, std::slice::from_ref(&target), policy)
+            .expect("reconnect after an already observed identity"),
+        target
+    );
 }
 
 #[test]
@@ -1365,8 +1600,8 @@ fn reconnect_candidate_limit_rejects_overflow_before_probing_and_allows_the_boun
     ));
     assert_eq!(
         boundary_runner.invocations().len(),
-        1,
-        "the boundary list reaches the ordinary initial probe"
+        2,
+        "the boundary list reaches the initial probe and identity-bound fallback"
     );
 
     let overflow_runner = RecordingRunner::default();

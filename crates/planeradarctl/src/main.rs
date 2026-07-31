@@ -1416,7 +1416,7 @@ impl<R: TransportCommandRunner, C: Clock> SystemLifecycleBackend<R, C> {
         let command = RemoteCommand::ordinary([
             "sh",
             "-c",
-            "test ! -L /opt/planeradar/bin/planeradar && test -x /opt/planeradar/bin/planeradar && test \"$(sha256sum -- /opt/planeradar/bin/planeradar | awk '{print $1}')\" = \"$1\" && test \"$(tr -d '\\r\\n' </opt/planeradar/REVISION)\" = \"$2\" && systemctl is-enabled --quiet planeradar.service && systemctl is-active --quiet planeradar.service && /opt/planeradar/bin/planeradar probe >/dev/null",
+            "test ! -L /opt/planeradar/bin/planeradar && test -x /opt/planeradar/bin/planeradar && test \"$(sha256sum -- /opt/planeradar/bin/planeradar | awk '{print $1}')\" = \"$1\" && test \"$(tr -d '\\r\\n' </opt/planeradar/REVISION)\" = \"$2\" && systemctl is-enabled --quiet planeradar.service && systemctl is-active --quiet planeradar.service && hostname=$(tr -d '\\r\\n' </etc/hostname) && curl --fail --silent --show-error --max-time 5 --max-filesize 4096 -H \"Host: $hostname.local\" http://127.0.0.1/healthz >/dev/null",
             "planeradar-lifecycle-health",
             pair.application.sha256.as_str(),
             pair.application.source_commit.as_str(),

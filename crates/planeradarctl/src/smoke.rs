@@ -138,7 +138,9 @@ pub fn verify_smoke_artifacts(
     if facts.installed_application != application
         || facts.expected_application != application
         || facts.running_application_revision != application.source_commit
-        || facts.installed_driver != driver
+        || facts.installed_driver.version != driver.version
+        || facts.installed_driver.source_commit != driver.source_commit
+        || facts.installed_driver.sha256 != facts.accepted_driver_manifest_sha256
         || facts.expected_driver != driver
         || facts.persisted_driver_manifest_sha256 != driver.sha256
     {

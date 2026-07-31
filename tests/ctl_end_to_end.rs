@@ -218,6 +218,7 @@ struct FixtureSystemState {
     driver_tool_target: RefCell<Option<SshTarget>>,
     normal_boot_tool_targets: RefCell<Vec<SshTarget>>,
     normal_boot_before_application: Cell<usize>,
+    identity_bound_targets: RefCell<Vec<SshTarget>>,
 }
 
 impl FixtureSystem {
@@ -235,6 +236,7 @@ impl FixtureSystem {
                 driver_tool_target: RefCell::new(None),
                 normal_boot_tool_targets: RefCell::new(Vec::new()),
                 normal_boot_before_application: Cell::new(0),
+                identity_bound_targets: RefCell::new(Vec::new()),
             }),
         }
     }
@@ -347,6 +349,7 @@ impl FixtureSystem {
             "driver_version": driver.version,
             "driver_revision": driver.source_commit,
             "driver_manifest_sha256": fs::read_to_string(self.path("/var/lib/planeradar-installer/driver-manifest.sha256")).expect("driver identity").trim(),
+            "accepted_driver_manifest_sha256": fs::read_to_string(self.path("/var/lib/planeradar-installer/driver-manifest.sha256")).expect("accepted driver identity").trim(),
             "expected_kernel": kernel,
             "running_kernel": kernel,
             "module_loaded": true,
@@ -675,6 +678,23 @@ impl Transport for FixtureSystem {
         Ok(TargetProbe {
             identity: self.shared.identity.clone(),
         })
+    }
+
+    fn probe_identity_bound(
+        &self,
+        target: &SshTarget,
+        expected: &TargetIdentity,
+    ) -> Result<SshTarget, TransportError> {
+        self.shared
+            .identity_bound_targets
+            .borrow_mut()
+            .push(target.clone());
+        let probe = self.probe(target)?;
+        if expected.matches(&probe.identity) {
+            Ok(target.clone())
+        } else {
+            Err(TransportError::TargetIdentityMismatch)
+        }
     }
 
     fn run(&self, _target: &SshTarget, request: RemoteCommand) -> Result<Output, TransportError> {
@@ -1037,6 +1057,7 @@ fn healthy_fixture_facts(
         expected_application: application.clone(),
         running_application_revision: application.source_commit.clone(),
         installed_driver: driver.clone(),
+        accepted_driver_manifest_sha256: driver.sha256.clone(),
         persisted_driver_manifest_sha256: driver.sha256.clone(),
         expected_driver: driver.clone(),
         running_kernel: "6.12.47+rpt-rpi-v8".into(),
@@ -1407,6 +1428,18 @@ fn controller_install_resume_reaches_every_real_phase() {
         driver_mutations_before_resume,
         "resume repeated completed driver mutations"
     );
+    assert!(
+        fixture
+            .shared
+            .identity_bound_targets
+            .borrow()
+            .iter()
+            .any(|target| target
+                == &"pi@planeradar.local"
+                    .parse::<SshTarget>()
+                    .expect("desired SSH target")),
+        "hostname adoption did not use the persisted identity-bound probe"
+    );
 
     let commands = target_commands_before_resume.lines().collect::<Vec<_>>();
     let update = commands
@@ -1446,6 +1479,34 @@ fn controller_install_resume_reaches_every_real_phase() {
             .iter()
             .any(|line| { line.contains("full-upgrade") || line.contains("dist-upgrade") }),
         "fixture install escaped the package contract"
+    );
+    let service_checks = fixture
+        .shared
+        .remote_commands
+        .borrow()
+        .iter()
+        .filter_map(|arguments| {
+            arguments
+                .iter()
+                .find(|argument| argument.contains("systemctl is-enabled"))
+                .cloned()
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        !service_checks.is_empty(),
+        "final service health was not checked"
+    );
+    assert!(
+        service_checks
+            .iter()
+            .all(|command| command.contains("/healthz") && command.contains("curl --fail")),
+        "final service health did not query the running HTTP service"
+    );
+    assert!(
+        service_checks
+            .iter()
+            .all(|command| !command.contains("planeradar probe")),
+        "final service health launched a competing display renderer"
     );
 
     let helper = root

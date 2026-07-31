@@ -109,6 +109,7 @@ const STABLE_RELEASE_WORKFLOW_PATH: &str = ".github/workflows/stable-draft.yml";
 const REQUIRED_TARGET_PACKAGES: &[&str] = &[
     "avahi-daemon",
     "ca-certificates",
+    "curl",
     "device-tree-compiler",
     "dkms",
     "evtest",

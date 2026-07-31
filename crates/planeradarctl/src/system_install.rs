@@ -340,7 +340,7 @@ where
         let request = RemoteCommand::ordinary([
             "sh",
             "-c",
-            "systemctl is-enabled --quiet planeradar.service && systemctl is-active --quiet planeradar.service && /opt/planeradar/bin/planeradar probe >/dev/null",
+            "systemctl is-enabled --quiet planeradar.service && systemctl is-active --quiet planeradar.service && hostname=$(tr -d '\\r\\n' </etc/hostname) && curl --fail --silent --show-error --max-time 5 --max-filesize 4096 -H \"Host: $hostname.local\" http://127.0.0.1/healthz >/dev/null",
         ])
         .map_err(|_| BackendFailure::FinalServiceFailed)?;
         self.run_remote_check(request)
@@ -410,17 +410,38 @@ where
     ) -> Result<(), BackendFailure> {
         let deadline = self.clock.now() + Duration::from_secs(30);
         loop {
-            if let Ok(observed) = self.transport.probe(&target) {
-                if !expected_identity.matches(&observed.identity) {
+            match self
+                .transport
+                .probe_identity_bound(&target, expected_identity)
+            {
+                Ok(reconnected) => {
+                    *self.target.borrow_mut() = reconnected;
+                    return Ok(());
+                }
+                Err(TransportError::HostKeyMismatch | TransportError::TargetIdentityMismatch) => {
                     return Err(BackendFailure::OperationFailed);
                 }
-                *self.target.borrow_mut() = target;
-                return Ok(());
+                Err(_) => {}
             }
             if self.clock.now() >= deadline {
                 return Err(BackendFailure::SshLost);
             }
             self.clock.sleep(Duration::from_secs(1));
+        }
+    }
+
+    fn verify_current_target_identity(
+        &self,
+        expected_identity: &TargetIdentity,
+    ) -> Result<(), BackendFailure> {
+        let observed = self
+            .transport
+            .probe(&self.current_target())
+            .map_err(|_| BackendFailure::SshLost)?;
+        if expected_identity.matches(&observed.identity) {
+            Ok(())
+        } else {
+            Err(BackendFailure::OperationFailed)
         }
     }
 }
@@ -601,6 +622,7 @@ where
                 sudo_reboot_validation_command().map_err(|_| BackendFailure::OperationFailed)?,
             )
             .map_err(|_| BackendFailure::OperationFailed)?;
+        self.verify_current_target_identity(&self.expected_identity)?;
         let _expected_disconnect = self.transport.run(
             &original,
             tryboot_reboot_command().map_err(|_| BackendFailure::OperationFailed)?,
@@ -610,7 +632,7 @@ where
             .wait_for_reboot(
                 &self.expected_identity,
                 std::slice::from_ref(&original),
-                self.reconnect_policy(None)?,
+                self.reconnect_policy(None)?.after_identity_verified(),
             )
             .map_err(tryboot_wait_failure)?;
         *self.target.borrow_mut() = reconnected;
@@ -686,6 +708,7 @@ where
 
     fn reboot_final(&self, request: &InstallRequest) -> Result<(), BackendFailure> {
         let original = self.current_target();
+        self.verify_current_target_identity(&request.target)?;
         let _expected_disconnect = self.transport.run(
             &original,
             final_reboot_command().map_err(|_| BackendFailure::OperationFailed)?,
@@ -695,7 +718,8 @@ where
             .wait_for_reboot(
                 &request.target,
                 std::slice::from_ref(&original),
-                self.reconnect_policy(Some(&request.desired_hostname))?,
+                self.reconnect_policy(Some(&request.desired_hostname))?
+                    .after_identity_verified(),
             )
             .map_err(|_| BackendFailure::SshLost)?;
         *self.target.borrow_mut() = reconnected;

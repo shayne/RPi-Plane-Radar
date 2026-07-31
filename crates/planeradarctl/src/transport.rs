@@ -1,8 +1,10 @@
 use std::{
-    collections::HashSet,
+    cell::RefCell,
+    collections::{HashMap, HashSet},
     ffi::OsString,
     fmt,
     io::Write,
+    net::Ipv4Addr,
     path::{Path, PathBuf},
     process::{Command, Stdio},
     str::FromStr,
@@ -22,7 +24,7 @@ use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 use thiserror::Error;
 
-use crate::target::{SshTarget, TargetIdentity};
+use crate::target::{SshHost, SshTarget, TargetIdentity};
 
 const HOST_KEY_ALGORITHMS: &str = "ssh-ed25519,ecdsa-sha2-nistp256,rsa-sha2-512,rsa-sha2-256";
 const MAX_HOST_KEY_OUTPUT_BYTES: usize = 16 * 1024;
@@ -94,6 +96,7 @@ pub struct ReconnectPolicy {
     max_backoff: Duration,
     connect_timeout: Duration,
     desired_local_hostname: Option<String>,
+    identity_preverified: bool,
 }
 
 impl fmt::Debug for ReconnectPolicy {
@@ -106,6 +109,7 @@ impl fmt::Debug for ReconnectPolicy {
             .field("max_backoff", &self.max_backoff)
             .field("connect_timeout", &self.connect_timeout)
             .field("desired_local_hostname", &"<redacted>")
+            .field("identity_preverified", &self.identity_preverified)
             .finish()
     }
 }
@@ -139,6 +143,7 @@ impl ReconnectPolicy {
             max_backoff,
             connect_timeout,
             desired_local_hostname: None,
+            identity_preverified: false,
         })
     }
 
@@ -154,6 +159,11 @@ impl ReconnectPolicy {
         }
         self.desired_local_hostname = Some(hostname);
         Ok(self)
+    }
+
+    pub fn after_identity_verified(mut self) -> Self {
+        self.identity_preverified = true;
+        self
     }
 }
 
@@ -555,6 +565,18 @@ pub struct TargetProbe {
 /// The subset of the transport interface completed in the first TDD slice.
 pub trait Transport {
     fn probe(&self, target: &SshTarget) -> Result<TargetProbe, TransportError>;
+    fn probe_identity_bound(
+        &self,
+        target: &SshTarget,
+        expected: &TargetIdentity,
+    ) -> Result<SshTarget, TransportError> {
+        let probe = self.probe(target)?;
+        if expected.matches(&probe.identity) {
+            Ok(target.clone())
+        } else {
+            Err(TransportError::TargetIdentityMismatch)
+        }
+    }
     fn run(&self, target: &SshTarget, request: RemoteCommand) -> Result<Output, TransportError>;
     fn run_bounded(
         &self,
@@ -591,6 +613,7 @@ pub struct OpenSshTransport<R, C = SystemClock> {
     runner: R,
     config: TransportConfig,
     clock: C,
+    ephemeral_host_keys: RefCell<HashMap<SshTarget, HostKey>>,
 }
 
 impl<R> OpenSshTransport<R, SystemClock> {
@@ -599,6 +622,7 @@ impl<R> OpenSshTransport<R, SystemClock> {
             runner,
             config,
             clock: SystemClock::default(),
+            ephemeral_host_keys: RefCell::new(HashMap::new()),
         }
     }
 }
@@ -615,6 +639,7 @@ impl<R, C> OpenSshTransport<R, C> {
             runner,
             config,
             clock,
+            ephemeral_host_keys: RefCell::new(HashMap::new()),
         }
     }
 }
@@ -627,8 +652,20 @@ impl<R: CommandRunner, C: Clock> Transport for OpenSshTransport<R, C> {
         )
     }
 
+    fn probe_identity_bound(
+        &self,
+        target: &SshTarget,
+        expected: &TargetIdentity,
+    ) -> Result<SshTarget, TransportError> {
+        self.probe_identity_bound_with_timeout(
+            target,
+            expected,
+            Duration::from_secs(self.config.connect_timeout_seconds.into()),
+        )
+    }
+
     fn run(&self, target: &SshTarget, request: RemoteCommand) -> Result<Output, TransportError> {
-        let mut arguments = self.noninteractive_arguments();
+        let (mut arguments, _ephemeral_trust) = self.noninteractive_arguments_for_target(target)?;
         if request.interactive_sudo {
             arguments.insert(0, "-tt".into());
         }
@@ -658,7 +695,7 @@ impl<R: CommandRunner, C: Clock> Transport for OpenSshTransport<R, C> {
         if timeout.is_zero() || stdout_limit == 0 {
             return Err(TransportError::CommandFailed);
         }
-        let mut arguments = self.noninteractive_arguments();
+        let (mut arguments, _ephemeral_trust) = self.noninteractive_arguments_for_target(target)?;
         if request.interactive_sudo {
             arguments.insert(0, "-tt".into());
         }
@@ -689,7 +726,7 @@ impl<R: CommandRunner, C: Clock> Transport for OpenSshTransport<R, C> {
         remote: &Path,
     ) -> Result<(), TransportError> {
         let remote = self.remote_copy_destination(target, remote)?;
-        self.copy(vec![local_copy_argument(local)?, remote.into()])
+        self.copy(target, vec![local_copy_argument(local)?, remote.into()])
     }
 
     fn copy_from(
@@ -699,7 +736,7 @@ impl<R: CommandRunner, C: Clock> Transport for OpenSshTransport<R, C> {
         local: &Path,
     ) -> Result<(), TransportError> {
         let remote = self.remote_copy_destination(target, remote)?;
-        self.copy(vec![remote.into(), local_copy_argument(local)?])
+        self.copy(target, vec![remote.into(), local_copy_argument(local)?])
     }
 
     fn wait_for_reboot(
@@ -714,26 +751,28 @@ impl<R: CommandRunner, C: Clock> Transport for OpenSshTransport<R, C> {
             .expect("candidate validation always retains the original")
             .clone();
         let disconnect_deadline = self.clock.now() + policy.disconnect_timeout;
-        self.expect_identity(
-            identity,
-            self.probe_until_deadline(
+        if !policy.identity_preverified {
+            let (_, initial_probe) = self.probe_reconnect_original_until_deadline(
                 &original,
+                identity,
                 disconnect_deadline,
                 policy.connect_timeout,
                 TransportError::NeverDisconnected,
-            )?,
-        )?;
+            )?;
+            self.expect_identity(identity, initial_probe)?;
+        }
         let mut backoff = policy.initial_backoff;
         loop {
-            let probe = self.probe_until_deadline(
+            let probe = self.probe_reconnect_original_until_deadline(
                 &original,
+                identity,
                 disconnect_deadline,
                 policy.connect_timeout,
                 TransportError::NeverDisconnected,
             );
             self.require_before_deadline(disconnect_deadline, TransportError::NeverDisconnected)?;
             match probe {
-                Ok(probe) => self.expect_identity(identity, probe)?,
+                Ok((_, probe)) => self.expect_identity(identity, probe)?,
                 Err(TransportError::ConnectionUnavailable) => break,
                 Err(error) => return Err(error),
             }
@@ -747,8 +786,9 @@ impl<R: CommandRunner, C: Clock> Transport for OpenSshTransport<R, C> {
         loop {
             for candidate in &candidates {
                 let probe = if candidate == &original {
-                    self.probe_until_deadline(
+                    self.probe_reconnect_original_until_deadline(
                         candidate,
+                        identity,
                         reconnect_deadline,
                         policy.connect_timeout,
                         TransportError::ReconnectTimedOut,
@@ -767,9 +807,9 @@ impl<R: CommandRunner, C: Clock> Transport for OpenSshTransport<R, C> {
                     TransportError::ReconnectTimedOut,
                 )?;
                 match probe {
-                    Ok(probe) => {
+                    Ok((reconnected, probe)) => {
                         self.expect_identity(identity, probe)?;
-                        return Ok(candidate.clone());
+                        return Ok(reconnected);
                     }
                     Err(TransportError::ConnectionUnavailable) => continue,
                     Err(error) => return Err(error),
@@ -890,12 +930,29 @@ impl<R, C> OpenSshTransport<R, C> {
         ]
     }
 
-    fn copy(&self, paths: Vec<OsString>) -> Result<(), TransportError>
+    fn noninteractive_arguments_for_target(
+        &self,
+        target: &SshTarget,
+    ) -> Result<(Vec<String>, Option<NamedTempFile>), TransportError> {
+        let Some(host_key) = self.ephemeral_host_keys.borrow().get(target).cloned() else {
+            return Ok((self.noninteractive_arguments(), None));
+        };
+        let known_hosts = exact_known_hosts_file(target, &host_key)?;
+        let arguments = self.noninteractive_arguments_for(
+            known_hosts.path(),
+            self.config.connect_timeout_seconds.into(),
+            host_key.ssh_host_key_algorithms(),
+        );
+        Ok((arguments, Some(known_hosts)))
+    }
+
+    fn copy(&self, target: &SshTarget, paths: Vec<OsString>) -> Result<(), TransportError>
     where
         R: CommandRunner,
     {
-        let mut arguments = self
-            .noninteractive_arguments()
+        let (base_arguments, _ephemeral_trust) =
+            self.noninteractive_arguments_for_target(target)?;
+        let mut arguments = base_arguments
             .into_iter()
             .map(OsString::from)
             .collect::<Vec<_>>();
@@ -983,6 +1040,15 @@ impl<R, C> OpenSshTransport<R, C> {
     where
         R: CommandRunner,
     {
+        if let Some(host_key) = self.ephemeral_host_keys.borrow().get(target).cloned() {
+            let known_hosts = exact_known_hosts_file(target, &host_key)?;
+            return self.probe_with_known_hosts(
+                target,
+                host_key,
+                known_hosts.path(),
+                connect_timeout,
+            );
+        }
         let host_key = self.trusted_host_key(target)?;
         self.probe_with_known_hosts(
             target,
@@ -990,6 +1056,31 @@ impl<R, C> OpenSshTransport<R, C> {
             &self.config.trusted_known_hosts,
             connect_timeout,
         )
+    }
+
+    fn probe_identity_bound_with_timeout(
+        &self,
+        target: &SshTarget,
+        expected: &TargetIdentity,
+        connect_timeout: Duration,
+    ) -> Result<SshTarget, TransportError>
+    where
+        R: CommandRunner,
+        C: Clock,
+    {
+        let deadline = self.clock.now() + connect_timeout.saturating_mul(6);
+        let (reconnected, probe) = self.probe_alternate_until_deadline(
+            target,
+            expected,
+            deadline,
+            connect_timeout,
+            TransportError::ConnectionUnavailable,
+        )?;
+        if expected.matches(&probe.identity) {
+            Ok(reconnected)
+        } else {
+            Err(TransportError::TargetIdentityMismatch)
+        }
     }
 
     fn probe_until_deadline(
@@ -1003,6 +1094,17 @@ impl<R, C> OpenSshTransport<R, C> {
         R: CommandRunner,
         C: Clock,
     {
+        if let Some(host_key) = self.ephemeral_host_keys.borrow().get(target).cloned() {
+            let known_hosts = exact_known_hosts_file(target, &host_key)?;
+            return self.probe_with_known_hosts_until_deadline(
+                target,
+                host_key,
+                known_hosts.path(),
+                deadline,
+                configured_timeout,
+                timeout_error,
+            );
+        }
         let host_key = self.trusted_host_key_until_deadline(
             target,
             deadline,
@@ -1087,33 +1189,18 @@ impl<R, C> OpenSshTransport<R, C> {
         deadline: Duration,
         configured_timeout: Duration,
         timeout_error: TransportError,
-    ) -> Result<TargetProbe, TransportError>
+    ) -> Result<(SshTarget, TargetProbe), TransportError>
     where
         R: CommandRunner,
         C: Clock,
     {
-        let timeout = self.attempt_timeout(deadline, configured_timeout, timeout_error)?;
-        let scan = self.run_until_deadline(
-            Invocation::new(
-                "ssh-keyscan",
-                vec![
-                    "-T".into(),
-                    timeout.as_secs().to_string(),
-                    "-t".into(),
-                    "ed25519,ecdsa,rsa".into(),
-                    "--".into(),
-                    target.host().as_str().into_owned(),
-                ],
-            ),
-            timeout,
+        let (host_key, reconnected) = self.scan_expected_host_key_until_deadline(
+            target,
+            expected,
             deadline,
+            configured_timeout,
             timeout_error,
         )?;
-        if !scan.succeeded() {
-            return Err(TransportError::ConnectionUnavailable);
-        }
-        let host_key = select_scanned_host_key(scan.stdout(), &expected.host_key_sha256)?;
-
         let mut known_hosts =
             NamedTempFile::new().map_err(|_| TransportError::EphemeralTrustFailed)?;
         #[cfg(unix)]
@@ -1125,18 +1212,128 @@ impl<R, C> OpenSshTransport<R, C> {
                 .map_err(|_| TransportError::EphemeralTrustFailed)?;
         }
         known_hosts
-            .write_all(host_key.known_hosts_line(target).as_bytes())
+            .write_all(host_key.known_hosts_line(&reconnected).as_bytes())
             .and_then(|()| known_hosts.flush())
             .map_err(|_| TransportError::EphemeralTrustFailed)?;
         self.require_before_deadline(deadline, timeout_error)?;
-        self.probe_with_known_hosts_until_deadline(
-            target,
-            host_key,
+        let probe = self.probe_with_known_hosts_until_deadline(
+            &reconnected,
+            host_key.clone(),
             known_hosts.path(),
             deadline,
             configured_timeout,
             timeout_error,
-        )
+        )?;
+        if !expected.matches(&probe.identity) {
+            return Err(TransportError::TargetIdentityMismatch);
+        }
+        let mut ephemeral_host_keys = self.ephemeral_host_keys.borrow_mut();
+        ephemeral_host_keys.insert(target.clone(), host_key.clone());
+        ephemeral_host_keys.insert(reconnected.clone(), host_key);
+        Ok((target.clone(), probe))
+    }
+
+    fn probe_reconnect_original_until_deadline(
+        &self,
+        target: &SshTarget,
+        expected: &TargetIdentity,
+        deadline: Duration,
+        configured_timeout: Duration,
+        timeout_error: TransportError,
+    ) -> Result<(SshTarget, TargetProbe), TransportError>
+    where
+        R: CommandRunner,
+        C: Clock,
+    {
+        match self.probe_until_deadline(target, deadline, configured_timeout, timeout_error) {
+            Ok(probe) => Ok((target.clone(), probe)),
+            Err(TransportError::TrustedHostKeyUnavailable) => self.probe_alternate_until_deadline(
+                target,
+                expected,
+                deadline,
+                configured_timeout,
+                timeout_error,
+            ),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn scan_expected_host_key_until_deadline(
+        &self,
+        target: &SshTarget,
+        expected: &TargetIdentity,
+        deadline: Duration,
+        configured_timeout: Duration,
+        timeout_error: TransportError,
+    ) -> Result<(HostKey, SshTarget), TransportError>
+    where
+        R: CommandRunner,
+        C: Clock,
+    {
+        let timeout = self.attempt_timeout(deadline, configured_timeout, timeout_error)?;
+        let scan = self.run_until_deadline(
+            keyscan_invocation(target.host().as_str().into_owned(), timeout),
+            timeout,
+            deadline,
+            timeout_error,
+        )?;
+        if scan.succeeded() {
+            return select_scanned_host_key(scan.stdout(), &expected.host_key_sha256)
+                .map(|host_key| (host_key, target.clone()));
+        }
+        if matches!(target.host(), SshHost::Ipv4(_)) {
+            return Err(TransportError::ConnectionUnavailable);
+        }
+
+        let timeout = self.attempt_timeout(deadline, configured_timeout, timeout_error)?;
+        let resolved = self.run_until_deadline(
+            Invocation::new(
+                "dscacheutil",
+                vec![
+                    "-q".into(),
+                    "host".into(),
+                    "-a".into(),
+                    "name".into(),
+                    target.host().as_str().into_owned(),
+                ],
+            ),
+            timeout,
+            deadline,
+            timeout_error,
+        )?;
+        if !resolved.succeeded() {
+            return Err(TransportError::ConnectionUnavailable);
+        }
+
+        let mut reached_host = false;
+        for address in resolved_host_addresses(resolved.stdout())? {
+            let timeout = self.attempt_timeout(deadline, configured_timeout, timeout_error)?;
+            let scan = self.run_until_deadline(
+                keyscan_invocation(address.to_string(), timeout),
+                timeout,
+                deadline,
+                timeout_error,
+            )?;
+            if !scan.succeeded() {
+                continue;
+            }
+            reached_host = true;
+            match select_scanned_host_key(scan.stdout(), &expected.host_key_sha256) {
+                Ok(host_key) => {
+                    let reconnected = format!("{}@{address}", target.username().as_str())
+                        .parse()
+                        .map_err(|_| TransportError::EphemeralTrustFailed)?;
+                    return Ok((host_key, reconnected));
+                }
+                Err(TransportError::HostKeyMismatch) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        if reached_host {
+            Err(TransportError::HostKeyMismatch)
+        } else {
+            Err(TransportError::ConnectionUnavailable)
+        }
     }
 
     fn probe_with_known_hosts(
@@ -1341,6 +1538,53 @@ fn reconnection_candidates(
     Ok(candidates)
 }
 
+fn keyscan_invocation(host: String, timeout: Duration) -> Invocation {
+    let keyscan_timeout_seconds = timeout.as_secs().saturating_sub(1).max(1);
+    Invocation::new(
+        "ssh-keyscan",
+        vec![
+            "-T".into(),
+            keyscan_timeout_seconds.to_string(),
+            "-t".into(),
+            "ed25519,ecdsa,rsa".into(),
+            "--".into(),
+            host,
+        ],
+    )
+}
+
+fn resolved_host_addresses(output: &[u8]) -> Result<Vec<Ipv4Addr>, TransportError> {
+    if output.len() > MAX_HOST_KEY_OUTPUT_BYTES {
+        return Err(TransportError::ConnectionUnavailable);
+    }
+    let output = std::str::from_utf8(output).map_err(|_| TransportError::ConnectionUnavailable)?;
+    let mut seen = HashSet::new();
+    let mut addresses = Vec::new();
+    for line in output.lines() {
+        let Some((field, value)) = line.split_once(':') else {
+            continue;
+        };
+        if field.trim() != "ip_address" {
+            continue;
+        }
+        let address = value
+            .trim()
+            .parse::<Ipv4Addr>()
+            .map_err(|_| TransportError::ConnectionUnavailable)?;
+        if seen.insert(address) {
+            addresses.push(address);
+            if addresses.len() > MAX_RECONNECT_CANDIDATES {
+                return Err(TransportError::ConnectionUnavailable);
+            }
+        }
+    }
+    if addresses.is_empty() {
+        return Err(TransportError::ConnectionUnavailable);
+    }
+    addresses.sort();
+    Ok(addresses)
+}
+
 fn bounded_attempt_timeout(remaining: Duration, configured_timeout: Duration) -> Option<Duration> {
     let timeout = remaining.min(configured_timeout);
     (timeout >= Duration::from_secs(1)).then_some(timeout)
@@ -1382,6 +1626,26 @@ impl HostKey {
             self.encoded
         )
     }
+}
+
+fn exact_known_hosts_file(
+    target: &SshTarget,
+    host_key: &HostKey,
+) -> Result<NamedTempFile, TransportError> {
+    let mut known_hosts = NamedTempFile::new().map_err(|_| TransportError::EphemeralTrustFailed)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        known_hosts
+            .as_file_mut()
+            .set_permissions(fs::Permissions::from_mode(0o600))
+            .map_err(|_| TransportError::EphemeralTrustFailed)?;
+    }
+    known_hosts
+        .write_all(host_key.known_hosts_line(target).as_bytes())
+        .and_then(|()| known_hosts.flush())
+        .map_err(|_| TransportError::EphemeralTrustFailed)?;
+    Ok(known_hosts)
 }
 
 /// Calculates the OpenSSH SHA-256 fingerprint from locally trusted
