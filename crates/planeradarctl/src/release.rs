@@ -108,7 +108,6 @@ const CANDIDATE_RELEASE_WORKFLOW_PATH: &str = ".github/workflows/release.yml";
 const STABLE_RELEASE_WORKFLOW_PATH: &str = ".github/workflows/stable-draft.yml";
 const REQUIRED_TARGET_PACKAGES: &[&str] = &[
     "avahi-daemon",
-    "build-essential",
     "ca-certificates",
     "device-tree-compiler",
     "dkms",
@@ -118,7 +117,6 @@ const REQUIRED_TARGET_PACKAGES: &[&str] = &[
     "libgl1-mesa-dri",
     "libgles2",
     "libsdl2-2.0-0",
-    "linux-headers-rpi-v8",
     "pngcheck",
 ];
 const MAX_STREAM_STDERR_BYTES: usize = 64 * 1024;

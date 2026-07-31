@@ -2,7 +2,7 @@ use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use nix::fcntl::{OFlag, openat, renameat};
@@ -38,8 +38,6 @@ const RUNTIME_PACKAGES: &[&str] = &[
     "dkms",
     "kmod",
     "device-tree-compiler",
-    "linux-headers-rpi-v8",
-    "build-essential",
     "evtest",
     "pngcheck",
 ];
@@ -1482,6 +1480,26 @@ pub struct SystemCommandRunner;
 impl CommandRunner for SystemCommandRunner {
     fn run(&self, program: &str, args: &[&str]) -> Result<(), InstallError> {
         let status = Command::new(program).args(args).status()?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(InstallError::CommandFailed {
+                program: program.to_owned(),
+                status: status.to_string(),
+            })
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MachineOutputCommandRunner;
+
+impl CommandRunner for MachineOutputCommandRunner {
+    fn run(&self, program: &str, args: &[&str]) -> Result<(), InstallError> {
+        let status = Command::new(program)
+            .args(args)
+            .stdout(Stdio::null())
+            .status()?;
         if status.success() {
             Ok(())
         } else {

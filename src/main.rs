@@ -14,12 +14,12 @@ use planeradar::cli::{Cli, Command, DemoCommand, InstallerStateCommand, version_
 use planeradar::display::{DisplayConfig, run_display, run_probe};
 use planeradar::install::{
     ApplicationReleaseIdentity, BootConfigEditor, DisplaySelection, InstallOptions, Installer,
-    SystemCommandRunner, activate_application_release, application_release_ownership_json,
-    commit_display_config, ensure_overlay, installer_ownership_json,
-    parse_application_ownership_json, read_installer_state_json, read_lifecycle_state_json,
-    read_optional_installer_state_json, read_optional_lifecycle_state_json,
-    retire_application_artifacts, rollback_display_config, stage_tryboot_config,
-    stage_tryboot_config_if_source_matches, uninstall_owned_installation,
+    MachineOutputCommandRunner, SystemCommandRunner, activate_application_release,
+    application_release_ownership_json, commit_display_config, ensure_overlay,
+    installer_ownership_json, parse_application_ownership_json, read_installer_state_json,
+    read_lifecycle_state_json, read_optional_installer_state_json,
+    read_optional_lifecycle_state_json, retire_application_artifacts, rollback_display_config,
+    stage_tryboot_config, stage_tryboot_config_if_source_matches, uninstall_owned_installation,
     write_installer_state_json, write_lifecycle_state_json,
 };
 use planeradar::logging;
@@ -104,14 +104,19 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             reboot,
             json,
         } => {
-            let result = Installer::new(&SystemCommandRunner).install(&InstallOptions {
+            let options = InstallOptions {
                 root: "/".into(),
                 boot_config: "/boot/firmware/config.txt".into(),
                 artifact,
                 checksum_file,
                 revision_file,
                 reboot,
-            })?;
+            };
+            let result = if json {
+                Installer::new(&MachineOutputCommandRunner).install(&options)?
+            } else {
+                Installer::new(&SystemCommandRunner).install(&options)?
+            };
             if json {
                 println!("{}", result.to_json()?);
             } else {

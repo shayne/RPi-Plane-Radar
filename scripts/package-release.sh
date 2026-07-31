@@ -528,9 +528,9 @@ manifest = {
         "kernel_policy": "driver-manifest-supported",
     },
     "required_target_packages": [
-        "avahi-daemon", "build-essential", "ca-certificates", "device-tree-compiler",
+        "avahi-daemon", "ca-certificates", "device-tree-compiler",
         "dkms", "evtest", "kmod", "libegl1", "libgl1-mesa-dri", "libgles2",
-        "libsdl2-2.0-0", "linux-headers-rpi-v8", "pngcheck",
+        "libsdl2-2.0-0", "pngcheck",
     ],
     "minimum_control_version": "0.1.0",
     "driver": {

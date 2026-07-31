@@ -217,6 +217,7 @@ struct FixtureSystemState {
     driver_targets: RefCell<Vec<(&'static str, SshTarget)>>,
     driver_tool_target: RefCell<Option<SshTarget>>,
     normal_boot_tool_targets: RefCell<Vec<SshTarget>>,
+    normal_boot_before_application: Cell<usize>,
 }
 
 impl FixtureSystem {
@@ -233,6 +234,7 @@ impl FixtureSystem {
                 driver_targets: RefCell::new(Vec::new()),
                 driver_tool_target: RefCell::new(None),
                 normal_boot_tool_targets: RefCell::new(Vec::new()),
+                normal_boot_before_application: Cell::new(0),
             }),
         }
     }
@@ -621,6 +623,18 @@ impl DriverActions<FixtureSystem> for FixtureSystem {
             format!("[all]\ndtoverlay={overlay}\n"),
         )
         .map_err(|_| BackendFailure::OperationFailed)?;
+        let accepted = self.accepted_identity()?;
+        fs::write(
+            self.path("/var/lib/hyperpixel2r-kms/accepted-state"),
+            format!(
+                "driver_version={}\nsource_revision={}\nkernel_release={}\noverlay_file={}\n",
+                accepted.driver_version,
+                accepted.source_revision,
+                accepted.kernel_release,
+                accepted.overlay_file,
+            ),
+        )
+        .map_err(|_| BackendFailure::OperationFailed)?;
         let _ = fs::remove_file(self.path("/boot/firmware/tryboot.txt"));
         let _ = fs::remove_file(self.path("/var/lib/hyperpixel2r-kms/tryboot-state"));
         Ok(())
@@ -631,6 +645,11 @@ impl DriverActions<FixtureSystem> for FixtureSystem {
         _transport: &FixtureSystem,
         target: &SshTarget,
     ) -> Result<bool, BackendFailure> {
+        if !self.path("/opt/planeradar/bin/planeradar").is_file() {
+            self.shared
+                .normal_boot_before_application
+                .set(self.shared.normal_boot_before_application.get() + 1);
+        }
         self.shared
             .driver_targets
             .borrow_mut()
@@ -711,7 +730,18 @@ impl Transport for FixtureSystem {
                 ]
                 .iter()
                 .all(|row| accepted.lines().any(|line| line == row));
-            return if exact {
+            let artifact = self.path(format!(
+                "/usr/lib/hyperpixel2r-kms/{}/{}/{}",
+                arguments[5], arguments[6], arguments[7]
+            ));
+            let prior_tryboot = artifact.join("prior-tryboot.txt");
+            let live_tryboot = self.path("/boot/firmware/tryboot.txt");
+            let prior_tryboot_is_bound = match (prior_tryboot.exists(), live_tryboot.exists()) {
+                (false, false) => true,
+                (true, true) => fs::read(&prior_tryboot).ok() == fs::read(&live_tryboot).ok(),
+                _ => false,
+            };
+            return if exact && prior_tryboot_is_bound {
                 Ok(Output::success(Vec::new(), Vec::new()))
             } else {
                 Err(TransportError::CommandFailed)
@@ -1402,10 +1432,15 @@ fn controller_install_resume_reaches_every_real_phase() {
         "libgles2",
         "libgl1-mesa-dri",
         "avahi-daemon",
-        "linux-headers-rpi-v8",
     ] {
         assert!(commands[install].split('\t').any(|value| value == package));
     }
+    assert!(
+        commands[install]
+            .split('\t')
+            .all(|value| !value.starts_with("linux-image") && !value.starts_with("linux-headers")),
+        "fixture application install selected a kernel or kernel-header package"
+    );
     assert!(
         !commands
             .iter()
@@ -1558,6 +1593,20 @@ fn controller_install_reuses_an_exact_healthy_accepted_driver_without_tryboot_mu
         .accept(&fixture, &ssh_target)
         .expect("seed accepted normal boot");
     let postconditions = fixture.postconditions().expect("accepted postconditions");
+    let accepted_artifact = root.join(format!(
+        "usr/lib/hyperpixel2r-kms/{}/{}/{}",
+        postconditions.driver_version,
+        postconditions.source_revision,
+        postconditions.kernel_release
+    ));
+    let preserved_tryboot = b"[all]\narm_boost=1\n";
+    fs::write(
+        accepted_artifact.join("prior-tryboot.txt"),
+        preserved_tryboot,
+    )
+    .expect("accepted prior tryboot backup");
+    fs::write(root.join("boot/firmware/tryboot.txt"), preserved_tryboot)
+        .expect("live preserved tryboot");
     fs::write(
         root.join("var/lib/hyperpixel2r-kms/accepted-state"),
         format!(
@@ -1633,6 +1682,16 @@ fn controller_install_reuses_an_exact_healthy_accepted_driver_without_tryboot_mu
             .all(|arguments| arguments.iter().all(|argument| argument != "0 tryboot")),
         "an identical accepted driver triggered a tryboot reboot"
     );
+    assert_eq!(
+        fs::read(root.join("boot/firmware/tryboot.txt")).expect("preserved live tryboot"),
+        preserved_tryboot,
+        "accepted prior tryboot bytes changed during driver reuse"
+    );
+    assert_eq!(
+        fixture.shared.normal_boot_before_application.get(),
+        0,
+        "renderer-aware normal-boot verification ran before the application was installed"
+    );
 }
 
 #[test]
@@ -1661,6 +1720,41 @@ fn accepted_driver_receipt_check_keeps_postconditions_out_of_the_shell_program()
     );
     assert!(program.contains("12:0"));
     assert!(program.contains("%u:%g:%a:%h"));
+    assert!(
+        program.contains("prior_tryboot=$artifact/prior-tryboot.txt"),
+        "receipt check omitted the accepted prior tryboot binding"
+    );
+    assert!(
+        program.contains("digest \"$live_tryboot\" \"$(sha256sum -- \"$prior_tryboot\""),
+        "receipt check does not bind a preserved live tryboot file to its accepted backup"
+    );
+    assert!(
+        !program.contains("/boot/firmware/tryboot.txt; do absent"),
+        "receipt check rejects every accepted preserved prior tryboot file"
+    );
+    for live_check in [
+        "test \"$(uname -m)\" = aarch64",
+        "test \"$(uname -r)\" = \"$3\"",
+        "test \"$tryboot_hex\" != 00000001",
+        "hyperpixel2r_kms\" { count++ } END { print count+0 }')\" = 1",
+        "module_version=/sys/module/hyperpixel2r_kms/version",
+        "test \"$(tr -d '\\n' < \"$module_version\")\" = \"$1\"",
+        "generic_bound_count=$((generic_bound_count + 1))",
+        "test \"$generic_bound_count\" = 1",
+        "grep -Fxq 480x480",
+        "test \"$connected\" = 1",
+        "grep -Eiq 'EDT|FT5'",
+        "test \"$touch\" = true",
+    ] {
+        assert!(
+            program.contains(live_check),
+            "accepted receipt omitted live hardware check: {live_check}"
+        );
+    }
+    assert!(
+        !program.contains("journalctl") && !program.contains("SDL display ready"),
+        "pre-install accepted-driver reuse incorrectly requires application renderer evidence"
+    );
     for path in [
         "tryboot-state",
         "rollback-state",

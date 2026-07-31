@@ -9,11 +9,11 @@ use clap::Parser;
 use planeradar::cli::{Cli, Command as CliCommand};
 use planeradar::install::{
     ApplicationReleaseIdentity, CommandRunner, InstallError, InstallOptions, InstallResult,
-    InstalledFile, Installer, PLANERADAR_SERVICE, activate_application_release,
-    application_release_ownership_json, parse_application_ownership_json,
-    read_installer_state_json, read_lifecycle_state_json, read_optional_installer_state_json,
-    retire_application_artifacts, uninstall_owned_installation, write_installer_state_json,
-    write_lifecycle_state_json,
+    InstalledFile, Installer, MachineOutputCommandRunner, PLANERADAR_SERVICE,
+    activate_application_release, application_release_ownership_json,
+    parse_application_ownership_json, read_installer_state_json, read_lifecycle_state_json,
+    read_optional_installer_state_json, retire_application_artifacts, uninstall_owned_installation,
+    write_installer_state_json, write_lifecycle_state_json,
 };
 use sha2::{Digest, Sha256};
 
@@ -28,8 +28,6 @@ const EXPECTED_PACKAGES: &[&str] = &[
     "dkms",
     "kmod",
     "device-tree-compiler",
-    "linux-headers-rpi-v8",
-    "build-essential",
     "evtest",
     "pngcheck",
 ];
@@ -217,6 +215,37 @@ fn installer_declares_every_graphics_runtime_package() {
 }
 
 #[test]
+fn installer_never_selects_a_kernel_or_header_meta_package() {
+    let fixture = Fixture::new("[all]\n");
+    let runner = RecordingRunner::for_root(&fixture.root);
+    Installer::new(&runner)
+        .install(&fixture.options(false))
+        .expect("install");
+    let install = runner
+        .commands()
+        .into_iter()
+        .find(|(program, args)| {
+            program == "apt-get" && args.first().is_some_and(|value| value == "install")
+        })
+        .expect("apt install");
+
+    assert!(
+        install.1.iter().all(|package| {
+            !package.starts_with("linux-image") && !package.starts_with("linux-headers")
+        }),
+        "application installation may not select a new kernel or kernel-header meta package: {:?}",
+        install.1
+    );
+}
+
+#[test]
+fn machine_output_runner_reserves_stdout_for_the_result_document() {
+    MachineOutputCommandRunner
+        .run("sh", &["-c", "test -c /dev/fd/1 && printf package-noise"])
+        .expect("machine-output child stdout is /dev/null");
+}
+
+#[test]
 fn installer_verifies_then_installs_once_and_is_idempotent() {
     let original_boot = "[all]\ndtparam=audio=on\n";
     let fixture = Fixture::new(original_boot);
@@ -309,8 +338,6 @@ fn installer_verifies_then_installs_once_and_is_idempotent() {
             "dkms".into(),
             "kmod".into(),
             "device-tree-compiler".into(),
-            "linux-headers-rpi-v8".into(),
-            "build-essential".into(),
             "evtest".into(),
             "pngcheck".into(),
         ],

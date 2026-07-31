@@ -55,7 +55,6 @@ pub fn build_release_with_payload(directory: &Path, payload: Vec<u8>) -> Release
         },
         "required_target_packages": [
             "avahi-daemon",
-            "build-essential",
             "ca-certificates",
             "device-tree-compiler",
             "dkms",
@@ -65,7 +64,6 @@ pub fn build_release_with_payload(directory: &Path, payload: Vec<u8>) -> Release
             "libgl1-mesa-dri",
             "libgles2",
             "libsdl2-2.0-0",
-            "linux-headers-rpi-v8",
             "pngcheck"
         ],
         "minimum_control_version": "0.1.0",
