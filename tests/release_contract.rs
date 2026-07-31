@@ -54,6 +54,26 @@ fn driver_lock_field(name: &str) -> String {
         .unwrap_or_else(|| panic!("driver lock field {name}"))
 }
 
+fn packaged_macho_architecture(path: &Path) -> std::process::Output {
+    let package = read("scripts/package-release.sh");
+    let start = package
+        .find("macho_architecture() {")
+        .expect("portable Mach-O architecture helper");
+    let end = package[start..]
+        .find("\n}\n")
+        .map(|offset| start + offset + 3)
+        .expect("complete Mach-O architecture helper");
+    let probe = format!(
+        "set -eu\n{}\nmacho_architecture \"$1\"\n",
+        &package[start..end]
+    );
+    Command::new("/bin/bash")
+        .args(["-c", &probe, "planeradar-macho-probe"])
+        .arg(path)
+        .output()
+        .expect("execute portable Mach-O helper")
+}
+
 #[test]
 fn release_entrypoints_and_mise_task_are_checked_in() {
     for path in [
@@ -344,16 +364,6 @@ fn packager_has_deterministic_source_and_archive_guards() {
 
 #[test]
 fn packager_portably_identifies_only_thin_supported_macho_inputs() {
-    let package = read("scripts/package-release.sh");
-    let start = package
-        .find("macho_architecture() {")
-        .expect("portable Mach-O architecture helper");
-    let end = package[start..]
-        .find("\n}\n")
-        .map(|offset| start + offset + 3)
-        .expect("complete Mach-O architecture helper");
-    let helper = &package[start..end];
-
     fn segment_command(file_size: u64, section_count: u32) -> Vec<u8> {
         let mut command = Vec::new();
         command.extend_from_slice(&0x19_u32.to_le_bytes());
@@ -399,7 +409,6 @@ fn packager_portably_identifies_only_thin_supported_macho_inputs() {
     let valid_arm64 = thin_macho(0x0100_000c, 2, 1, 72, &valid_segment);
     let valid_x86_64 = thin_macho(0x0100_0007, 2, 1, 72, &valid_segment);
     let temporary = tempfile::tempdir().expect("temporary Mach-O fixtures");
-    let probe = format!("set -eu\n{helper}\nmacho_architecture \"$1\"\n");
 
     for (name, bytes, expected) in [
         ("arm64", valid_arm64.clone(), "arm64"),
@@ -407,11 +416,7 @@ fn packager_portably_identifies_only_thin_supported_macho_inputs() {
     ] {
         let path = temporary.path().join(name);
         fs::write(&path, bytes).expect("valid thin Mach-O fixture");
-        let output = Command::new("/bin/bash")
-            .args(["-c", &probe, "planeradar-macho-probe"])
-            .arg(path)
-            .output()
-            .expect("execute portable Mach-O helper");
+        let output = packaged_macho_architecture(&path);
         assert!(
             output.status.success(),
             "portable Mach-O helper rejected {name}: {}",
@@ -470,11 +475,7 @@ fn packager_portably_identifies_only_thin_supported_macho_inputs() {
     for (name, bytes) in malformed_fixtures {
         let path = temporary.path().join(name);
         fs::write(&path, bytes).expect("malformed Mach-O fixture");
-        let output = Command::new("/bin/bash")
-            .args(["-c", &probe, "planeradar-macho-probe"])
-            .arg(path)
-            .output()
-            .expect("execute portable Mach-O helper");
+        let output = packaged_macho_architecture(&path);
         assert!(
             !output.status.success(),
             "portable Mach-O helper accepted malformed fixture {name}: {}",
@@ -809,17 +810,56 @@ fn packager_rejects_a_dirty_release_source_before_building() {
     );
 }
 
-fn clean_clone() -> tempfile::TempDir {
+fn clean_clone_from(source: &Path) -> tempfile::TempDir {
     let temporary = tempfile::tempdir().expect("temporary repository");
     let status = Command::new("git")
         .args(["clone", "--quiet"])
-        .arg(root())
+        .arg(source)
         .arg(".")
         .current_dir(temporary.path())
         .status()
         .expect("clone fixture repository");
     assert!(status.success());
+    let symbolic_head = Command::new("git")
+        .args(["symbolic-ref", "-q", "HEAD"])
+        .current_dir(temporary.path())
+        .status()
+        .expect("inspect fixture repository HEAD");
+    if !symbolic_head.success() {
+        let status = Command::new("git")
+            .args(["switch", "--create", "fixture-source", "--quiet"])
+            .current_dir(temporary.path())
+            .status()
+            .expect("attach fixture repository HEAD");
+        assert!(status.success());
+    }
     temporary
+}
+
+fn clean_clone() -> tempfile::TempDir {
+    clean_clone_from(&root())
+}
+
+#[test]
+fn packager_fixture_clone_has_an_attached_head_when_its_source_is_detached() {
+    let detached_source = clean_clone();
+    let source_ref = run_fixture_git(detached_source.path(), &["symbolic-ref", "-q", "HEAD"]);
+    let source_branch = source_ref
+        .strip_prefix("refs/heads/")
+        .expect("fixture source branch");
+    run_fixture_git(detached_source.path(), &["switch", "--detach", "--quiet"]);
+    run_fixture_git(detached_source.path(), &["branch", "-D", source_branch]);
+
+    let clone = clean_clone_from(detached_source.path());
+    let symbolic_head = Command::new("git")
+        .args(["symbolic-ref", "-q", "HEAD"])
+        .current_dir(clone.path())
+        .output()
+        .expect("inspect cloned fixture HEAD");
+    assert!(
+        symbolic_head.status.success(),
+        "release fixtures must start from an attached branch even when CI is detached"
+    );
 }
 
 #[test]
@@ -3834,12 +3874,12 @@ fn assembled_release_fixture_is_schema_bound_normalized_and_arch_correct() {
             .expect("extract control");
         assert!(output.status.success());
         fs::write(extraction.path(), output.stdout).expect("extracted control");
-        let lipo = Command::new("lipo")
-            .arg("-archs")
-            .arg(extraction.path())
-            .output()
-            .expect("lipo");
-        assert!(lipo.status.success());
-        assert_eq!(String::from_utf8_lossy(&lipo.stdout).trim(), architecture);
+        let probe = packaged_macho_architecture(extraction.path());
+        assert!(
+            probe.status.success(),
+            "portable Mach-O verification failed: {}",
+            String::from_utf8_lossy(&probe.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&probe.stdout).trim(), architecture);
     }
 }
