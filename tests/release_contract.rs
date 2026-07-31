@@ -505,7 +505,7 @@ fn release_packaging_verifiers_run_on_native_docker_hosts() {
         );
         assert!(
             verifier.contains("Install packaging dependencies")
-                && verifier.contains("file libdigest-sha-perl"),
+                && verifier.contains("file libdigest-sha-perl libsdl2-dev pkg-config zstd"),
             "{path} must provision the non-mise packaging dependencies"
         );
         assert!(
