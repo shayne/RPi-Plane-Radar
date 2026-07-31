@@ -31,7 +31,8 @@ use planeradarctl::state::{
     ArtifactIdentity, InstallPhase, LocalStateStore, StateStore, TargetInstallState,
 };
 use planeradarctl::system_install::{
-    DriverActions, HostPreflightGate, InstallClock, SystemInstallBackend,
+    AcceptedDriverIdentity, DriverActions, HostPreflightGate, InstallClock, SystemInstallBackend,
+    accepted_driver_receipt_command,
 };
 use planeradarctl::target::{SshTarget, TargetIdentity};
 use planeradarctl::transport::{
@@ -487,6 +488,18 @@ impl DriverActions<FixtureSystem> for FixtureSystem {
         Ok(())
     }
 
+    fn accepted_identity(&self) -> Result<AcceptedDriverIdentity, BackendFailure> {
+        Ok(AcceptedDriverIdentity {
+            driver_version: self.shared.driver.version.clone(),
+            source_revision: self.shared.driver.source_commit.clone(),
+            kernel_release: "6.12.47+rpt-rpi-v8".into(),
+            overlay_file: format!(
+                "hyperpixel2r-kms-{}.dtbo",
+                &self.shared.driver.source_commit[..12]
+            ),
+        })
+    }
+
     fn postconditions(&self) -> Result<DriverPostconditions, BackendFailure> {
         let driver = &self.shared.driver;
         let kernel = "6.12.47+rpt-rpi-v8";
@@ -677,6 +690,28 @@ impl Transport for FixtureSystem {
                 .path("/var/lib/hyperpixel2r-kms/tryboot-state")
                 .is_file()
             {
+                Ok(Output::success(Vec::new(), Vec::new()))
+            } else {
+                Err(TransportError::CommandFailed)
+            };
+        }
+        if arguments
+            .iter()
+            .any(|value| value == "planeradar-driver-accepted-reuse")
+        {
+            let accepted =
+                fs::read_to_string(self.path("/var/lib/hyperpixel2r-kms/accepted-state"))
+                    .unwrap_or_default();
+            let exact = arguments.len() == 9
+                && [
+                    format!("driver_version={}", arguments[5]),
+                    format!("source_revision={}", arguments[6]),
+                    format!("kernel_release={}", arguments[7]),
+                    format!("overlay_file={}", arguments[8]),
+                ]
+                .iter()
+                .all(|row| accepted.lines().any(|line| line == row));
+            return if exact {
                 Ok(Output::success(Vec::new(), Vec::new()))
             } else {
                 Err(TransportError::CommandFailed)
@@ -1463,6 +1498,10 @@ fn controller_install_resume_reaches_every_real_phase() {
         "production staged-driver command builder was bypassed"
     );
     assert!(
+        fixture.command_count("planeradar-driver-accepted-reuse") >= 1,
+        "a missing accepted receipt was not checked before the guarded tryboot path"
+    );
+    assert!(
         fixture.command_count("planeradar-driver-committed") >= 1,
         "production committed-driver command builder was bypassed"
     );
@@ -1492,4 +1531,144 @@ fn controller_install_resume_reaches_every_real_phase() {
                 .all(|target| target == &desired_driver_target),
         "normal-boot verification reused the pre-rename driver tool target"
     );
+}
+
+#[test]
+fn controller_install_reuses_an_exact_healthy_accepted_driver_without_tryboot_mutation() {
+    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join(FIXTURE_ROOT);
+    let temporary = tempfile::tempdir().expect("accepted-driver install fixture");
+    let root = temporary.path().join("target");
+    fs::create_dir(&root).expect("target fixture root");
+    let root = fs::canonicalize(root).expect("canonical target fixture root");
+    copy_regular_tree(&source, &root);
+    let (application, driver, payload) = fixture_release(&temporary.path().join("release"));
+    let target = TargetIdentity {
+        host_key_sha256: format!("SHA256:{}", "a".repeat(43)),
+        model: "Raspberry Pi Zero 2 W Rev 1.0".into(),
+        serial: "10000000deadbeef".into(),
+    };
+    let fixture = FixtureSystem::new(root.clone(), target.clone(), driver.clone());
+    let ssh_target: SshTarget = "pi@raspberrypi.local".parse().expect("fixture SSH target");
+    fs::create_dir_all(root.join("var/lib/planeradar-installer"))
+        .expect("fixture installer state directory");
+    fixture
+        .stage(&fixture, &ssh_target)
+        .expect("seed accepted driver artifacts");
+    fixture
+        .accept(&fixture, &ssh_target)
+        .expect("seed accepted normal boot");
+    let postconditions = fixture.postconditions().expect("accepted postconditions");
+    fs::write(
+        root.join("var/lib/hyperpixel2r-kms/accepted-state"),
+        format!(
+            "schema_version=2\ndriver_version={}\nsource_revision={}\nkernel_release={}\nmanifest_sha256={}\nmodule_file={}\nmodule_sha256={}\noverlay_file={}\noverlay_sha256={}\nnormal_config_sha256={}\nstock_config_sha256={}\nprior_dkms_inventory_sha256={}\n",
+            postconditions.driver_version,
+            postconditions.source_revision,
+            postconditions.kernel_release,
+            postconditions.manifest_sha256,
+            postconditions.module_file,
+            postconditions.module_sha256,
+            postconditions.overlay_file,
+            postconditions.overlay_sha256,
+            fixture.sha256(root.join("boot/firmware/config.txt")),
+            "b".repeat(64),
+            "c".repeat(64),
+        ),
+    )
+    .expect("accepted driver receipt");
+    fixture.shared.driver_actions.borrow_mut().clear();
+    fixture.shared.driver_targets.borrow_mut().clear();
+    fixture.shared.remote_commands.borrow_mut().clear();
+    fixture.shared.interrupt_hostname_once.set(false);
+
+    let home = temporary.path().join("home");
+    let state = temporary.path().join("state");
+    fs::create_dir(&home).expect("controller home");
+    fs::create_dir(&state).expect("controller state");
+    let store = LocalStateStore::new(&home, Some(&state), target.clone()).expect("state store");
+    let backend = SystemInstallBackend::new(
+        fixture.clone(),
+        ssh_target,
+        target.clone(),
+        Path::new(env!("CARGO_MANIFEST_DIR")).to_owned(),
+        None,
+        payload,
+        fixture.clone(),
+        fixture.clone(),
+        fixture.clone(),
+    );
+    let request = InstallRequest {
+        target,
+        application,
+        driver,
+        desired_hostname: "planeradar".into(),
+    };
+
+    assert_eq!(
+        ControllerInstaller::new(&backend, &store)
+            .run(request)
+            .expect("install with accepted driver"),
+        InstallOutcome::Complete
+    );
+    assert!(
+        fixture
+            .shared
+            .driver_actions
+            .borrow()
+            .iter()
+            .all(|action| !["stage", "accept"].contains(action)),
+        "an exact accepted driver was staged or committed again: {:?}",
+        fixture.shared.driver_actions.borrow()
+    );
+    assert!(
+        fixture.command_count("planeradar-driver-accepted-reuse") >= 3,
+        "the exact accepted receipt was not reverified at each driver boundary"
+    );
+    assert!(
+        fixture
+            .shared
+            .remote_commands
+            .borrow()
+            .iter()
+            .all(|arguments| arguments.iter().all(|argument| argument != "0 tryboot")),
+        "an identical accepted driver triggered a tryboot reboot"
+    );
+}
+
+#[test]
+fn accepted_driver_receipt_check_keeps_postconditions_out_of_the_shell_program() {
+    let hostile_revision = "$(touch /tmp/planeradar-pwned); echo '";
+    let expected = AcceptedDriverIdentity {
+        driver_version: "0.1.0".into(),
+        source_revision: hostile_revision.into(),
+        kernel_release: "6.18.34+rpt-rpi-v8".into(),
+        overlay_file: "hyperpixel2r-kms-224cc7ab7817.dtbo".into(),
+    };
+    let command = accepted_driver_receipt_command(&expected).expect("accepted receipt command");
+    let arguments = command.arguments();
+    let program = &arguments[3];
+
+    assert_eq!(arguments[4], "planeradar-driver-accepted-reuse");
+    assert_eq!(arguments[6], hostile_revision);
+    assert!(!program.contains(hostile_revision));
+    assert!(
+        std::process::Command::new("sh")
+            .args(["-n", "-c", program])
+            .status()
+            .expect("check receipt shell syntax")
+            .success(),
+        "accepted receipt shell program is not syntactically valid"
+    );
+    assert!(program.contains("12:0"));
+    assert!(program.contains("%u:%g:%a:%h"));
+    for path in [
+        "tryboot-state",
+        "rollback-state",
+        "accepted-transition",
+        "accepted-uninstall",
+        "rollback-candidate-dkms-state",
+        "/boot/firmware/tryboot.txt",
+    ] {
+        assert!(program.contains(path), "receipt check omitted {path}");
+    }
 }

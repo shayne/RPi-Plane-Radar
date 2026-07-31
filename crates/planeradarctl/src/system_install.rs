@@ -74,12 +74,21 @@ impl InstallClock for SystemInstallClock {
 
 pub trait DriverActions<T: Transport> {
     fn ensure_ready(&self, transport: &T, target: &SshTarget) -> Result<(), BackendFailure>;
+    fn accepted_identity(&self) -> Result<AcceptedDriverIdentity, BackendFailure>;
     fn postconditions(&self) -> Result<DriverPostconditions, BackendFailure>;
     fn stage(&self, transport: &T, target: &SshTarget) -> Result<(), BackendFailure>;
     fn verify_tryboot(&self, transport: &T, target: &SshTarget) -> Result<bool, BackendFailure>;
     fn accept(&self, transport: &T, target: &SshTarget) -> Result<(), BackendFailure>;
     fn verify_normal_boot(&self, transport: &T, target: &SshTarget)
     -> Result<bool, BackendFailure>;
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AcceptedDriverIdentity {
+    pub driver_version: String,
+    pub source_revision: String,
+    pub kernel_release: String,
+    pub overlay_file: String,
 }
 
 pub struct SystemDriverActions {
@@ -162,6 +171,17 @@ impl<T: Transport> DriverActions<T> for SystemDriverActions {
         self.with_tool(|tool| {
             tool.postconditions()
                 .map_err(|_| BackendFailure::OperationFailed)
+        })
+    }
+
+    fn accepted_identity(&self) -> Result<AcceptedDriverIdentity, BackendFailure> {
+        self.with_tool(|tool| {
+            Ok(AcceptedDriverIdentity {
+                driver_version: tool.driver_version().to_owned(),
+                source_revision: tool.source_revision().to_owned(),
+                kernel_release: tool.kernel_release().to_owned(),
+                overlay_file: tool.expected_overlay_file().to_owned(),
+            })
         })
     }
 
@@ -342,6 +362,19 @@ where
         let command =
             committed_driver_command(&expected).map_err(|_| BackendFailure::OperationFailed)?;
         self.run_remote_check(command)
+    }
+
+    fn verify_reusable_accepted_driver(&self) -> Result<bool, BackendFailure> {
+        self.driver
+            .ensure_ready(&self.transport, &self.current_target())?;
+        let expected = self.driver.accepted_identity()?;
+        let receipt = accepted_driver_receipt_command(&expected)
+            .map_err(|_| BackendFailure::OperationFailed)?;
+        let reusable = self.run_remote_check(receipt)?
+            && self
+                .driver
+                .verify_normal_boot(&self.transport, &self.current_target())?;
+        Ok(reusable)
     }
 
     fn verify_accepted_driver(&self, normal_boot: bool) -> Result<bool, BackendFailure> {
@@ -547,10 +580,16 @@ where
     }
 
     fn stage_tryboot(&self, _request: &InstallRequest) -> Result<(), BackendFailure> {
+        if self.verify_reusable_accepted_driver()? {
+            return Ok(());
+        }
         self.driver.stage(&self.transport, &self.current_target())
     }
 
     fn boot_and_verify_tryboot(&self, _request: &InstallRequest) -> Result<(), BackendFailure> {
+        if self.verify_reusable_accepted_driver()? {
+            return Ok(());
+        }
         let original = self.current_target();
         self.transport
             .run(
@@ -582,6 +621,9 @@ where
     }
 
     fn accept_driver(&self, _request: &InstallRequest) -> Result<(), BackendFailure> {
+        if self.verify_reusable_accepted_driver()? {
+            return Ok(());
+        }
         self.driver
             .accept(&self.transport, &self.current_target())?;
         if self.verify_accepted_driver(false)? {
@@ -711,6 +753,9 @@ where
                 .ensure_ready(&self.transport, &self.current_target())
                 .map(|()| true),
             InstallPhase::TrybootStaged => {
+                if self.verify_reusable_accepted_driver()? {
+                    return Ok(PhaseVerification::Valid);
+                }
                 let persisted = *self.persisted_target_phase.borrow();
                 if persisted.is_some_and(|phase| phase >= InstallPhase::DriverAccepted) {
                     self.verify_accepted_driver(
@@ -721,6 +766,9 @@ where
                 }
             }
             InstallPhase::TrybootVerified => {
+                if self.verify_reusable_accepted_driver()? {
+                    return Ok(PhaseVerification::Valid);
+                }
                 if self
                     .persisted_target_phase
                     .borrow()
@@ -732,11 +780,17 @@ where
                         .verify_tryboot(&self.transport, &self.current_target())
                 }
             }
-            InstallPhase::DriverAccepted => self.verify_accepted_driver(
-                self.persisted_target_phase
-                    .borrow()
-                    .is_some_and(|phase| phase >= InstallPhase::FinalRebooted),
-            ),
+            InstallPhase::DriverAccepted => {
+                if self.verify_reusable_accepted_driver()? {
+                    Ok(true)
+                } else {
+                    self.verify_accepted_driver(
+                        self.persisted_target_phase
+                            .borrow()
+                            .is_some_and(|phase| phase >= InstallPhase::FinalRebooted),
+                    )
+                }
+            }
             InstallPhase::ApplicationInstalled => self.verify_installed_application(request),
             InstallPhase::HostnameChanged => {
                 let desired = self.desired_target(&request.desired_hostname)?;
@@ -861,6 +915,23 @@ pub fn staged_driver_transaction_command(
         &expected.applied_dtb_file,
         &expected.applied_dtb_sha256,
         &expected.replaced_overlay,
+    ])
+}
+
+#[doc(hidden)]
+pub fn accepted_driver_receipt_command(
+    expected: &AcceptedDriverIdentity,
+) -> Result<RemoteCommand, TransportError> {
+    RemoteCommand::interactive_sudo([
+        "sudo",
+        "sh",
+        "-c",
+        r#"set -eu; root=/var/lib/hyperpixel2r-kms; state=$root/accepted-state; stock=$root/accepted-stock-config.txt; config=/boot/firmware/config.txt; directory() { test ! -L "$1" && test -d "$1" && test "$(stat -c '%u:%g:%a' -- "$1")" = "0:0:$2"; }; regular() { test ! -L "$1" && test -f "$1" && test "$(stat -c '%u:%g:%a:%h' -- "$1")" = "0:0:$2:1"; }; boot_regular() { test ! -L "$1" && test -f "$1" && test "$(stat -c '%u:%g:%h' -- "$1")" = "0:0:1"; case "$(stat -c '%a' -- "$1")" in 644|755) ;; *) return 1;; esac; }; digest() { test "$(sha256sum -- "$1" | awk '{print $1}')" = "$2"; }; absent() { test ! -L "$1" && test ! -e "$1"; }; valid_sha() { candidate=$1; case "$candidate" in *[!0-9a-f]*|'') return 1;; esac; test "${#candidate}" = 64; }; valid_revision() { candidate=$1; case "$candidate" in *[!0-9a-f]*|'') return 1;; esac; test "${#candidate}" = 40; }; directory "$root" 755; directory /usr/lib/hyperpixel2r-kms 755; regular "$state" 600; regular "$stock" 600; boot_regular "$config"; test "$(awk -F= 'NF != 2 || $1 == "" || $2 == "" || seen[$1]++ { bad=1 } END { print NR ":" bad+0 }' "$state")" = "12:0"; value() { awk -F= -v key="$1" '$1 == key { print $2 }' "$state"; }; for key in schema_version driver_version source_revision kernel_release manifest_sha256 module_file module_sha256 overlay_file overlay_sha256 normal_config_sha256 stock_config_sha256 prior_dkms_inventory_sha256; do test "$(awk -F= -v key="$key" '$1 == key { count++ } END { print count+0 }' "$state")" = 1; done; test "$(value schema_version)" = 2; test "$(value driver_version)" = "$1"; test "$(value source_revision)" = "$2"; test "$(value kernel_release)" = "$3"; test "$(value module_file)" = hyperpixel2r_kms.ko; test "$(value overlay_file)" = "$4"; for key in manifest_sha256 module_sha256 overlay_sha256 normal_config_sha256 stock_config_sha256 prior_dkms_inventory_sha256; do valid_sha "$(value "$key")"; done; digest "$config" "$(value normal_config_sha256)"; digest "$stock" "$(value stock_config_sha256)"; version_root="/usr/lib/hyperpixel2r-kms/$1"; revision_root="$version_root/$2"; artifact="$revision_root/$3"; directory "$version_root" 755; directory "$revision_root" 755; directory "$artifact" 755; manifest=$artifact/manifest.txt; regular "$manifest" 644; digest "$manifest" "$(value manifest_sha256)"; test "$(awk -F '\t' 'NF != 2 || $1 == "" || $2 == "" || seen[$1]++ { bad=1 } END { print NR ":" bad+0 }' "$manifest")" = "14:0"; field() { awk -F '\t' -v key="$1" '$1 == key { print $2 }' "$manifest"; }; for key in schema_version driver_version source_revision source_tree kernel_release architecture base_dtb_sha256 module_file module_sha256 module_vermagic overlay_file overlay_sha256 applied_dtb_file applied_dtb_sha256; do test "$(awk -F '\t' -v key="$key" '$1 == key { count++ } END { print count+0 }' "$manifest")" = 1; done; test "$(field schema_version)" = 1; test "$(field driver_version)" = "$1"; test "$(field source_revision)" = "$2"; test "$(field kernel_release)" = "$3"; test "$(field architecture)" = aarch64; valid_revision "$(field source_tree)"; valid_sha "$(field base_dtb_sha256)"; test "$(field module_file)" = "$(value module_file)"; test "$(field module_sha256)" = "$(value module_sha256)"; test "$(field overlay_file)" = "$(value overlay_file)"; test "$(field overlay_sha256)" = "$(value overlay_sha256)"; test "$(field applied_dtb_file)" = hyperpixel2r-kms-applied.dtb; valid_sha "$(field applied_dtb_sha256)"; case "$(field module_vermagic)" in "$3 "*) ;; *) exit 1;; esac; module=$artifact/$(value module_file); overlay=$artifact/$(value overlay_file); applied=$artifact/$(field applied_dtb_file); regular "$module" 644; digest "$module" "$(value module_sha256)"; regular "$overlay" 644; digest "$overlay" "$(value overlay_sha256)"; regular "$applied" 644; digest "$applied" "$(field applied_dtb_sha256)"; marker=$artifact/dkms-prior-state; regular "$marker" 600; digest "$marker" "$(value prior_dkms_inventory_sha256)"; installed_module=/lib/modules/$3/extra/$(value module_file); installed_overlay=/boot/firmware/overlays/$(value overlay_file); regular "$installed_module" 644; digest "$installed_module" "$(value module_sha256)"; boot_regular "$installed_overlay"; digest "$installed_overlay" "$(value overlay_sha256)"; test "$(awk -v wanted="dtoverlay=$4" '{ line=$0; sub(/^[[:space:]]+/, "", line); sub(/[[:space:]]+$/, "", line); if (line !~ /^dtoverlay=/) next; if (line == wanted) { count++; next } if (line ~ /hyperpixel2r/) bad=1 } END { print count ":" bad+0 }' "$config")" = "1:0"; for path in "$root/tryboot-state" "$root/rollback-state" "$root/accepted-transition" "$root/accepted-transition-prior-config.txt" "$root/accepted-uninstall" "$root/accepted-uninstall-stock.txt" "$root/rollback-candidate-dkms-state" "$root/rollback-candidate-tryboot.txt" /boot/firmware/tryboot.txt; do absent "$path"; done"#,
+        "planeradar-driver-accepted-reuse",
+        &expected.driver_version,
+        &expected.source_revision,
+        &expected.kernel_release,
+        &expected.overlay_file,
     ])
 }
 
