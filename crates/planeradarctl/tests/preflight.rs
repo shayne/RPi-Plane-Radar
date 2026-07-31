@@ -1498,7 +1498,10 @@ fn target_adapter_uses_noninteractive_sudo_when_it_is_already_available() {
     assert!(!requests[0].is_interactive_sudo());
     assert_eq!(requests[0].arguments(), ["sudo", "-n", "true"]);
     assert!(!requests[1].is_interactive_sudo());
-    assert_eq!(requests[1].arguments(), ["sh", "-c", TARGET_FACTS_SCRIPT]);
+    assert_eq!(
+        requests[1].arguments(),
+        ["sudo", "-n", "sh", "-c", TARGET_FACTS_SCRIPT]
+    );
     assert!(
         requests
             .iter()
@@ -1529,7 +1532,38 @@ fn target_adapter_falls_back_to_interactive_sudo_validation() {
     assert!(requests[1].is_interactive_sudo());
     assert_eq!(requests[1].arguments(), ["sudo", "-v"]);
     assert!(!requests[2].is_interactive_sudo());
-    assert_eq!(requests[2].arguments(), ["sh", "-c", TARGET_FACTS_SCRIPT]);
+    assert_eq!(
+        requests[2].arguments(),
+        ["sudo", "-n", "sh", "-c", TARGET_FACTS_SCRIPT]
+    );
+}
+
+#[test]
+fn target_facts_probe_accepts_safe_existing_pi_state_without_weakening_conflict_checks() {
+    for required in [
+        r#"repository_probe="${repository_uri}.xz""#,
+        r#"FragmentPath --value planeradar.service"#,
+        r#"/proc/"$service_main_pid"/exe"#,
+        r#"port_80_pid_count"#,
+        r#"test "$port_80_pid_count" = 1"#,
+        r#"root:root:755:1"#,
+        r#"candidate" = "$boot_selected_kernel_release"#,
+        r#"grep -E '^dtoverlay=(.*hyperpixel.*|vc4-kms-dpi.*|dpi[0-9].*)$'"#,
+    ] {
+        assert!(
+            TARGET_FACTS_SCRIPT.contains(required),
+            "missing supported existing-state preflight proof: {required}"
+        );
+    }
+    assert!(
+        !TARGET_FACTS_SCRIPT.contains("curl --fail --head"),
+        "apt reachability must probe an actual compressed index instead of an unserved uncompressed HEAD target"
+    );
+    assert!(
+        !TARGET_FACTS_SCRIPT
+            .contains(r#"grep -Ev '^(|dtoverlay=vc4-kms-v3d|dtoverlay=vc4-kms-dpi-hyperpixel2r"#),
+        "unrelated Raspberry Pi overlays must not be treated as HyperPixel conflicts"
+    );
 }
 
 #[test]

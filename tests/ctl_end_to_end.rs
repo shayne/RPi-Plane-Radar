@@ -652,10 +652,12 @@ impl Transport for FixtureSystem {
         if arguments == ["sudo", "-n", "true"] || arguments == ["sudo", "-v"] {
             return Ok(Output::success(Vec::new(), Vec::new()));
         }
-        if arguments.len() == 3
-            && arguments[0] == "sh"
-            && arguments[1] == "-c"
-            && arguments[2] == TARGET_FACTS_SCRIPT
+        if arguments.len() == 5
+            && arguments[0] == "sudo"
+            && arguments[1] == "-n"
+            && arguments[2] == "sh"
+            && arguments[3] == "-c"
+            && arguments[4] == TARGET_FACTS_SCRIPT
         {
             return Ok(Output::success(self.target_facts(), Vec::new()));
         }
