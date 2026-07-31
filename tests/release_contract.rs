@@ -343,6 +343,179 @@ fn packager_has_deterministic_source_and_archive_guards() {
 }
 
 #[test]
+fn packager_portably_identifies_only_thin_supported_macho_inputs() {
+    let package = read("scripts/package-release.sh");
+    let start = package
+        .find("macho_architecture() {")
+        .expect("portable Mach-O architecture helper");
+    let end = package[start..]
+        .find("\n}\n")
+        .map(|offset| start + offset + 3)
+        .expect("complete Mach-O architecture helper");
+    let helper = &package[start..end];
+
+    fn segment_command(file_size: u64, section_count: u32) -> Vec<u8> {
+        let mut command = Vec::new();
+        command.extend_from_slice(&0x19_u32.to_le_bytes());
+        command.extend_from_slice(&72_u32.to_le_bytes());
+        command.extend_from_slice(&[0; 16]);
+        command.extend_from_slice(&0_u64.to_le_bytes());
+        command.extend_from_slice(&file_size.to_le_bytes());
+        command.extend_from_slice(&0_u64.to_le_bytes());
+        command.extend_from_slice(&file_size.to_le_bytes());
+        command.extend_from_slice(&5_u32.to_le_bytes());
+        command.extend_from_slice(&5_u32.to_le_bytes());
+        command.extend_from_slice(&section_count.to_le_bytes());
+        command.extend_from_slice(&0_u32.to_le_bytes());
+        assert_eq!(command.len(), 72);
+        command
+    }
+
+    fn thin_macho(
+        cpu_type: u32,
+        file_type: u32,
+        command_count: u32,
+        command_bytes: u32,
+        commands: &[u8],
+    ) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for value in [
+            0xfeed_facf,
+            cpu_type,
+            0,
+            file_type,
+            command_count,
+            command_bytes,
+            0,
+            0,
+        ] {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        bytes.extend_from_slice(commands);
+        bytes
+    }
+
+    let valid_segment = segment_command(32 + 72, 0);
+    let valid_arm64 = thin_macho(0x0100_000c, 2, 1, 72, &valid_segment);
+    let valid_x86_64 = thin_macho(0x0100_0007, 2, 1, 72, &valid_segment);
+    let temporary = tempfile::tempdir().expect("temporary Mach-O fixtures");
+    let probe = format!("set -eu\n{helper}\nmacho_architecture \"$1\"\n");
+
+    for (name, bytes, expected) in [
+        ("arm64", valid_arm64.clone(), "arm64"),
+        ("x86_64", valid_x86_64.clone(), "x86_64"),
+    ] {
+        let path = temporary.path().join(name);
+        fs::write(&path, bytes).expect("valid thin Mach-O fixture");
+        let output = Command::new("/bin/bash")
+            .args(["-c", &probe, "planeradar-macho-probe"])
+            .arg(path)
+            .output()
+            .expect("execute portable Mach-O helper");
+        assert!(
+            output.status.success(),
+            "portable Mach-O helper rejected {name}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), expected);
+    }
+
+    let mut undersized_command = Vec::new();
+    undersized_command.extend_from_slice(&0x19_u32.to_le_bytes());
+    undersized_command.extend_from_slice(&4_u32.to_le_bytes());
+    let mut trailing_command_bytes = valid_segment.clone();
+    trailing_command_bytes.extend_from_slice(&[0; 8]);
+    let uuid_command = [
+        0x1b_u32.to_le_bytes().as_slice(),
+        8_u32.to_le_bytes().as_slice(),
+    ]
+    .concat();
+    let unsupported_cpu = thin_macho(0x0100_0012, 2, 1, 72, &valid_segment);
+    let not_executable = thin_macho(0x0100_000c, 6, 1, 72, &valid_segment);
+    let malformed_fixtures = [
+        ("truncated-header", valid_arm64[..8].to_vec()),
+        ("universal", b"\xca\xfe\xba\xbe\0\0\0\x02".to_vec()),
+        ("unsupported-cpu", unsupported_cpu),
+        ("not-executable", not_executable),
+        ("zero-commands", thin_macho(0x0100_000c, 2, 0, 0, &[])),
+        (
+            "too-many-commands",
+            thin_macho(0x0100_000c, 2, 4097, 72, &valid_segment),
+        ),
+        (
+            "truncated-table",
+            thin_macho(0x0100_000c, 2, 1, 72, &valid_segment[..8]),
+        ),
+        (
+            "undersized-command",
+            thin_macho(0x0100_000c, 2, 1, 8, &undersized_command),
+        ),
+        (
+            "trailing-command-bytes",
+            thin_macho(0x0100_000c, 2, 1, 80, &trailing_command_bytes),
+        ),
+        (
+            "missing-segment",
+            thin_macho(0x0100_000c, 2, 1, 8, &uuid_command),
+        ),
+        (
+            "unbacked-segment",
+            thin_macho(0x0100_000c, 2, 1, 72, &segment_command(1024 * 1024, 0)),
+        ),
+        (
+            "truncated-sections",
+            thin_macho(0x0100_000c, 2, 1, 72, &segment_command(32 + 72, 1)),
+        ),
+    ];
+    for (name, bytes) in malformed_fixtures {
+        let path = temporary.path().join(name);
+        fs::write(&path, bytes).expect("malformed Mach-O fixture");
+        let output = Command::new("/bin/bash")
+            .args(["-c", &probe, "planeradar-macho-probe"])
+            .arg(path)
+            .output()
+            .expect("execute portable Mach-O helper");
+        assert!(
+            !output.status.success(),
+            "portable Mach-O helper accepted malformed fixture {name}: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+}
+
+#[test]
+fn release_packaging_verifiers_run_on_native_docker_hosts() {
+    for (path, next_job) in [
+        (".github/workflows/release.yml", "release"),
+        (".github/workflows/stable-draft.yml", "draft"),
+    ] {
+        let workflow = read(path);
+        let start = workflow
+            .find("  verify-release:\n")
+            .unwrap_or_else(|| panic!("{path} verify-release job"));
+        let end_marker = format!("\n  {next_job}:\n");
+        let end = workflow[start..]
+            .find(&end_marker)
+            .map(|offset| start + offset)
+            .unwrap_or_else(|| panic!("{path} job after verify-release"));
+        let verifier = &workflow[start..end];
+        assert!(
+            verifier.contains("runs-on: ubuntu-24.04-arm"),
+            "{path} must package on a native Docker host"
+        );
+        assert!(
+            verifier.contains("Install packaging dependencies")
+                && verifier.contains("file libdigest-sha-perl"),
+            "{path} must provision the non-mise packaging dependencies"
+        );
+        assert!(
+            !verifier.contains("runs-on: macos"),
+            "{path} must not require unsupported nested virtualization"
+        );
+    }
+}
+
+#[test]
 fn release_provenance_is_the_dispatch_oidc_identity_end_to_end() {
     let workflow = read(".github/workflows/release.yml");
     assert!(
@@ -800,8 +973,30 @@ fn packager_provenance_fixture(
     let app = dist.join("app-input");
     let control_arm64 = dist.join("control-arm64-input");
     let control_x86_64 = dist.join("control-x86_64-input");
-    for input in [&app, &control_arm64, &control_x86_64] {
-        write_executable(input, "#!/bin/sh\nexit 0\n");
+    write_executable(&app, "#!/bin/sh\nexit 0\n");
+    for (input, cpu_type) in [
+        (&control_arm64, 0x0100_000c_u32),
+        (&control_x86_64, 0x0100_0007_u32),
+    ] {
+        let mut bytes = Vec::new();
+        for value in [0xfeed_facf, cpu_type, 0, 2, 1, 72, 0, 0] {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        bytes.extend_from_slice(&0x19_u32.to_le_bytes());
+        bytes.extend_from_slice(&72_u32.to_le_bytes());
+        bytes.extend_from_slice(&[0; 16]);
+        bytes.extend_from_slice(&0_u64.to_le_bytes());
+        bytes.extend_from_slice(&104_u64.to_le_bytes());
+        bytes.extend_from_slice(&0_u64.to_le_bytes());
+        bytes.extend_from_slice(&104_u64.to_le_bytes());
+        bytes.extend_from_slice(&5_u32.to_le_bytes());
+        bytes.extend_from_slice(&5_u32.to_le_bytes());
+        bytes.extend_from_slice(&0_u32.to_le_bytes());
+        bytes.extend_from_slice(&0_u32.to_le_bytes());
+        assert_eq!(bytes.len(), 104);
+        fs::write(input, bytes).expect("thin Mach-O input fixture");
+        fs::set_permissions(input, fs::Permissions::from_mode(0o755))
+            .expect("executable Mach-O input fixture");
     }
     write_executable(
         &bin.join("file"),
@@ -810,16 +1005,6 @@ case "$*" in
   *app-input*) echo 'ELF 64-bit LSB executable, ARM aarch64' ;;
   *control-arm64-input*) echo 'Mach-O 64-bit executable arm64' ;;
   *control-x86_64-input*) echo 'Mach-O 64-bit executable x86_64' ;;
-  *) exit 1 ;;
-esac
-"#,
-    );
-    write_executable(
-        &bin.join("lipo"),
-        r#"#!/bin/sh
-case "$*" in
-  *control-arm64-input*) echo arm64 ;;
-  *control-x86_64-input*) echo x86_64 ;;
   *) exit 1 ;;
 esac
 "#,

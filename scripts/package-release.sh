@@ -58,6 +58,74 @@ file_size() {
   fi
 }
 
+macho_architecture() {
+  python3 - "$1" <<'PY'
+import os
+import struct
+import sys
+
+MAX_LOAD_COMMANDS = 4096
+MAX_LOAD_COMMAND_BYTES = 16 * 1024 * 1024
+MH_EXECUTE = 2
+LC_SEGMENT_64 = 0x19
+MACH_HEADER_64_BYTES = 32
+SEGMENT_COMMAND_64_BYTES = 72
+SECTION_64_BYTES = 80
+
+with open(sys.argv[1], "rb") as binary:
+    file_size = os.fstat(binary.fileno()).st_size
+    header = binary.read(MACH_HEADER_64_BYTES)
+    if len(header) != MACH_HEADER_64_BYTES:
+        raise SystemExit(1)
+    magic, cpu_type, _, file_type, command_count, command_bytes, _, _ = struct.unpack(
+        "<8I", header
+    )
+    if magic != 0xFEEDFACF or file_type != MH_EXECUTE:
+        raise SystemExit(1)
+    architecture = {
+        0x0100000C: "arm64",
+        0x01000007: "x86_64",
+    }.get(cpu_type)
+    if architecture is None:
+        raise SystemExit(1)
+    if not (1 <= command_count <= MAX_LOAD_COMMANDS):
+        raise SystemExit(1)
+    if not (command_count * 8 <= command_bytes <= MAX_LOAD_COMMAND_BYTES):
+        raise SystemExit(1)
+    if MACH_HEADER_64_BYTES + command_bytes > file_size:
+        raise SystemExit(1)
+    commands = binary.read(command_bytes)
+    if len(commands) != command_bytes:
+        raise SystemExit(1)
+
+offset = 0
+has_file_backed_segment = False
+for _ in range(command_count):
+    if offset + 8 > len(commands):
+        raise SystemExit(1)
+    command, command_size = struct.unpack_from("<2I", commands, offset)
+    if command_size < 8 or offset + command_size > len(commands):
+        raise SystemExit(1)
+    if command == LC_SEGMENT_64:
+        if command_size < SEGMENT_COMMAND_64_BYTES:
+            raise SystemExit(1)
+        file_offset, segment_size = struct.unpack_from("<2Q", commands, offset + 40)
+        section_count = struct.unpack_from("<I", commands, offset + 64)[0]
+        if command_size != SEGMENT_COMMAND_64_BYTES + section_count * SECTION_64_BYTES:
+            raise SystemExit(1)
+        if (
+            segment_size > 0
+            and file_offset <= file_size
+            and segment_size <= file_size - file_offset
+        ):
+            has_file_backed_segment = True
+    offset += command_size
+if offset != len(commands) or not has_file_backed_segment:
+    raise SystemExit(1)
+print(architecture)
+PY
+}
+
 verify_binary_architecture() {
   local path=$1 expected=$2 description
   description="$(file -b "$path")"
@@ -69,13 +137,13 @@ verify_binary_architecture() {
     darwin-arm64)
       [[ "$description" == *"Mach-O 64-bit"* && "$description" == *"arm64"* ]] ||
         die "control binary is not a Mach-O 64-bit arm64 executable"
-      [[ "$(lipo -archs "$path")" == "arm64" ]] ||
+      [[ "$(macho_architecture "$path")" == "arm64" ]] ||
         die "control binary has a mislabeled or universal architecture"
       ;;
     darwin-x86_64)
       [[ "$description" == *"Mach-O 64-bit"* && "$description" == *"x86_64"* ]] ||
         die "control binary is not a Mach-O 64-bit x86_64 executable"
-      [[ "$(lipo -archs "$path")" == "x86_64" ]] ||
+      [[ "$(macho_architecture "$path")" == "x86_64" ]] ||
         die "control binary has a mislabeled or universal architecture"
       ;;
     *)
@@ -190,7 +258,7 @@ package_version="$(awk -F ' *= *' '
 git cat-file -e "$workflow_commit:$workflow_path" ||
   die "selected source does not contain the required release workflow"
 
-for command in docker cargo file lipo shasum find python3; do
+for command in docker cargo file shasum find python3; do
   require_command "$command"
 done
 
