@@ -1486,7 +1486,7 @@ impl Transport for RecordingTransport {
 }
 
 #[test]
-fn target_adapter_uses_strict_probe_typed_sudo_and_one_fixed_facts_command() {
+fn target_adapter_uses_noninteractive_sudo_when_it_is_already_available() {
     let transport = RecordingTransport::supported();
     let target = SshTarget::from_str("pi@raspberrypi.local").expect("target");
     let report = TargetPreflight::new(&transport, FixedUnixClock(parsed_target().system_time_unix))
@@ -1495,8 +1495,8 @@ fn target_adapter_uses_strict_probe_typed_sudo_and_one_fixed_facts_command() {
 
     let requests = transport.requests.lock().expect("request lock");
     assert_eq!(requests.len(), 2);
-    assert!(requests[0].is_interactive_sudo());
-    assert_eq!(requests[0].arguments(), ["sudo", "-v"]);
+    assert!(!requests[0].is_interactive_sudo());
+    assert_eq!(requests[0].arguments(), ["sudo", "-n", "true"]);
     assert!(!requests[1].is_interactive_sudo());
     assert_eq!(requests[1].arguments(), ["sh", "-c", TARGET_FACTS_SCRIPT]);
     assert!(
@@ -1508,6 +1508,28 @@ fn target_adapter_uses_strict_probe_typed_sudo_and_one_fixed_facts_command() {
                     && !argument.to_ascii_lowercase().contains("token")
             )
     );
+}
+
+#[test]
+fn target_adapter_falls_back_to_interactive_sudo_validation() {
+    let transport = RecordingTransport::with_outputs([
+        Err(TransportError::CommandFailed),
+        Ok(CommandOutput::success(vec![], vec![])),
+        Ok(CommandOutput::success(valid_target_json(), vec![])),
+    ]);
+    let target = SshTarget::from_str("pi@raspberrypi.local").expect("target");
+    let report = TargetPreflight::new(&transport, FixedUnixClock(parsed_target().system_time_unix))
+        .run(&target, &identity());
+    assert!(report.require_success().is_ok(), "{report:?}");
+
+    let requests = transport.requests.lock().expect("request lock");
+    assert_eq!(requests.len(), 3);
+    assert!(!requests[0].is_interactive_sudo());
+    assert_eq!(requests[0].arguments(), ["sudo", "-n", "true"]);
+    assert!(requests[1].is_interactive_sudo());
+    assert_eq!(requests[1].arguments(), ["sudo", "-v"]);
+    assert!(!requests[2].is_interactive_sudo());
+    assert_eq!(requests[2].arguments(), ["sh", "-c", TARGET_FACTS_SCRIPT]);
 }
 
 #[test]
@@ -1528,6 +1550,11 @@ fn target_adapter_stops_before_sudo_and_facts_when_identity_is_wrong() {
 #[test]
 fn target_adapter_rejects_nonzero_sudo_even_with_plausible_output() {
     let transport = RecordingTransport::with_outputs([
+        Ok(CommandOutput::new(
+            1,
+            b"{\"sudo\":true}".to_vec(),
+            b"password prompt".to_vec(),
+        )),
         Ok(CommandOutput::new(
             1,
             b"{\"sudo\":true}".to_vec(),

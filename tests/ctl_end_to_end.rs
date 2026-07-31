@@ -649,7 +649,7 @@ impl Transport for FixtureSystem {
             .remote_commands
             .borrow_mut()
             .push(arguments.clone());
-        if arguments == ["sudo", "-v"] {
+        if arguments == ["sudo", "-n", "true"] || arguments == ["sudo", "-v"] {
             return Ok(Output::success(Vec::new(), Vec::new()));
         }
         if arguments.len() == 3

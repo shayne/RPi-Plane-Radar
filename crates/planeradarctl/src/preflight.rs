@@ -419,10 +419,14 @@ impl<'a, T: Transport, C: UnixClock> TargetPreflight<'a, T, C> {
             );
         }
 
-        let sudo_available = RemoteCommand::interactive_sudo(["sudo", "-v"])
+        let sudo_available = RemoteCommand::ordinary(["sudo", "-n", "true"])
             .ok()
             .and_then(|request| self.transport.run(target, request).ok())
-            .is_some_and(|output| output.status() == 0);
+            .is_some_and(|output| output.status() == 0)
+            || RemoteCommand::interactive_sudo(["sudo", "-v"])
+                .ok()
+                .and_then(|request| self.transport.run(target, request).ok())
+                .is_some_and(|output| output.status() == 0);
         let facts = self.facts(target);
         evaluate_target(
             expected_identity,
