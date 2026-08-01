@@ -33,6 +33,18 @@ module, overlay, 480×480 mode, touch, KMSDRM, and OpenGL ES renderer, commits
 the normal boot, then activates the application. That path reboots because the
 kernel is involved, not because rebooting feels reassuring.
 
+The driver stage is deliberately non-rebooting when Plane Radar calls it. The
+controller first saves the staged phase locally and on the Pi, then owns the
+one tryboot reboot and reconnect. This ordering matters: SSH disappearing
+before the phase is durable turns a successful stage into an ambiguous retry.
+
+For a cross-build, the controller normally refreshes the target kernel export
+and rebuilds. If that export later fails because the package index has retired
+the installed kernel's exact source version, a byte-valid cached build may be
+resumed. The driver stage still revalidates its target manifest, source
+revision, kernel, DTB, and artifact hashes before changing tryboot state. A
+missing or modified cache does not enable this fallback.
+
 Plane Radar retains the current and previous two accepted application/driver
 pairs. Settings are outside those immutable payloads and survive an upgrade.
 
@@ -71,7 +83,9 @@ mise run uninstall -- user@host
 This removes the service, installed application payloads, management helpers,
 recorded display driver state, and only the boot and driver files proven by
 the ownership manifests. It preserves `/var/lib/planeradar/settings.json` and
-the rest of the application state by default.
+the rest of the application state by default. Once the identity-bound
+uninstall completes, the Mac retires the superseded initial-install
+transaction so the same Pi can be installed again from a release bootstrap.
 
 To remove the saved location and preferences too:
 

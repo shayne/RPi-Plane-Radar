@@ -51,7 +51,7 @@ of what already happened.
 
 | State | Location | Durability | Owner |
 | --- | --- | --- | --- |
-| Mac install transaction | `${XDG_STATE_HOME}/planeradar/installer/<host-key-sha256>/state.json`, otherwise `~/.local/state/planeradar/installer/<host-key-sha256>/state.json` | Until the transaction is superseded | Local user, mode 0600 |
+| Mac install transaction | `${XDG_STATE_HOME}/planeradar/installer/<host-key-sha256>/state.json`, otherwise `~/.local/state/planeradar/installer/<host-key-sha256>/state.json` | Until the transaction is superseded; retired after a successful identity-bound uninstall | Local user, mode 0600 |
 | Verified release and payload cache | `~/.cache/planeradar/` | Reusable, content-addressed | Local user, private directory |
 | Driver source cache for maintainers | `.cache/driver/` | Rebuildable and ignored | Local checkout |
 | Target install transaction | `/var/lib/planeradar-installer/state.json` | Through initial install | root, mode 0600 |
@@ -162,13 +162,17 @@ The kernel driver lives in its own GPL-2.0-only repository. Plane Radar does
 not vendor it or use a submodule. `driver.lock.toml` pins the repository,
 semantic version, full commit, release-manifest digest, and lifecycle protocol.
 An exact-kernel prebuilt archive is preferred; Docker cross-builds against the
-target kernel context when no matching archive exists.
+target kernel context when no matching archive exists. A failed refresh may
+fall back to a byte-valid earlier build for that exact kernel; the target-side
+stage protocol revalidates its manifest and postconditions before use.
 
 Driver activation is a boot transaction. The candidate lives in
-`tryboot.txt`, the Pi performs `reboot "0 tryboot"`, and automated probes check
-the module, overlay, DRM mode, touch, SDL driver, and renderer before the
-normal boot configuration is committed. If the trial does not return, the
-next power cycle falls back to the prior normal boot.
+`tryboot.txt`. Plane Radar asks the driver to stage without rebooting, persists
+`TrybootStaged` on both sides of the SSH boundary, and only then performs the
+single `reboot "0 tryboot"` itself. Automated probes check the module, overlay,
+DRM mode, touch, SDL driver, and renderer before the normal boot configuration
+is committed. If the trial does not return, the next power cycle falls back to
+the prior normal boot.
 
 ## Service boundary
 

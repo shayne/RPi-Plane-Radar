@@ -332,23 +332,24 @@ impl<'a, B: InstallBackend, S: StateStore> Installer<'a, B, S> {
             (Some(mac), Some(target)) if records_agree(&mac, &target, &request) => {
                 (mac, target.owned_files)
             }
-            (Some(mac), Some(target))
-                if target_is_reconcilable_one_phase_ahead(&mac, &target, &request) =>
-            {
+            (Some(mac), Some(target)) if target_is_reconcilable_ahead(&mac, &target, &request) => {
                 let candidate = state_at_phase(&mac, target.last_verified_phase, &request);
-                match self
-                    .backend
-                    .verify_phase(candidate.phase, &request, &candidate)
+                for phase in InstallPhase::ALL
+                    .into_iter()
+                    .skip(phase_index(mac.phase) + 1)
+                    .take_while(|phase| *phase <= target.last_verified_phase)
                 {
-                    Ok(PhaseVerification::Valid) => {
-                        self.state_store.save(&candidate)?;
-                        (candidate, target.owned_files)
+                    let phase_state = state_at_phase(&mac, phase, &request);
+                    match self.backend.verify_phase(phase, &request, &phase_state) {
+                        Ok(PhaseVerification::Valid) => {}
+                        Ok(PhaseVerification::Drifted) => {
+                            return Err(InstallError::StateDisagreement);
+                        }
+                        Err(failure) => return Ok(interrupted(mac.phase, failure)),
                     }
-                    Ok(PhaseVerification::Drifted) => {
-                        return Err(InstallError::StateDisagreement);
-                    }
-                    Err(failure) => return Ok(interrupted(mac.phase, failure)),
                 }
+                self.state_store.save(&candidate)?;
+                (candidate, target.owned_files)
             }
             _ => return Err(InstallError::StateDisagreement),
         };
@@ -684,12 +685,12 @@ fn target_matches_mac_state(mac: &InstallState, target: &TargetInstallState) -> 
         && target.driver == mac.driver
 }
 
-fn target_is_reconcilable_one_phase_ahead(
+fn target_is_reconcilable_ahead(
     mac: &InstallState,
     target: &TargetInstallState,
     request: &InstallRequest,
 ) -> bool {
-    previous_phase(target.last_verified_phase) == Some(mac.phase)
+    target.last_verified_phase > mac.phase
         && target.last_verified_phase >= InstallPhase::ApplicationAcquired
         && target.hardware.model == mac.target.model
         && target.hardware.serial == mac.target.serial

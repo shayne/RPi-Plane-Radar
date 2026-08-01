@@ -495,6 +495,68 @@ fn target_record_one_phase_ahead_is_verified_then_reconciled_without_repeating_t
 }
 
 #[test]
+fn target_record_multiple_phases_ahead_is_reconciled_only_after_every_intermediate_postcondition() {
+    let backend = ScriptedBackend::default();
+    let store = MemoryStateStore::default();
+    store
+        .save(&expected_state(InstallPhase::Discovered))
+        .expect("seed Mac state");
+    backend
+        .save_target_state(&expected_target_state(InstallPhase::DriverReady))
+        .expect("seed ahead target state");
+
+    let outcome = Installer::new(&backend, &store)
+        .run(request())
+        .expect("reconcile multiple durable target phases");
+
+    assert_eq!(outcome, InstallOutcome::Complete);
+    for reconciled in [
+        InstallPhase::PreflightPassed,
+        InstallPhase::ApplicationAcquired,
+        InstallPhase::DriverReady,
+    ] {
+        assert_eq!(
+            backend
+                .actions()
+                .iter()
+                .filter(|phase| **phase == reconciled)
+                .count(),
+            0,
+            "repeated reconciled phase {reconciled:?}"
+        );
+    }
+    assert_records_agree(&store, &backend, InstallPhase::Complete);
+}
+
+#[test]
+fn target_record_multiple_phases_ahead_is_rejected_when_any_intermediate_postcondition_drifted() {
+    let backend = ScriptedBackend::default();
+    let store = MemoryStateStore::default();
+    store
+        .save(&expected_state(InstallPhase::Discovered))
+        .expect("seed Mac state");
+    backend
+        .save_target_state(&expected_target_state(InstallPhase::DriverReady))
+        .expect("seed ahead target state");
+    backend.drift(InstallPhase::ApplicationAcquired);
+
+    let error = Installer::new(&backend, &store)
+        .run(request())
+        .expect_err("drifted intermediate phase must block reconciliation");
+
+    assert!(error.is_state_disagreement());
+    assert_eq!(
+        store
+            .load()
+            .expect("load Mac state")
+            .expect("Mac state")
+            .phase,
+        InstallPhase::Discovered
+    );
+    assert!(backend.actions().is_empty());
+}
+
+#[test]
 fn a_postcondition_failure_never_persists_the_unverified_phase() {
     let backend = ScriptedBackend::default();
     let store = MemoryStateStore::default();

@@ -34,9 +34,9 @@ use planeradarctl::{
         extract_application_payload_at_mtime,
     },
     operations::{
-        AcceptedPair, LifecycleBackend, LifecycleError, LifecycleManager, LifecycleState,
-        MANAGEMENT_HELPER_PROTOCOL, ManagementHelper, OperationsClient, ReleasePair,
-        SshOperationsBackend, SystemCaptureClock, UninstallPhase,
+        AcceptedPair, LifecycleBackend, LifecycleError, LifecycleManager, LifecycleOutcome,
+        LifecycleState, MANAGEMENT_HELPER_PROTOCOL, ManagementHelper, OperationsClient,
+        ReleasePair, SshOperationsBackend, SystemCaptureClock, UninstallPhase,
     },
     preflight::{SystemUnixClock, TargetPreflight},
     release::{GhReleaseSource, MANIFEST_NAME, ReleaseClient, ReleaseInput, Verifier},
@@ -789,6 +789,9 @@ fn run_lifecycle_target(
     let transport =
         OpenSshTransport::system(TransportConfig::new(home.join(".ssh").join("known_hosts"))?);
     let observed = transport.probe(&target)?.identity;
+    let local_install_state = (operation == "uninstall")
+        .then(|| LocalStateStore::from_environment(&home, observed.clone()))
+        .transpose()?;
     let cache_root = home.join(".cache").join("planeradar");
     ensure_private_cache_root(&cache_root)?;
     let backend = SystemLifecycleBackend {
@@ -817,6 +820,13 @@ fn run_lifecycle_target(
         "uninstall" => manager.uninstall(config.purge_settings)?,
         _ => unreachable!("known lifecycle operation"),
     };
+    if matches!(
+        outcome,
+        LifecycleOutcome::Uninstalled | LifecycleOutcome::AlreadyUninstalled
+    ) && let Some(store) = local_install_state
+    {
+        store.retire()?;
+    }
     println!("{outcome}");
     Ok(())
 }

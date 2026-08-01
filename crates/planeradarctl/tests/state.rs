@@ -297,6 +297,62 @@ fn failed_save_preserves_the_prior_valid_state() {
     assert_eq!(store.load().expect("load prior state"), Some(original));
 }
 
+#[test]
+fn retiring_a_completed_install_transaction_is_identity_bound_and_idempotent() {
+    let temporary_directory = tempfile::tempdir().expect("temporary directory");
+    let state_home = temporary_directory.path().join("home");
+    let expected = identity();
+    let transaction_store = store(&state_home, expected.clone());
+    transaction_store
+        .save(&state(InstallPhase::Complete))
+        .expect("save completed transaction");
+
+    let mut wrong_identity = expected;
+    wrong_identity.serial = "10000000abcdef02".into();
+    let wrong_store = store(&state_home, wrong_identity);
+    assert!(
+        wrong_store.retire().is_err(),
+        "a different Pi identity must not retire the transaction"
+    );
+    assert!(transaction_store.state_path().is_file());
+
+    assert!(
+        transaction_store
+            .retire()
+            .expect("retire completed transaction")
+    );
+    assert_eq!(
+        transaction_store.load().expect("load retired transaction"),
+        None
+    );
+    assert!(
+        !transaction_store
+            .retire()
+            .expect("repeat transaction retirement"),
+        "retirement must be idempotent"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn retiring_a_transaction_refuses_a_symlink_without_touching_its_target() {
+    let temporary_directory = tempfile::tempdir().expect("temporary directory");
+    let store = store(&temporary_directory.path().join("home"), identity());
+    let parent = store.state_path().parent().expect("state parent");
+    fs::create_dir_all(parent).expect("create state parent");
+
+    let outside = temporary_directory.path().join("outside-state.json");
+    fs::write(&outside, b"outside state").expect("write outside state");
+    symlink(&outside, store.state_path()).expect("create state symlink");
+
+    assert!(store.retire().is_err(), "retire must refuse a symlink");
+    assert_eq!(
+        fs::read(&outside).expect("read outside state"),
+        b"outside state"
+    );
+    assert!(store.state_path().is_symlink());
+}
+
 #[cfg(unix)]
 #[test]
 fn atomic_replacement_leaves_a_hard_link_to_the_prior_valid_state_unchanged() {

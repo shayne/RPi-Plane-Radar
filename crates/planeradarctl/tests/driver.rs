@@ -775,6 +775,109 @@ fn resolved_driver_plan_drives_the_exact_prebuilt_and_crossbuild_command_sequenc
 }
 
 #[test]
+fn crossbuild_reuses_exact_verified_artifacts_when_the_moving_package_index_is_unavailable() {
+    let temporary = tempfile::tempdir().expect("temporary crossbuild cache");
+    let source = temporary.path().join("source");
+    let artifacts = temporary.path().join("artifacts");
+    let kernel_release = "6.18.34+rpt-rpi-v8";
+    let artifact = artifacts.join(kernel_release);
+    fs::create_dir_all(&source).expect("source directory");
+    fs::create_dir_all(&artifact).expect("artifact directory");
+    let module = b"cached module bytes";
+    let overlay = b"cached overlay bytes";
+    let applied = b"cached applied dtb bytes";
+    fs::write(artifact.join("hyperpixel2r_kms.ko"), module).expect("module");
+    fs::write(artifact.join("hyperpixel2r-kms-ca95ffeb30b3.dtbo"), overlay).expect("overlay");
+    fs::write(artifact.join("hyperpixel2r-kms-applied.dtb"), applied).expect("applied dtb");
+    let manifest = format!(
+        "schema_version\t1\ndriver_version\t0.1.0\nsource_revision\t{DRIVER_COMMIT}\nsource_tree\t{DRIVER_TREE}\nkernel_release\t{kernel_release}\narchitecture\taarch64\nbase_dtb_sha256\t{}\nmodule_file\thyperpixel2r_kms.ko\nmodule_sha256\t{}\nmodule_vermagic\t{EXPECTED_VERMAGIC}\noverlay_file\thyperpixel2r-kms-ca95ffeb30b3.dtbo\noverlay_sha256\t{}\napplied_dtb_file\thyperpixel2r-kms-applied.dtb\napplied_dtb_sha256\t{}\n",
+        "a".repeat(64),
+        digest(module),
+        digest(overlay),
+        digest(applied),
+    );
+    fs::write(artifact.join("manifest.txt"), manifest).expect("manifest");
+
+    let runner = SequencedRunner::new([
+        Ok(CommandOutput::new(
+            1,
+            Vec::new(),
+            b"exact source package metadata is unavailable".to_vec(),
+        )),
+        Ok(CommandOutput::success(Vec::new(), Vec::new())),
+    ]);
+    let tool = DriverTool::new(
+        runner.clone(),
+        source.clone(),
+        DriverPlan::CrossBuild { source },
+        DriverContext {
+            target: "pi@raspberrypi.local".into(),
+            kernel_release: kernel_release.into(),
+            kernel_export: temporary.path().join("kernel-target"),
+            artifacts,
+            replace_overlay: String::new(),
+        },
+        "0.1.0".into(),
+        DRIVER_COMMIT.into(),
+    )
+    .expect("crossbuild tool");
+
+    tool.prepare_and_stage()
+        .expect("reuse exact artifacts after export failure");
+
+    let calls = runner.invocations.lock().expect("invocation lock");
+    assert_eq!(
+        calls
+            .iter()
+            .map(|invocation| invocation.arguments()[0]
+                .rsplit('/')
+                .next()
+                .expect("script"))
+            .collect::<Vec<_>>(),
+        ["export-target-kbuild.sh", "stage-tryboot.sh"]
+    );
+    drop(calls);
+
+    fs::write(artifact.join("hyperpixel2r_kms.ko"), b"tampered cache")
+        .expect("tamper cached module");
+    let rejecting_runner = SequencedRunner::new([Ok(CommandOutput::new(
+        1,
+        Vec::new(),
+        b"exact source package metadata is unavailable".to_vec(),
+    ))]);
+    let rejecting_tool = DriverTool::new(
+        rejecting_runner.clone(),
+        temporary.path().join("source"),
+        DriverPlan::CrossBuild {
+            source: temporary.path().join("source"),
+        },
+        DriverContext {
+            target: "pi@raspberrypi.local".into(),
+            kernel_release: kernel_release.into(),
+            kernel_export: temporary.path().join("kernel-target"),
+            artifacts: temporary.path().join("artifacts"),
+            replace_overlay: String::new(),
+        },
+        "0.1.0".into(),
+        DRIVER_COMMIT.into(),
+    )
+    .expect("rejecting crossbuild tool");
+    assert!(matches!(
+        rejecting_tool.prepare_and_stage(),
+        Err(DriverError::ToolCommandFailed {
+            action: DriverAction::ExportKernel,
+            ..
+        })
+    ));
+    let rejecting_calls = rejecting_runner
+        .invocations
+        .lock()
+        .expect("rejecting invocation lock");
+    assert_eq!(rejecting_calls.len(), 1);
+    assert!(rejecting_calls[0].arguments()[0].ends_with("export-target-kbuild.sh"));
+}
+
+#[test]
 fn prebuilt_preparation_executes_target_export_before_the_real_stage_boundary() {
     let temporary = tempfile::tempdir().expect("temporary production contract");
     let source = temporary.path().join("source");
@@ -813,6 +916,7 @@ while test "$#" -gt 0; do
     --target|--replace-overlay) shift 2 ;;
     --kernel-target) kernel_target="$2"; shift 2 ;;
     --artifact-dir) artifact_dir="$2"; shift 2 ;;
+    --stage-only) shift ;;
     *) exit 64 ;;
   esac
 done
@@ -1411,6 +1515,13 @@ fn driver_staging_accepts_only_an_absent_or_exact_supported_overlay_replacement(
                 .arguments()
                 .windows(2)
                 .any(|pair| { pair[0] == "--replace-overlay" && pair[1] == replacement })
+        );
+        assert!(
+            invocations[0]
+                .arguments()
+                .iter()
+                .any(|argument| argument == "--stage-only"),
+            "the app must persist its staged phase before it owns the tryboot reboot"
         );
     }
 

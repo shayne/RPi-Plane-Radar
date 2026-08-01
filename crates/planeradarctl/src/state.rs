@@ -370,6 +370,23 @@ impl LocalStateStore {
         &self.target_key
     }
 
+    /// Retires a completed local install transaction after an identity-bound
+    /// uninstall has superseded it. The record is parsed and matched before it
+    /// is removed, so a stale hostname cannot erase another Pi's recovery
+    /// state. Missing state is an idempotent success.
+    pub fn retire(&self) -> Result<bool, StateError> {
+        if self.load()?.is_none() {
+            return Ok(false);
+        }
+        reject_unsafe_final_path(&self.state_path)?;
+        fs::remove_file(&self.state_path).map_err(|source| StateError::Io {
+            path: self.state_path.clone(),
+            source,
+        })?;
+        sync_directory(self.state_parent()?)?;
+        Ok(true)
+    }
+
     fn state_parent(&self) -> Result<&Path, StateError> {
         self.state_path
             .parent()

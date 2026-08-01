@@ -1724,8 +1724,19 @@ impl<R: CommandRunner> DriverTool<R> {
                 self.run(DriverAction::ExportKernel)?;
             }
             DriverPlan::CrossBuild { .. } => {
-                self.run(DriverAction::ExportKernel)?;
-                self.run(DriverAction::Build)?;
+                if let Err(export_error) = self.run(DriverAction::ExportKernel) {
+                    // Repository metadata moves independently of an installed
+                    // kernel. If an earlier exact-kernel build is still
+                    // byte-valid, let the driver stage protocol revalidate its
+                    // target manifest and remote postconditions rather than
+                    // making recovery depend on a package version that has
+                    // disappeared from the index.
+                    if self.postconditions().is_err() {
+                        return Err(export_error);
+                    }
+                } else {
+                    self.run(DriverAction::Build)?;
+                }
             }
         }
         Ok(())
@@ -1839,6 +1850,7 @@ impl<R: CommandRunner> DriverTool<R> {
                     self.context.kernel_export.to_string_lossy().into_owned(),
                     "--replace-overlay".into(),
                     self.context.replace_overlay.clone(),
+                    "--stage-only".into(),
                 ]);
             }
             DriverAction::VerifyBoot => {
