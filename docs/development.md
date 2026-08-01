@@ -94,12 +94,13 @@ mise run install -- user@host --release-dir /absolute/path/to/release
 The command decides which verification path applies:
 
 - A local `--release-dir` verifies its local manifest, checksums, and release
-  identity.
+  identity. If it is a stable draft, it also verifies every runnable artifact
+  attestation without requiring the not-yet-created public tag.
 - An explicit source-controller release candidate selected with `--version`
   verifies its release-candidate manifest, checksums, and release identity, but
   skips the stable-only GitHub release and attestation policy.
-- Stable source-controller versions add `gh release verify` and runnable
-  artifact attestations.
+- Published stable source-controller versions add `gh release verify` as well
+  as the runnable artifact attestations.
 
 The separate release bootstrap verifies release-candidate attestations before
 executing the downloaded controller. “Published” is not one security mode

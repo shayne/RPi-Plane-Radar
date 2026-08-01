@@ -1002,9 +1002,12 @@ impl<R: TransportCommandRunner, C: Clock> SystemLifecycleBackend<R, C> {
             ReleaseClient::new(GhReleaseSource::system(), self.cache_root.join("release"))
                 .resolve(version, driver_lock, input)
                 .map_err(|_| LifecycleError::ImmutableReleaseMismatch)?;
-        Verifier::new(SystemCommandRunner)
-            .verify(version, &release)
-            .map_err(|_| LifecycleError::ImmutableReleaseMismatch)?;
+        let verifier = Verifier::new(SystemCommandRunner);
+        match input {
+            ReleaseInput::Local(_) => verifier.verify_local(version, &release),
+            ReleaseInput::Downloaded => verifier.verify(version, &release),
+        }
+        .map_err(|_| LifecycleError::ImmutableReleaseMismatch)?;
         let artifact = release
             .artifacts
             .iter()
@@ -2058,7 +2061,11 @@ fn run_install(config: InstallConfig) -> Result<(), Box<dyn std::error::Error>> 
         .map_or(ReleaseInput::Downloaded, ReleaseInput::Local);
     let release = ReleaseClient::new(GhReleaseSource::system(), cache_root.join("release"))
         .resolve(&version, &lock, release_input)?;
-    Verifier::new(SystemCommandRunner).verify(&version, &release)?;
+    let verifier = Verifier::new(SystemCommandRunner);
+    match release_input {
+        ReleaseInput::Local(_) => verifier.verify_local(&version, &release),
+        ReleaseInput::Downloaded => verifier.verify(&version, &release),
+    }?;
     let application_artifact = release
         .artifacts
         .iter()

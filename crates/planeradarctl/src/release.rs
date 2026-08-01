@@ -788,6 +788,23 @@ impl<R: CommandRunner> Verifier<R> {
         requested_version: &Version,
         release: &ResolvedRelease,
     ) -> Result<(), ReleaseError> {
+        self.verify_with_publication(requested_version, release, true)
+    }
+
+    pub fn verify_local(
+        &self,
+        requested_version: &Version,
+        release: &ResolvedRelease,
+    ) -> Result<(), ReleaseError> {
+        self.verify_with_publication(requested_version, release, false)
+    }
+
+    fn verify_with_publication(
+        &self,
+        requested_version: &Version,
+        release: &ResolvedRelease,
+        require_public_release: bool,
+    ) -> Result<(), ReleaseError> {
         let expected_tag = format!("v{requested_version}");
         if &release.manifest.version != requested_version
             || release.tag != expected_tag
@@ -805,19 +822,21 @@ impl<R: CommandRunner> Verifier<R> {
             return Ok(());
         }
 
-        require_command_success(
-            &self.runner,
-            Invocation::new(
-                "gh",
-                vec![
-                    "release".into(),
-                    "verify".into(),
-                    expected_tag,
-                    "-R".into(),
-                    APP_REPOSITORY.into(),
-                ],
-            ),
-        )?;
+        if require_public_release {
+            require_command_success(
+                &self.runner,
+                Invocation::new(
+                    "gh",
+                    vec![
+                        "release".into(),
+                        "verify".into(),
+                        expected_tag,
+                        "-R".into(),
+                        APP_REPOSITORY.into(),
+                    ],
+                ),
+            )?;
+        }
         for artifact in release
             .artifacts
             .iter()

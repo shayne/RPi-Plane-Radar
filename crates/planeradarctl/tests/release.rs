@@ -1518,6 +1518,49 @@ fn stable_release_verification_uses_exact_gh_vectors_for_every_runnable_artifact
 }
 
 #[test]
+fn local_stable_draft_verification_requires_attestations_without_a_public_release() {
+    let temporary = tempfile::tempdir().expect("temporary directory");
+    let runner = RecordingCommandRunner::default();
+    let release = stable_resolved(temporary.path());
+
+    Verifier::new(&runner)
+        .verify_local(&requested("0.1.0"), &release)
+        .expect("local stable draft verification");
+
+    let invocations = runner.invocations.lock().expect("invocations");
+    assert_eq!(invocations.len(), 3);
+    assert!(invocations.iter().all(|invocation| {
+        invocation.program() == "gh"
+            && invocation
+                .arguments()
+                .starts_with(&["attestation".into(), "verify".into()])
+            && invocation
+                .arguments()
+                .contains(&"--deny-self-hosted-runners".into())
+    }));
+}
+
+#[test]
+fn local_stable_draft_verification_fails_closed_on_attestation_error() {
+    let temporary = tempfile::tempdir().expect("temporary directory");
+    let runner = RecordingCommandRunner::with_statuses(vec![1]);
+    let release = stable_resolved(temporary.path());
+
+    assert!(
+        Verifier::new(&runner)
+            .verify_local(&requested("0.1.0"), &release)
+            .is_err()
+    );
+    let invocations = runner.invocations.lock().expect("invocations");
+    assert_eq!(invocations.len(), 1);
+    assert!(
+        invocations[0]
+            .arguments()
+            .starts_with(&["attestation".into(), "verify".into(),])
+    );
+}
+
+#[test]
 fn stable_verification_rejects_persistent_mutation_during_release_verification() {
     let temporary = tempfile::tempdir().expect("temporary directory");
     let release = stable_resolved(temporary.path());

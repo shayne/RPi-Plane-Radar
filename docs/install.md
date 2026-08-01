@@ -55,8 +55,10 @@ mise run install -- user@host --release-dir /absolute/path/to/release
 
 A local directory is not a trust bypass. The controller still checks the
 manifest, checksums, repository, source commit, architecture, driver lock, and
-release identity before using it. Stable releases also receive the stable
-GitHub release and artifact-attestation checks described below.
+release identity before using it. A local stable draft must pass the exact
+artifact-attestation checks described below even though its GitHub release is
+not public yet. A published stable release must also pass GitHub release
+verification.
 
 ## Optional `.env`
 
@@ -99,10 +101,12 @@ Before mutation, every source install verifies:
 - the external driver repository, version, full commit, manifest digest,
   kernel release, vermagic, overlay, and artifact hashes.
 
-The source controller keeps a stable-only attestation policy. For a stable
-release it additionally runs GitHub release verification and verifies each
-runnable artifact attestation. Explicit source release candidates still
-enforce manifests, checksums, and release identity, but they do not run those
+The source controller keeps a stable-only attestation policy. A local stable
+draft verifies each runnable artifact against the exact repository, workflow,
+branch, and source commit without requiring a tag that does not exist yet. A
+published stable release selected with `--version` additionally runs GitHub
+release verification. Explicit source release candidates still enforce
+manifests, checksums, and release identity, but they do not run those
 stable-only `gh release verify` and `gh attestation verify` checks. The
 separate release bootstrap verifies release-candidate attestations before it
 executes the downloaded controller.

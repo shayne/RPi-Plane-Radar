@@ -242,9 +242,10 @@ fn development_guide_distinguishes_every_release_verification_path() {
     let normalized = development.split_whitespace().collect::<Vec<_>>().join(" ");
     for required in [
         "local `--release-dir` verifies its local manifest, checksums, and release identity",
+        "If it is a stable draft, it also verifies every runnable artifact attestation without requiring the not-yet-created public tag",
         "explicit source-controller release candidate selected with `--version` verifies its release-candidate manifest, checksums, and release identity",
         "skips the stable-only GitHub release and attestation policy",
-        "Stable source-controller versions add `gh release verify` and runnable artifact attestations",
+        "Published stable source-controller versions add `gh release verify` as well as the runnable artifact attestations",
         "separate release bootstrap verifies release-candidate attestations before executing the downloaded controller",
     ] {
         assert!(
