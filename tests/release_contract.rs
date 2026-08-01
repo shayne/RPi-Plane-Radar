@@ -191,6 +191,22 @@ fn stable_workflows_promote_the_exact_accepted_draft_without_rebuilding() {
 }
 
 #[test]
+fn stable_draft_installs_pinned_tools_before_parallel_source_verification() {
+    let draft = read(".github/workflows/stable-draft.yml");
+    let install = draft
+        .find("mise install")
+        .expect("stable draft must install the pinned mise environment");
+    let verify = draft
+        .find("mise run verify")
+        .expect("stable draft must verify the exact source");
+
+    assert!(
+        install < verify,
+        "stable draft must finish installing pinned tools before parallel verification"
+    );
+}
+
+#[test]
 fn authoritative_verification_covers_every_workspace_package_and_target() {
     let mise = read("mise.toml");
     let nextest = read(".config/nextest.toml");
