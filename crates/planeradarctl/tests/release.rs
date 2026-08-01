@@ -238,6 +238,38 @@ fn parses_the_complete_valid_manifest_and_reuses_the_checked_in_driver_lock() {
 }
 
 #[test]
+fn accepts_the_exact_pre_curl_package_contract_for_resume_and_rollback_only() {
+    let mut legacy = valid_value();
+    legacy["required_target_packages"]
+        .as_array_mut()
+        .expect("package array")
+        .retain(|package| package != "curl");
+
+    let parsed = parse_value(&legacy, "0.1.0-rc.1")
+        .expect("the exact prior package contract remains recoverable");
+    assert!(
+        parsed
+            .required_target_packages
+            .iter()
+            .all(|package| package != "curl")
+    );
+
+    let mut incomplete = legacy.clone();
+    incomplete["required_target_packages"]
+        .as_array_mut()
+        .expect("package array")
+        .retain(|package| package != "evtest");
+    assert!(parse_value(&incomplete, "0.1.0-rc.1").is_err());
+
+    let mut reordered = legacy;
+    reordered["required_target_packages"]
+        .as_array_mut()
+        .expect("package array")
+        .swap(0, 1);
+    assert!(parse_value(&reordered, "0.1.0-rc.1").is_err());
+}
+
+#[test]
 fn focused_invalid_fixtures_are_rejected() {
     for fixture in [
         include_str!("../../../tests/fixtures/releases/invalid-schema-version.json"),

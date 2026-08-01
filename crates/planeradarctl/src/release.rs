@@ -120,6 +120,19 @@ const REQUIRED_TARGET_PACKAGES: &[&str] = &[
     "libsdl2-2.0-0",
     "pngcheck",
 ];
+const LEGACY_REQUIRED_TARGET_PACKAGES: &[&str] = &[
+    "avahi-daemon",
+    "ca-certificates",
+    "device-tree-compiler",
+    "dkms",
+    "evtest",
+    "kmod",
+    "libegl1",
+    "libgl1-mesa-dri",
+    "libgles2",
+    "libsdl2-2.0-0",
+    "pngcheck",
+];
 const MAX_STREAM_STDERR_BYTES: usize = 64 * 1024;
 
 /// The driver identity in a release manifest is the same checked-in lock type,
@@ -249,11 +262,7 @@ impl ReleaseManifest {
         let minimum_control_version = parse_canonical_version(&raw.minimum_control_version)?;
         if minimum_control_version
             > Version::parse(env!("CARGO_PKG_VERSION")).expect("crate version")
-            || raw.required_target_packages
-                != REQUIRED_TARGET_PACKAGES
-                    .iter()
-                    .map(|value| (*value).to_owned())
-                    .collect::<Vec<_>>()
+            || !supported_package_contract(&raw.required_target_packages)
         {
             return Err(ReleaseError::InvalidManifest);
         }
@@ -368,6 +377,17 @@ impl ReleaseManifest {
             artifacts,
         })
     }
+}
+
+fn supported_package_contract(packages: &[String]) -> bool {
+    [REQUIRED_TARGET_PACKAGES, LEGACY_REQUIRED_TARGET_PACKAGES]
+        .into_iter()
+        .any(|supported| {
+            packages
+                .iter()
+                .map(String::as_str)
+                .eq(supported.iter().copied())
+        })
 }
 
 #[derive(Debug, Deserialize)]

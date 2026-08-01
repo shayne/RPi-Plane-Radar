@@ -942,7 +942,10 @@ impl<R: TransportCommandRunner, C: Clock> SystemLifecycleBackend<R, C> {
         ])
         .map_err(|_| LifecycleError::Backend)?;
         let output = self.run_remote(command)?;
-        if output.stdout() != format!("{MANAGEMENT_HELPER_PROTOCOL}\n").as_bytes() {
+        let expected_lf = format!("{MANAGEMENT_HELPER_PROTOCOL}\n");
+        let expected_crlf = format!("{MANAGEMENT_HELPER_PROTOCOL}\r\n");
+        if output.stdout() != expected_lf.as_bytes() && output.stdout() != expected_crlf.as_bytes()
+        {
             return Err(LifecycleError::Backend);
         }
         Ok(())
@@ -3018,7 +3021,7 @@ mod tests {
             CommandOutput::success(Vec::new(), Vec::new()),
             CommandOutput::success(Vec::new(), Vec::new()),
             CommandOutput::success(Vec::new(), Vec::new()),
-            CommandOutput::success(b"lifecycle-v3\n".to_vec(), Vec::new()),
+            CommandOutput::success(b"lifecycle-v3\r\n".to_vec(), Vec::new()),
             CommandOutput::success(Vec::new(), Vec::new()),
         ]);
         let mut verified = BTreeMap::new();
