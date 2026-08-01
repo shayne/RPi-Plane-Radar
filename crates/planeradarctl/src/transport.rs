@@ -176,6 +176,7 @@ pub struct Invocation {
     os_arguments: Vec<OsString>,
     timeout: Option<Duration>,
     stdout_limit: Option<usize>,
+    inherit_stderr: bool,
 }
 
 impl Invocation {
@@ -187,6 +188,7 @@ impl Invocation {
             os_arguments,
             timeout: None,
             stdout_limit: None,
+            inherit_stderr: false,
         }
     }
 
@@ -201,6 +203,7 @@ impl Invocation {
             os_arguments,
             timeout: None,
             stdout_limit: None,
+            inherit_stderr: false,
         }
     }
 
@@ -238,6 +241,15 @@ impl Invocation {
     pub fn stdout_limit(&self) -> Option<usize> {
         self.stdout_limit
     }
+
+    pub(crate) fn with_inherited_stderr(mut self) -> Self {
+        self.inherit_stderr = true;
+        self
+    }
+
+    pub fn inherits_stderr(&self) -> bool {
+        self.inherit_stderr
+    }
 }
 
 impl fmt::Debug for Invocation {
@@ -248,6 +260,7 @@ impl fmt::Debug for Invocation {
             .field("argument_count", &self.arguments.len())
             .field("timeout", &self.timeout)
             .field("stdout_limit", &self.stdout_limit)
+            .field("inherit_stderr", &self.inherit_stderr)
             .finish()
     }
 }
@@ -328,21 +341,31 @@ impl CommandRunner for SystemCommandRunner {
         let timeout = invocation.timeout;
         let stdout_limit = invocation.stdout_limit.unwrap_or(MAX_CAPTURED_STREAM_BYTES);
         let started_at = Instant::now();
-        let mut child = Command::new(&invocation.program)
+        let mut command = Command::new(&invocation.program);
+        command
             .args(invocation.os_arguments())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|_| RunnerError::Failed)?;
+            .stdout(Stdio::piped());
+        if invocation.inherit_stderr {
+            command.stderr(Stdio::inherit());
+        } else {
+            command.stderr(Stdio::piped());
+        }
+        let mut child = command.spawn().map_err(|_| RunnerError::Failed)?;
         let stdout = child.stdout.take().ok_or(RunnerError::Failed)?;
-        let stderr = child.stderr.take().ok_or(RunnerError::Failed)?;
+        let stderr = if invocation.inherit_stderr {
+            None
+        } else {
+            Some(child.stderr.take().ok_or(RunnerError::Failed)?)
+        };
         let (overflow_sender, overflow_receiver) = mpsc::channel();
         let stdout_reader = thread::spawn({
             let overflow_sender = overflow_sender.clone();
             move || read_limited_stream(stdout, stdout_limit, overflow_sender)
         });
-        let stderr_reader = thread::spawn(move || {
-            read_limited_stream(stderr, MAX_CAPTURED_STREAM_BYTES, overflow_sender)
+        let stderr_reader = stderr.map(|stderr| {
+            thread::spawn(move || {
+                read_limited_stream(stderr, MAX_CAPTURED_STREAM_BYTES, overflow_sender)
+            })
         });
 
         let mut failure = None;
@@ -390,10 +413,16 @@ impl CommandRunner for SystemCommandRunner {
             .join()
             .map_err(|_| RunnerError::Failed)?
             .map_err(|_| RunnerError::Failed)?;
-        let stderr = stderr_reader
-            .join()
-            .map_err(|_| RunnerError::Failed)?
-            .map_err(|_| RunnerError::Failed)?;
+        let stderr = match stderr_reader {
+            Some(reader) => reader
+                .join()
+                .map_err(|_| RunnerError::Failed)?
+                .map_err(|_| RunnerError::Failed)?,
+            None => BoundedCapture {
+                bytes: Vec::new(),
+                exceeded: false,
+            },
+        };
         if stdout.exceeded || stderr.exceeded {
             return Err(RunnerError::Failed);
         }
@@ -667,6 +696,7 @@ impl<R: CommandRunner, C: Clock> Transport for OpenSshTransport<R, C> {
     fn run(&self, target: &SshTarget, request: RemoteCommand) -> Result<Output, TransportError> {
         let (mut arguments, _ephemeral_trust) = self.noninteractive_arguments_for_target(target)?;
         if request.interactive_sudo {
+            arguments.insert(0, "-q".into());
             arguments.insert(0, "-tt".into());
         }
         arguments.extend(target.ssh_arguments());
@@ -677,7 +707,11 @@ impl<R: CommandRunner, C: Clock> Transport for OpenSshTransport<R, C> {
                 .enumerate()
                 .map(|(index, argument)| quote_remote_argument(argument, index == 0)),
         );
-        let output = self.runner.run(Invocation::new("ssh", arguments))?;
+        let mut invocation = Invocation::new("ssh", arguments);
+        if request.interactive_sudo {
+            invocation = invocation.with_inherited_stderr();
+        }
+        let output = self.runner.run(invocation)?;
         if output.succeeded() {
             Ok(output)
         } else {
@@ -697,6 +731,7 @@ impl<R: CommandRunner, C: Clock> Transport for OpenSshTransport<R, C> {
         }
         let (mut arguments, _ephemeral_trust) = self.noninteractive_arguments_for_target(target)?;
         if request.interactive_sudo {
+            arguments.insert(0, "-q".into());
             arguments.insert(0, "-tt".into());
         }
         arguments.extend(target.ssh_arguments());
@@ -707,11 +742,13 @@ impl<R: CommandRunner, C: Clock> Transport for OpenSshTransport<R, C> {
                 .enumerate()
                 .map(|(index, argument)| quote_remote_argument(argument, index == 0)),
         );
-        let output = self.runner.run(
-            Invocation::new("ssh", arguments)
-                .with_timeout(timeout)
-                .with_stdout_limit(stdout_limit),
-        )?;
+        let mut invocation = Invocation::new("ssh", arguments)
+            .with_timeout(timeout)
+            .with_stdout_limit(stdout_limit);
+        if request.interactive_sudo {
+            invocation = invocation.with_inherited_stderr();
+        }
+        let output = self.runner.run(invocation)?;
         if output.succeeded() {
             Ok(output)
         } else {

@@ -2495,12 +2495,14 @@ mod tests {
         TargetInstallState,
     };
     use planeradarctl::system_install::{
-        committed_driver_command, hostname_command, staged_driver_transaction_command,
-        target_install_command, target_install_ownership_command, tryboot_wait_failure,
+        committed_driver_command, display_probe_command, hostname_command,
+        staged_driver_transaction_command, sudo_reboot_validation_command, target_install_command,
+        target_install_ownership_command, tryboot_wait_failure,
     };
     use planeradarctl::target::SshTarget;
     use planeradarctl::transport::{
-        CommandOutput, CommandRunner, Invocation, OpenSshTransport, RunnerError, TransportConfig,
+        CommandOutput, CommandRunner, Invocation, OpenSshTransport, RemoteCommand, RunnerError,
+        Transport, TransportConfig,
     };
     use semver::Version;
     use sha2::{Digest, Sha256};
@@ -3096,6 +3098,32 @@ mod tests {
 
     #[test]
     fn production_adapter_uses_exact_typed_reboot_and_hostname_commands() {
+        let sudo = sudo_reboot_validation_command().expect("sudo validation command");
+        assert!(sudo.is_interactive_sudo());
+        assert_eq!(sudo.arguments(), ["sudo", "true"]);
+
+        let helper = "/var/lib/planeradar-installer/helpers/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/planeradar";
+        let display_probe = display_probe_command(helper).expect("display probe command");
+        assert!(display_probe.is_interactive_sudo());
+        assert_eq!(
+            display_probe.arguments(),
+            [
+                "sudo",
+                "systemd-run",
+                "--quiet",
+                "--wait",
+                "--collect",
+                "--unit=planeradar-display-probe",
+                "--property=Type=exec",
+                "--property=RuntimeMaxSec=45s",
+                "--property=TimeoutStopSec=5s",
+                "--property=StandardOutput=journal",
+                "--property=StandardError=journal",
+                helper,
+                "probe",
+            ]
+        );
+
         let tryboot = tryboot_reboot_command().expect("tryboot command");
         assert!(tryboot.is_interactive_sudo());
         assert_eq!(tryboot.arguments(), ["sudo", "reboot", "0 tryboot"]);
@@ -3119,6 +3147,38 @@ mod tests {
                 "/usr/bin/systemctl",
                 "reboot",
             ]
+        );
+    }
+
+    #[test]
+    fn interactive_sudo_surfaces_its_password_prompt_on_the_controlling_terminal() {
+        let temporary = tempfile::tempdir().expect("temporary transport directory");
+        let runner = RecordingLifecycleRunner::default();
+        let transport = OpenSshTransport::with_runner(
+            &runner,
+            TransportConfig::new(temporary.path().join("known_hosts"))
+                .expect("transport configuration"),
+        );
+        let target = "pi@raspberrypi.local".parse().expect("SSH target");
+
+        transport
+            .run(
+                &target,
+                RemoteCommand::interactive_sudo(["sudo", "true"])
+                    .expect("interactive sudo command"),
+            )
+            .expect("record interactive sudo");
+
+        let invocations = runner.invocations.borrow();
+        let invocation = invocations.last().expect("SSH invocation");
+        assert!(invocation.inherits_stderr());
+        assert_eq!(
+            invocation.arguments().first().map(String::as_str),
+            Some("-tt")
+        );
+        assert_eq!(
+            invocation.arguments().get(1).map(String::as_str),
+            Some("-q")
         );
     }
 
@@ -3380,6 +3440,16 @@ mod tests {
         let command =
             staged_driver_transaction_command(&expected).expect("staged transaction command");
         assert!(command.is_interactive_sudo());
+        let staged_check = &command.arguments()[3];
+        assert!(staged_check.contains("1) expected_rows=16"));
+        assert!(staged_check.contains("2) expected_rows=18"));
+        assert!(staged_check.contains("3) expected_rows=19"));
+        assert!(staged_check.contains("module_existed"));
+        assert!(staged_check.contains("overlay_existed"));
+        assert!(staged_check.contains("prior_dkms_inventory_sha256"));
+        assert!(staged_check.contains("boot_regular \"$overlay\""));
+        assert!(staged_check.contains("boot_regular \"$normal\""));
+        assert!(staged_check.contains("boot_regular \"$candidate\""));
         assert_eq!(
             &command.arguments()[4..],
             [
@@ -3400,8 +3470,20 @@ mod tests {
             ]
         );
 
+        let mut no_replaced_overlay = expected.clone();
+        no_replaced_overlay.replaced_overlay.clear();
+        let no_replacement = staged_driver_transaction_command(&no_replaced_overlay)
+            .expect("staged transaction without a replaced overlay");
+        assert_eq!(
+            no_replacement.arguments().last().map(String::as_str),
+            Some("none")
+        );
+
         let committed = committed_driver_command(&expected).expect("committed");
         assert!(committed.is_interactive_sudo());
+        let committed_check = &committed.arguments()[3];
+        assert!(committed_check.contains("boot_regular \"$overlay\""));
+        assert!(committed_check.contains("boot_regular \"$config\""));
         assert_eq!(
             &committed.arguments()[4..],
             [

@@ -32,7 +32,7 @@ use planeradarctl::state::{
 };
 use planeradarctl::system_install::{
     AcceptedDriverIdentity, DriverActions, HostPreflightGate, InstallClock, SystemInstallBackend,
-    accepted_driver_receipt_command,
+    accepted_driver_receipt_command, recorded_driver_receipt_command,
 };
 use planeradarctl::target::{SshTarget, TargetIdentity};
 use planeradarctl::transport::{
@@ -211,6 +211,7 @@ struct FixtureSystemState {
     identity: TargetIdentity,
     driver: ArtifactIdentity,
     interrupt_hostname_once: Cell<bool>,
+    interrupt_record_once: Cell<bool>,
     monotonic: Cell<Duration>,
     remote_commands: RefCell<Vec<Vec<String>>>,
     driver_actions: RefCell<Vec<&'static str>>,
@@ -229,6 +230,7 @@ impl FixtureSystem {
                 identity,
                 driver,
                 interrupt_hostname_once: Cell::new(true),
+                interrupt_record_once: Cell::new(false),
                 monotonic: Cell::new(Duration::ZERO),
                 remote_commands: RefCell::new(Vec::new()),
                 driver_actions: RefCell::new(Vec::new()),
@@ -513,6 +515,9 @@ impl DriverActions<FixtureSystem> for FixtureSystem {
             "/usr/lib/hyperpixel2r-kms/{}/{}/{kernel}",
             driver.version, driver.source_commit
         ));
+        if !artifact.is_dir() {
+            return Err(BackendFailure::OperationFailed);
+        }
         Ok(DriverPostconditions {
             driver_version: driver.version.clone(),
             source_revision: driver.source_commit.clone(),
@@ -605,10 +610,14 @@ impl DriverActions<FixtureSystem> for FixtureSystem {
             .driver_targets
             .borrow_mut()
             .push(("verify_tryboot", target.clone()));
-        Ok(
-            fs::read_to_string(self.path("/run/planeradar-fixture/module-state"))
-                .is_ok_and(|state| state.trim() == "hyperpixel2r_kms=loaded"),
-        )
+        let module_ready = fs::read_to_string(self.path("/run/planeradar-fixture/module-state"))
+            .is_ok_and(|state| state.trim() == "hyperpixel2r_kms=loaded");
+        let display_ready = fs::read_to_string(self.path("/run/planeradar-fixture/display-probe"))
+            .is_ok_and(|state| state.trim() == "KMSDRM/opengles2");
+        let tryboot_transaction = self
+            .path("/var/lib/hyperpixel2r-kms/tryboot-state")
+            .is_file();
+        Ok(module_ready && display_ready && tryboot_transaction)
     }
 
     fn accept(&self, _transport: &FixtureSystem, target: &SshTarget) -> Result<(), BackendFailure> {
@@ -626,6 +635,24 @@ impl DriverActions<FixtureSystem> for FixtureSystem {
             format!("[all]\ndtoverlay={overlay}\n"),
         )
         .map_err(|_| BackendFailure::OperationFailed)?;
+        let _ = fs::remove_file(self.path("/boot/firmware/tryboot.txt"));
+        let _ = fs::remove_file(self.path("/var/lib/hyperpixel2r-kms/tryboot-state"));
+        Ok(())
+    }
+
+    fn record_accepted(
+        &self,
+        _transport: &FixtureSystem,
+        target: &SshTarget,
+    ) -> Result<(), BackendFailure> {
+        self.shared.driver_actions.borrow_mut().push("record");
+        self.shared
+            .driver_targets
+            .borrow_mut()
+            .push(("record", target.clone()));
+        if self.shared.interrupt_record_once.replace(false) {
+            return Err(BackendFailure::OperationFailed);
+        }
         let accepted = self.accepted_identity()?;
         fs::write(
             self.path("/var/lib/hyperpixel2r-kms/accepted-state"),
@@ -638,8 +665,6 @@ impl DriverActions<FixtureSystem> for FixtureSystem {
             ),
         )
         .map_err(|_| BackendFailure::OperationFailed)?;
-        let _ = fs::remove_file(self.path("/boot/firmware/tryboot.txt"));
-        let _ = fs::remove_file(self.path("/var/lib/hyperpixel2r-kms/tryboot-state"));
         Ok(())
     }
 
@@ -703,7 +728,18 @@ impl Transport for FixtureSystem {
             .remote_commands
             .borrow_mut()
             .push(arguments.clone());
-        if arguments == ["sudo", "-n", "true"] || arguments == ["sudo", "-v"] {
+        if arguments == ["sudo", "-n", "true"] || arguments == ["sudo", "true"] {
+            return Ok(Output::success(Vec::new(), Vec::new()));
+        }
+        if arguments
+            .iter()
+            .any(|argument| argument == "--unit=planeradar-display-probe")
+        {
+            fs::write(
+                self.path("/run/planeradar-fixture/display-probe"),
+                "KMSDRM/opengles2\n",
+            )
+            .map_err(|_| TransportError::CommandFailed)?;
             return Ok(Output::success(Vec::new(), Vec::new()));
         }
         if arguments.len() == 5
@@ -741,7 +777,7 @@ impl Transport for FixtureSystem {
             let accepted =
                 fs::read_to_string(self.path("/var/lib/hyperpixel2r-kms/accepted-state"))
                     .unwrap_or_default();
-            let exact = arguments.len() == 9
+            let exact = arguments.len() == 10
                 && [
                     format!("driver_version={}", arguments[5]),
                     format!("source_revision={}", arguments[6]),
@@ -1382,8 +1418,22 @@ fn controller_install_resume_reaches_every_real_phase() {
         .driver_actions
         .borrow()
         .iter()
-        .filter(|action| matches!(**action, "stage" | "accept"))
+        .filter(|action| matches!(**action, "stage" | "accept" | "record"))
         .count();
+    let driver_actions = fixture.shared.driver_actions.borrow();
+    let committed = driver_actions
+        .iter()
+        .position(|action| *action == "accept")
+        .expect("driver commit action");
+    let recorded = driver_actions
+        .iter()
+        .position(|action| *action == "record")
+        .expect("driver accepted receipt action");
+    assert!(
+        committed < recorded,
+        "accepted receipt preceded driver commit"
+    );
+    drop(driver_actions);
 
     let resumed_store =
         LocalStateStore::new(&home, Some(&state), target.clone()).expect("fresh state store");
@@ -1423,7 +1473,7 @@ fn controller_install_resume_reaches_every_real_phase() {
             .driver_actions
             .borrow()
             .iter()
-            .filter(|action| matches!(**action, "stage" | "accept"))
+            .filter(|action| matches!(**action, "stage" | "accept" | "record"))
             .count(),
         driver_mutations_before_resume,
         "resume repeated completed driver mutations"
@@ -1630,6 +1680,105 @@ fn controller_install_resume_reaches_every_real_phase() {
 }
 
 #[test]
+fn controller_resume_records_an_exact_commit_after_receipt_publication_failed() {
+    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join(FIXTURE_ROOT);
+    let temporary = tempfile::tempdir().expect("partial acceptance fixture");
+    let root = temporary.path().join("target");
+    fs::create_dir(&root).expect("target fixture root");
+    let root = fs::canonicalize(root).expect("canonical target fixture root");
+    copy_regular_tree(&source, &root);
+    let (application, driver, payload) = fixture_release(&temporary.path().join("release"));
+    let target = TargetIdentity {
+        host_key_sha256: format!("SHA256:{}", "a".repeat(43)),
+        model: "Raspberry Pi Zero 2 W Rev 1.0".into(),
+        serial: "10000000deadbeef".into(),
+    };
+    let request = InstallRequest {
+        target: target.clone(),
+        application: application.clone(),
+        driver: driver.clone(),
+        desired_hostname: "planeradar".into(),
+    };
+    let home = temporary.path().join("home");
+    let state = temporary.path().join("state");
+    fs::create_dir(&home).expect("controller home");
+    fs::create_dir(&state).expect("controller state");
+    let store = LocalStateStore::new(&home, Some(&state), target.clone()).expect("state store");
+    let fixture = FixtureSystem::new(root.clone(), target.clone(), driver.clone());
+    fixture.shared.interrupt_record_once.set(true);
+    fixture.shared.interrupt_hostname_once.set(false);
+    let backend = SystemInstallBackend::new(
+        fixture.clone(),
+        "pi@raspberrypi.local".parse().expect("fixture SSH target"),
+        target.clone(),
+        Path::new(env!("CARGO_MANIFEST_DIR")).to_owned(),
+        None,
+        payload,
+        fixture.clone(),
+        fixture.clone(),
+        fixture.clone(),
+    );
+
+    assert_eq!(
+        ControllerInstaller::new(&backend, &store)
+            .run(request.clone())
+            .expect("interrupted receipt publication"),
+        InstallOutcome::Interrupted {
+            phase: InstallPhase::TrybootVerified,
+            reason: InterruptionReason::BackendOperationFailed,
+            guidance: None,
+        }
+    );
+    assert!(!root.join("var/lib/hyperpixel2r-kms/tryboot-state").exists());
+    assert!(
+        !root
+            .join("var/lib/hyperpixel2r-kms/accepted-state")
+            .exists()
+    );
+    assert!(
+        fs::read_to_string(root.join("boot/firmware/config.txt"))
+            .expect("committed normal config")
+            .contains("dtoverlay=hyperpixel2r-kms-")
+    );
+
+    let (_, _, resumed_payload) = fixture_release(&temporary.path().join("resume-release"));
+    let resumed_store =
+        LocalStateStore::new(&home, Some(&state), target.clone()).expect("resumed state store");
+    let resumed = SystemInstallBackend::new(
+        fixture.clone(),
+        "pi@raspberrypi.local".parse().expect("resumed SSH target"),
+        target,
+        Path::new(env!("CARGO_MANIFEST_DIR")).to_owned(),
+        None,
+        resumed_payload,
+        fixture.clone(),
+        fixture.clone(),
+        fixture.clone(),
+    );
+    assert_eq!(
+        ControllerInstaller::new(&resumed, &resumed_store)
+            .run(request)
+            .expect("resumed receipt publication"),
+        InstallOutcome::Complete
+    );
+    let actions = fixture.shared.driver_actions.borrow();
+    assert_eq!(
+        actions.iter().filter(|action| **action == "accept").count(),
+        1,
+        "resume repeated an already committed normal config"
+    );
+    assert_eq!(
+        actions.iter().filter(|action| **action == "record").count(),
+        2,
+        "resume did not retry only the missing accepted receipt"
+    );
+    assert!(
+        root.join("var/lib/hyperpixel2r-kms/accepted-state")
+            .is_file()
+    );
+}
+
+#[test]
 fn controller_install_reuses_an_exact_healthy_accepted_driver_without_tryboot_mutation() {
     let source = Path::new(env!("CARGO_MANIFEST_DIR")).join(FIXTURE_ROOT);
     let temporary = tempfile::tempdir().expect("accepted-driver install fixture");
@@ -1767,6 +1916,14 @@ fn accepted_driver_receipt_check_keeps_postconditions_out_of_the_shell_program()
     let command = accepted_driver_receipt_command(&expected).expect("accepted receipt command");
     let arguments = command.arguments();
     let program = &arguments[3];
+
+    assert_eq!(arguments.last().map(String::as_str), Some("true"));
+    let recorded = recorded_driver_receipt_command(&expected).expect("recorded receipt command");
+    assert_eq!(
+        recorded.arguments().last().map(String::as_str),
+        Some("false")
+    );
+    assert_eq!(&recorded.arguments()[3], program);
 
     assert_eq!(arguments[4], "planeradar-driver-accepted-reuse");
     assert_eq!(arguments[6], hostile_revision);

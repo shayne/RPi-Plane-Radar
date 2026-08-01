@@ -411,8 +411,9 @@ fn only_typed_interactive_sudo_requests_allocate_a_tty() {
     let invocations = runner.invocations();
     let arguments = invocations[0].arguments();
     assert_eq!(arguments[0], "-tt");
+    assert_eq!(arguments[1], "-q");
     assert_eq!(
-        arguments[17..],
+        arguments[18..],
         [
             "--",
             "alice@radar.local",

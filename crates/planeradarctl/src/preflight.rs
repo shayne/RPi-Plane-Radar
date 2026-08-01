@@ -423,7 +423,7 @@ impl<'a, T: Transport, C: UnixClock> TargetPreflight<'a, T, C> {
             .ok()
             .and_then(|request| self.transport.run(target, request).ok())
             .is_some_and(|output| output.status() == 0)
-            || RemoteCommand::interactive_sudo(["sudo", "-v"])
+            || RemoteCommand::interactive_sudo(["sudo", "true"])
                 .ok()
                 .and_then(|request| self.transport.run(target, request).ok())
                 .is_some_and(|output| output.status() == 0);

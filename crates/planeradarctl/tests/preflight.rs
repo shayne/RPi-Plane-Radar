@@ -1609,7 +1609,7 @@ fn target_adapter_falls_back_to_interactive_sudo_validation() {
     assert!(!requests[0].is_interactive_sudo());
     assert_eq!(requests[0].arguments(), ["sudo", "-n", "true"]);
     assert!(requests[1].is_interactive_sudo());
-    assert_eq!(requests[1].arguments(), ["sudo", "-v"]);
+    assert_eq!(requests[1].arguments(), ["sudo", "true"]);
     assert!(!requests[2].is_interactive_sudo());
     assert_eq!(
         requests[2].arguments(),
