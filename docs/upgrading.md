@@ -17,11 +17,13 @@ application version, full revision, binary hash, driver version and revision,
 driver manifest, kernel, module, overlay, service, restart count, HTTP, touch,
 DRM mode, renderer, and mDNS.
 
-## Upgrade to an immutable version
+## Upgrade to the latest immutable stable release
 
 ```sh
-mise run upgrade -- user@host --version 0.1.0-rc.N
+mise run upgrade -- user@host
 ```
+
+Pass `--version X.Y.Z` when you need a specific stable release.
 
 An application-only upgrade stages a content-addressed payload, atomically
 activates it, restarts the service, and verifies health. If health fails, the
@@ -67,7 +69,7 @@ Without a version, rollback selects the newest prior accepted pair. To choose a
 specific retained release:
 
 ```sh
-mise run rollback -- user@host --version 0.1.0-rc.N
+mise run rollback -- user@host --version X.Y.Z
 ```
 
 Application-only rollback is atomic. A driver rollback uses the boot-safe

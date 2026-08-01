@@ -37,6 +37,12 @@ fn fenced_shell_blocks(markdown: &str) -> Vec<String> {
     }
 
     assert!(current.is_none(), "README has an unterminated shell fence");
+    assert!(
+        blocks.iter().all(|block| !block
+            .lines()
+            .any(|line| line.trim_start().starts_with("```"))),
+        "public documentation has a nested shell fence"
+    );
     blocks
 }
 
@@ -133,11 +139,30 @@ fn readme_states_support_maturity_credit_and_disclosure() {
         "maintainers remain responsible",
         "[MIT License](LICENSE)",
         "docs/recovery.md",
-        "stable release remains gated",
+        "immutable stable release",
     ] {
         assert!(
             readme.contains(required),
             "README is missing required public contract text {required:?}"
+        );
+    }
+
+    for stale in [
+        "There is no stable release yet",
+        "0.1.0-rc.N",
+        "stable release remains gated",
+    ] {
+        assert!(
+            !readme.contains(stale),
+            "README still contains pre-release text {stale:?}"
+        );
+    }
+
+    let install = read(repository_root().join("docs/install.md"));
+    for stale in ["There is no stable release yet", "0.1.0-rc.N"] {
+        assert!(
+            !install.contains(stale),
+            "installation guide still contains pre-release text {stale:?}"
         );
     }
 

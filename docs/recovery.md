@@ -18,7 +18,7 @@ Rerun the exact command with the same target, version or release directory,
 hostname, and purge choice:
 
 ```sh
-mise run install -- user@host --version 0.1.0-rc.N
+mise run install -- user@host --version X.Y.Z
 ```
 
 The Mac record lives at

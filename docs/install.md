@@ -39,11 +39,11 @@ mise install
 mise run install -- user@host
 ```
 
-There is no stable release yet. Until `v0.1.0` is published, select a release
-candidate:
+The default command resolves and installs the latest immutable stable release.
+To reproduce the first accepted release exactly, pin `v0.1.0`:
 
 ```sh
-mise run install -- user@host --version 0.1.0-rc.N
+mise run install -- user@host --version 0.1.0
 ```
 
 `--version` and `--release-dir` are mutually exclusive. Maintainers accepting
@@ -84,7 +84,7 @@ default. The target has no implicit private default inside `planeradarctl`.
 With `.env` in place, the command can omit repeated values:
 
 ```sh
-mise run install -- --version 0.1.0-rc.N
+mise run install
 ```
 
 ## What the installer checks
@@ -160,8 +160,8 @@ Release assets contain a native macOS control binary and `install.sh`. Download
 the bootstrap with GitHub CLI:
 
 ```sh
-gh release download v0.1.0-rc.N -R shayne/RPi-Plane-Radar --pattern install.sh --output planeradar-install.sh
-bash planeradar-install.sh --version 0.1.0-rc.N user@host
+gh release download -R shayne/RPi-Plane-Radar --pattern install.sh --output planeradar-install.sh
+bash planeradar-install.sh user@host
 ```
 
 The script requires macOS and an authenticated `gh` session. It resolves the

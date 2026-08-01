@@ -8,9 +8,9 @@ ADS-B radar: a Raspberry Pi Zero 2 W, a Pimoroni HyperPixel 2.1 Round, and
 
 That narrow support statement is deliberate. This configuration has been
 tested on the physical display. Broader Pi, display, and OS support is not
-claimed. A stable release remains gated on the final history, exact-release,
-and clean-room acceptance work; until then, treat this as release-candidate
-software.
+claimed. [Version 0.1.0](https://github.com/shayne/RPi-Plane-Radar/releases/tag/v0.1.0)
+is an immutable stable release built from the hardware-accepted application
+and display-driver pair.
 
 Most of the implementation was built with substantial OpenAI Codex
 assistance. The commit history credits that work explicitly; maintainers still
@@ -44,11 +44,11 @@ the Pi when it needs it. It verifies the Mac, the target, the application
 release, and the separately versioned display driver before changing either
 boot or service state.
 
-There is no stable release yet. While that remains true, select an immutable
-release candidate explicitly:
+The default command installs the latest immutable stable release. To reproduce
+the first accepted release exactly, pin it explicitly:
 
 ```sh
-mise run install -- user@host --version 0.1.0-rc.N
+mise run install -- user@host --version 0.1.0
 ```
 
 The installer defaults the final hostname to `planeradar`. It may reboot once
@@ -58,7 +58,7 @@ the same command if the Mac exits or a reboot outlasts the connection window.
 The boring state file is what makes that safe; guessing which step finished
 would not.
 
-Read [Installation](docs/install.md) before using a release candidate or a
+Read [Installation](docs/install.md) before pinning another version or using a
 local release directory.
 
 ## Configure the radar
@@ -95,14 +95,17 @@ harmless decoration for an issue.
 
 ## Upgrade, roll back, or remove it
 
-Choose immutable versions for changes:
+Upgrade to the latest immutable stable release, roll back to a retained
+release, or remove Plane Radar:
 
 ```sh
-mise run upgrade -- user@host --version 0.1.0-rc.N
+mise run upgrade -- user@host
 mise run rollback -- user@host
 mise run uninstall -- user@host
 mise run uninstall -- user@host --purge-settings
 ```
+
+Pass `--version X.Y.Z` to `upgrade` when you need a specific stable release.
 
 Application-only upgrades switch binaries atomically and do not reboot. A
 driver change uses the same one-shot tryboot, verification, and commit flow as
@@ -128,8 +131,8 @@ Release assets include `install.sh` for a fresh Mac that does not need a Rust
 build. Download it with GitHub CLI, then run it with a target:
 
 ```sh
-gh release download v0.1.0-rc.N -R shayne/RPi-Plane-Radar --pattern install.sh --output planeradar-install.sh
-bash planeradar-install.sh --version 0.1.0-rc.N user@host
+gh release download -R shayne/RPi-Plane-Radar --pattern install.sh --output planeradar-install.sh
+bash planeradar-install.sh user@host
 ```
 
 The bootstrap is macOS-only and requires `gh`. It resolves the immutable tag,
