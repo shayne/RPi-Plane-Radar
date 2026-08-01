@@ -193,6 +193,11 @@ fn stable_workflows_promote_the_exact_accepted_draft_without_rebuilding() {
 #[test]
 fn stable_draft_installs_pinned_tools_before_parallel_source_verification() {
     let draft = read(".github/workflows/stable-draft.yml");
+    let verify_source = draft
+        .split_once("\n  verify-source:")
+        .and_then(|(_, jobs)| jobs.split_once("\n  control:"))
+        .map(|(job, _)| job)
+        .expect("stable draft must define a verify-source job before control builds");
     let install = draft
         .find(
             "mise exec -- rustup toolchain install \"$RUSTUP_TOOLCHAIN\" --profile minimal --component clippy,rustfmt --no-self-update",
@@ -205,6 +210,10 @@ fn stable_draft_installs_pinned_tools_before_parallel_source_verification() {
     assert!(
         install < verify,
         "stable draft must finish installing pinned tools before parallel verification"
+    );
+    assert!(
+        verify_source.contains("fetch-depth: 0"),
+        "stable source verification must fetch full history for release-contract fixtures"
     );
 }
 
