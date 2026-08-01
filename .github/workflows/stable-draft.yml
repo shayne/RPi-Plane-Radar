@@ -95,8 +95,8 @@ jobs:
       - name: Set up mise
         uses: jdx/mise-action@9e7f7633ff6f6d6048a9418a68d48f288f50eb14 # v4.2.3
 
-      - name: Install pinned verification tools
-        run: mise install
+      - name: Install pinned Rust verification toolchain
+        run: mise exec -- rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --component clippy,rustfmt --no-self-update
 
       - name: Install native verification dependencies
         run: |

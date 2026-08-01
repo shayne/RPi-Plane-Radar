@@ -194,8 +194,10 @@ fn stable_workflows_promote_the_exact_accepted_draft_without_rebuilding() {
 fn stable_draft_installs_pinned_tools_before_parallel_source_verification() {
     let draft = read(".github/workflows/stable-draft.yml");
     let install = draft
-        .find("mise install")
-        .expect("stable draft must install the pinned mise environment");
+        .find(
+            "mise exec -- rustup toolchain install \"$RUSTUP_TOOLCHAIN\" --profile minimal --component clippy,rustfmt --no-self-update",
+        )
+        .expect("stable draft must install the pinned Rust toolchain and verification components");
     let verify = draft
         .find("mise run verify")
         .expect("stable draft must verify the exact source");
