@@ -22,72 +22,19 @@
 
 ---
 
-### Task 1: Add the Plane Radar animated-media contract
-
-**Files:**
-- Modify: `tests/docs_contract.rs:6-8,119-151,388-406`
-- Test: `tests/docs_contract.rs`
-
-**Interfaces:**
-- Consumes: the existing static PNG contract and README public-contract test
-- Produces: a required README link to `docs/images/planeradar-radar.gif` and a native, looping GIF container check
-
-- [ ] **Step 1: Change the README contract to require the GIF hero**
-
-In `readme_states_support_maturity_credit_and_disclosure`, replace the two static-hero requirements with:
-
-```rust
-"docs/images/planeradar-radar.gif",
-"![Plane Radar running on a Raspberry Pi Zero 2 W](docs/images/planeradar-radar.gif)",
-```
-
-Keep `accepted_device_capture_is_exact_rgba_480_square` unchanged so the accepted PNG remains hash-pinned.
-
-- [ ] **Step 2: Add a GIF container contract**
-
-Add this test after the existing PNG test:
-
-```rust
-#[test]
-fn readme_animation_is_native_480_square_and_loops() {
-    let path = repository_root().join("docs/images/planeradar-radar.gif");
-    let bytes = fs::read(&path).unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
-    assert!(bytes.len() >= 13, "GIF is shorter than its logical screen descriptor");
-    assert!(
-        &bytes[..6] == b"GIF87a" || &bytes[..6] == b"GIF89a",
-        "README animation is not a GIF"
-    );
-    assert_eq!(u16::from_le_bytes([bytes[6], bytes[7]]), 480);
-    assert_eq!(u16::from_le_bytes([bytes[8], bytes[9]]), 480);
-    assert!(
-        bytes.windows(b"NETSCAPE2.0".len()).any(|window| window == b"NETSCAPE2.0"),
-        "README animation does not contain an infinite-loop extension"
-    );
-}
-```
-
-- [ ] **Step 3: Run the contract and confirm the intended failure**
-
-Run:
-
-```sh
-mise run docs-check
-```
-
-Expected: FAIL because the README still names the PNG and `docs/images/planeradar-radar.gif` does not exist.
-
----
-
-### Task 2: Capture and encode the live Plane Radar GIF
+### Task 1: Capture the GIF and update the Plane Radar README
 
 **Files:**
 - Create: `docs/images/planeradar-radar.gif`
+- Modify: `README.md:1-201`
+- Modify: `tests/docs_contract.rs:6-8,119-151,388-406`
 - Create temporarily: `target/readme-capture.*/frame-00.png` through `frame-59.png`
 - Create temporarily: `target/readme-capture.*/timestamps.tsv`
+- Test: `tests/docs_contract.rs`
 
 **Interfaces:**
-- Consumes: ignored `.env` key `PLANERADAR_PI_TARGET`, the running `planeradar.service`, `/var/lib/planeradar/debug.png`, and the existing SIGUSR1 screenshot path
-- Produces: a native 480 by 480, 60-frame, 15-second looping GIF for the README
+- Consumes: ignored `.env` key `PLANERADAR_PI_TARGET`, the running `planeradar.service`, `/var/lib/planeradar/debug.png`, the existing SIGUSR1 screenshot path, and the static PNG documentation contract
+- Produces: a native 480 by 480, 60-frame, 15-second looping GIF, a compact app README, and passing animated-media documentation contracts
 
 - [ ] **Step 1: Confirm the target is healthy without exposing its private address**
 
@@ -214,19 +161,51 @@ mise x ffmpeg@8.1.2 -- ffmpeg -y \
 
 Inspect the contact sheet and the GIF. Confirm the radar remains edge-to-edge, text is sharp, colors match the accepted renderer, and no frame is blank or corrupted.
 
----
+- [ ] **Step 7: Change the README contract to require the GIF hero**
 
-### Task 3: Rewrite the Plane Radar README in a factual README register
+In `readme_states_support_maturity_credit_and_disclosure`, replace the two static-hero requirements with:
 
-**Files:**
-- Modify: `README.md:1-201`
-- Test: `tests/docs_contract.rs`
+```rust
+"docs/images/planeradar-radar.gif",
+"![Plane Radar running on a Raspberry Pi Zero 2 W](docs/images/planeradar-radar.gif)",
+```
 
-**Interfaces:**
-- Consumes: `docs/images/planeradar-radar.gif` and the existing public install/operation contracts
-- Produces: a compact public README with the GIF as its hero media
+Keep `accepted_device_capture_is_exact_rgba_480_square` unchanged so the accepted PNG remains hash-pinned.
 
-- [ ] **Step 1: Replace the opening and hero reference**
+- [ ] **Step 8: Add a GIF container contract**
+
+Add this test after the existing PNG test:
+
+```rust
+#[test]
+fn readme_animation_is_native_480_square_and_loops() {
+    let path = repository_root().join("docs/images/planeradar-radar.gif");
+    let bytes = fs::read(&path).unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+    assert!(bytes.len() >= 13, "GIF is shorter than its logical screen descriptor");
+    assert!(
+        &bytes[..6] == b"GIF87a" || &bytes[..6] == b"GIF89a",
+        "README animation is not a GIF"
+    );
+    assert_eq!(u16::from_le_bytes([bytes[6], bytes[7]]), 480);
+    assert_eq!(u16::from_le_bytes([bytes[8], bytes[9]]), 480);
+    assert!(
+        bytes.windows(b"NETSCAPE2.0".len()).any(|window| window == b"NETSCAPE2.0"),
+        "README animation does not contain an infinite-loop extension"
+    );
+}
+```
+
+- [ ] **Step 9: Run the contract and confirm the README-only failure**
+
+Run:
+
+```sh
+mise run docs-check
+```
+
+Expected: FAIL because the README still names the PNG. The GIF container test itself must pass.
+
+- [ ] **Step 10: Replace the opening and hero reference**
 
 Use this opening after the CI badge:
 
@@ -245,7 +224,7 @@ is the current immutable stable release.
 
 Remove the duplicate AI-assistance paragraph from the opening. Keep the full disclosure in `Credit, licenses, and AI disclosure`.
 
-- [ ] **Step 2: Replace the remaining conversational asides**
+- [ ] **Step 11: Replace the remaining conversational asides**
 
 Make these exact copy changes while preserving their surrounding sections:
 
@@ -276,7 +255,7 @@ changes affect the boot path.
 
 Do not change fenced commands, documented paths, links, or operational warnings.
 
-- [ ] **Step 3: Run the documentation contract**
+- [ ] **Step 12: Run the documentation contract**
 
 Run:
 
@@ -286,7 +265,7 @@ mise run docs-check
 
 Expected: PASS, including the static PNG hash, GIF dimensions/loop extension, exact install block, public links, support statement, and AI disclosure.
 
-- [ ] **Step 4: Review and commit the application documentation**
+- [ ] **Step 13: Review and commit the application documentation**
 
 Run:
 
@@ -299,7 +278,7 @@ Expected: the commit contains `README.md`, `tests/docs_contract.rs`, and `docs/i
 
 ---
 
-### Task 4: Rewrite the HyperPixel driver README in the same register
+### Task 2: Rewrite the HyperPixel driver README in the same register
 
 **Files:**
 - Modify: `/Users/shayne/code/hyperpixel2r-kms/README.md:1-142`
@@ -389,10 +368,10 @@ Expected: the commit changes only `README.md`.
 
 ---
 
-### Task 5: Verify, land, and confirm both repositories
+### Task 3: Verify, land, and confirm both repositories
 
 **Files:**
-- Verify: all files changed by Tasks 1 through 4
+- Verify: all files changed by Tasks 1 and 2
 - Verify unchanged: `docs/images/planeradar-radar.png`, `release/current-release.txt`
 
 **Interfaces:**
