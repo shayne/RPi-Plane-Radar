@@ -67,6 +67,7 @@ const INTERNAL_CONTINUE_MARKER: &str = "control-bootstrap.continue";
 const INTERNAL_MARKER_MAX_BYTES: u64 = 96;
 const INTERNAL_CONTINUE_TIMEOUT: Duration = Duration::from_secs(3);
 const INTERNAL_CONTINUE_POLL_INTERVAL: Duration = Duration::from_millis(5);
+const SCREENSHOT_OPERATION_TIMEOUT: Duration = Duration::from_secs(45);
 static TERMINAL_SIGNAL_PARENT: AtomicI32 = AtomicI32::new(0);
 
 extern "C" fn relay_terminal_signal(signal: libc::c_int) {
@@ -2007,7 +2008,7 @@ fn run_remote_operation(
             }
         }
         RemoteOperation::Screenshot { output } => {
-            let capture = client.screenshot(&output, Duration::from_secs(15))?;
+            let capture = client.screenshot(&output, SCREENSHOT_OPERATION_TIMEOUT)?;
             println!(
                 "Screenshot saved to {} (sha256 {})",
                 capture.destination.display(),
@@ -2485,12 +2486,20 @@ mod tests {
 
     use super::{
         DriverProtocolActions, InstallCandidateState, InstallPhase, InstallState, MANIFEST_NAME,
-        SystemLifecycleBackend, TargetIdentity, TransportError, deploy_helper_command,
-        final_reboot_command, finalize_lifecycle_uninstall_command,
+        SCREENSHOT_OPERATION_TIMEOUT, SystemLifecycleBackend, TargetIdentity, TransportError,
+        deploy_helper_command, final_reboot_command, finalize_lifecycle_uninstall_command,
         preserve_lifecycle_helper_command, private_state_read_command, requested_version,
         resume_state_matches, retire_lifecycle_helper_command, select_candidate_index,
         tryboot_reboot_command, worker_exit_code,
     };
+
+    #[test]
+    fn production_screenshot_budget_includes_two_ssh_round_trips_and_capture_wait() {
+        assert_eq!(
+            SCREENSHOT_OPERATION_TIMEOUT,
+            std::time::Duration::from_secs(45)
+        );
+    }
 
     #[test]
     fn native_supervisor_maps_worker_exit_and_signal_statuses() {
