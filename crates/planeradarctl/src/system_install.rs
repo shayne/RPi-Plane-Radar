@@ -866,7 +866,14 @@ pub fn sudo_reboot_validation_command() -> Result<RemoteCommand, TransportError>
 }
 
 fn final_reboot_command() -> Result<RemoteCommand, TransportError> {
-    RemoteCommand::interactive_sudo(["sudo", "systemctl", "reboot"])
+    RemoteCommand::interactive_sudo([
+        "sudo",
+        "systemd-run",
+        "--unit=planeradar-reboot",
+        "--on-active=2s",
+        "/usr/bin/systemctl",
+        "reboot",
+    ])
 }
 
 #[doc(hidden)]
@@ -995,4 +1002,26 @@ pub fn committed_driver_command(
         &expected.applied_dtb_sha256,
         &expected.replaced_overlay,
     ])
+}
+
+#[cfg(test)]
+mod reboot_tests {
+    use super::final_reboot_command;
+
+    #[test]
+    fn final_reboot_is_scheduled_after_the_controller_starts_waiting() {
+        let command = final_reboot_command().expect("final reboot command");
+        assert!(command.is_interactive_sudo());
+        assert_eq!(
+            command.arguments(),
+            [
+                "sudo",
+                "systemd-run",
+                "--unit=planeradar-reboot",
+                "--on-active=2s",
+                "/usr/bin/systemctl",
+                "reboot",
+            ]
+        );
+    }
 }

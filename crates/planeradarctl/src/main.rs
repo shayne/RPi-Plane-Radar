@@ -1132,6 +1132,9 @@ impl<R: TransportCommandRunner, C: Clock> SystemLifecycleBackend<R, C> {
 
     fn reboot_and_reconnect(&self, tryboot: bool) -> Result<(), LifecycleError> {
         let original = self.target();
+        self.transport
+            .probe_identity_bound(&original, &self.expected_identity)
+            .map_err(|_| LifecycleError::Backend)?;
         let command = if tryboot {
             tryboot_reboot_command()
         } else {
@@ -1152,7 +1155,8 @@ impl<R: TransportCommandRunner, C: Clock> SystemLifecycleBackend<R, C> {
             Duration::from_secs(10),
             Duration::from_secs(10),
         )
-        .map_err(|_| LifecycleError::Backend)?;
+        .map_err(|_| LifecycleError::Backend)?
+        .after_identity_verified();
         let target = self
             .transport
             .wait_for_reboot(
@@ -2339,7 +2343,14 @@ fn tryboot_reboot_command() -> Result<RemoteCommand, TransportError> {
 }
 
 fn final_reboot_command() -> Result<RemoteCommand, TransportError> {
-    RemoteCommand::interactive_sudo(["sudo", "systemctl", "reboot"])
+    RemoteCommand::interactive_sudo([
+        "sudo",
+        "systemd-run",
+        "--unit=planeradar-reboot",
+        "--on-active=2s",
+        "/usr/bin/systemctl",
+        "reboot",
+    ])
 }
 
 fn deploy_helper_command(
@@ -3088,7 +3099,17 @@ mod tests {
 
         let final_reboot = final_reboot_command().expect("final reboot command");
         assert!(final_reboot.is_interactive_sudo());
-        assert_eq!(final_reboot.arguments(), ["sudo", "systemctl", "reboot"]);
+        assert_eq!(
+            final_reboot.arguments(),
+            [
+                "sudo",
+                "systemd-run",
+                "--unit=planeradar-reboot",
+                "--on-active=2s",
+                "/usr/bin/systemctl",
+                "reboot",
+            ]
+        );
     }
 
     #[test]
