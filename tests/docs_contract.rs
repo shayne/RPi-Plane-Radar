@@ -128,8 +128,8 @@ fn readme_states_support_maturity_credit_and_disclosure() {
         "macOS",
         "Wi-Fi and SSH must already work",
         "Plane Radar does not configure Wi-Fi",
-        "docs/images/planeradar-radar.png",
-        "![Plane Radar running on a Raspberry Pi Zero 2 W](docs/images/planeradar-radar.png)",
+        "docs/images/planeradar-radar.gif",
+        "![Plane Radar running on a Raspberry Pi Zero 2 W](docs/images/planeradar-radar.gif)",
         "https://github.com/MatixYo/ESP32-Plane-Radar",
         "independent Raspberry Pi implementation",
         "not a GitHub fork",
@@ -402,6 +402,28 @@ fn accepted_device_capture_is_exact_rgba_480_square() {
     let mut pixels = vec![0; reader.output_buffer_size().expect("PNG output size")];
     let frame = reader.next_frame(&mut pixels).expect("decode screenshot");
     assert_eq!(frame.buffer_size(), 480 * 480 * 4);
+}
+
+#[test]
+fn readme_animation_is_native_480_square_and_loops() {
+    let path = repository_root().join("docs/images/planeradar-radar.gif");
+    let bytes = fs::read(&path).unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+    assert!(
+        bytes.len() >= 13,
+        "GIF is shorter than its logical screen descriptor"
+    );
+    assert!(
+        &bytes[..6] == b"GIF87a" || &bytes[..6] == b"GIF89a",
+        "README animation is not a GIF"
+    );
+    assert_eq!(u16::from_le_bytes([bytes[6], bytes[7]]), 480);
+    assert_eq!(u16::from_le_bytes([bytes[8], bytes[9]]), 480);
+    assert!(
+        bytes
+            .windows(b"NETSCAPE2.0".len())
+            .any(|window| window == b"NETSCAPE2.0"),
+        "README animation does not contain an infinite-loop extension"
+    );
 }
 
 #[test]

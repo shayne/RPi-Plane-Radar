@@ -2,21 +2,16 @@
 
 [![Rust CI](https://github.com/shayne/RPi-Plane-Radar/actions/workflows/ci.yml/badge.svg)](https://github.com/shayne/RPi-Plane-Radar/actions/workflows/ci.yml)
 
-Plane Radar turns one very specific pile of hardware into a small, dedicated
-ADS-B radar: a Raspberry Pi Zero 2 W, a Pimoroni HyperPixel 2.1 Round, and
-64-bit Raspberry Pi OS Lite Trixie.
+Plane Radar is a Rust ADS-B display for the Raspberry Pi Zero 2 W and
+Pimoroni HyperPixel 2.1 Round. It is tested with 64-bit Raspberry Pi OS Lite Trixie
+on the physical display.
 
-That narrow support statement is deliberate. This configuration has been
-tested on the physical display. Broader Pi, display, and OS support is not
-claimed. [Version 0.1.0](https://github.com/shayne/RPi-Plane-Radar/releases/tag/v0.1.0)
-is an immutable stable release built from the hardware-accepted application
-and display-driver pair.
+The supported configuration is intentionally narrow. Other Raspberry Pi
+models, displays, and operating-system releases are not currently supported.
+[Version 0.1.0](https://github.com/shayne/RPi-Plane-Radar/releases/tag/v0.1.0)
+is the current immutable stable release.
 
-Most of the implementation was built with substantial OpenAI Codex
-assistance. The commit history credits that work explicitly; maintainers still
-own the review and the hardware result.
-
-![Plane Radar running on a Raspberry Pi Zero 2 W](docs/images/planeradar-radar.png)
+![Plane Radar running on a Raspberry Pi Zero 2 W](docs/images/planeradar-radar.gif)
 
 ## Install from a Mac
 
@@ -53,10 +48,9 @@ mise run install -- user@host --version 0.1.0
 
 The installer defaults the final hostname to `planeradar`. It may reboot once
 to test the display driver through Raspberry Pi tryboot and again after the
-hostname change. The transaction is saved after each verified phase, so rerun
-the same command if the Mac exits or a reboot outlasts the connection window.
-The boring state file is what makes that safe; guessing which step finished
-would not.
+hostname change. The transaction records every verified phase. If the Mac exits
+or a reboot outlasts the connection window, rerun the same command to resume
+safely.
 
 Read [Installation](docs/install.md) before pinning another version or using a
 local release directory.
@@ -90,8 +84,8 @@ and mDNS result with the accepted release identities. `screenshot` asks the
 running renderer for a new 480×480 RGBA frame and refuses stale or unsafe
 files.
 
-The frame may contain live callsigns. Treat it as operational data, not a
-harmless decoration for an issue.
+The frame may contain live callsigns and should be treated as operational
+data.
 
 ## Upgrade, roll back, or remove it
 
@@ -109,8 +103,8 @@ Pass `--version X.Y.Z` to `upgrade` when you need a specific stable release.
 
 Application-only upgrades switch binaries atomically and do not reboot. A
 driver change uses the same one-shot tryboot, verification, and commit flow as
-the first install. Plane Radar keeps the current and previous two accepted
-application/driver pairs so a failed change has somewhere real to go back to.
+the first install. Plane Radar retains the current and previous two accepted
+application and driver pairs for rollback.
 
 Plain `uninstall` removes installer-owned application and driver state but
 preserves settings. `--purge-settings` also removes the saved location and
@@ -138,8 +132,8 @@ bash planeradar-install.sh user@host
 The bootstrap is macOS-only and requires `gh`. It resolves the immutable tag,
 checks GitHub release integrity, verifies checksums and attestations, selects
 the matching Apple Silicon or Intel control binary, and launches that verified
-binary. A curl-to-shell shortcut would skip the useful part, so this project
-does not recommend one.
+binary. The project does not provide a curl-to-shell path because that would
+bypass these verification steps.
 
 ## What lives where
 
@@ -175,9 +169,8 @@ generate an SPDX SBOM, and attest the release subjects.
 The HyperPixel kernel code is not vendored or attached as a submodule. Plane
 Radar pins an immutable release from the separate
 [hyperpixel2r-kms project](https://github.com/shayne/hyperpixel2r-kms) by
-repository, version, full commit, and manifest digest. That separation matters:
-an application update is ordinary; a display driver update can decide whether
-the Pi comes back after reboot.
+repository, version, full commit, and manifest digest. Application and driver
+releases are versioned separately because driver changes affect the boot path.
 
 Read [Development](docs/development.md), [Troubleshooting](docs/troubleshooting.md),
 [Contributing](CONTRIBUTING.md), and [Security](SECURITY.md) before changing
