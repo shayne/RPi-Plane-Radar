@@ -1499,9 +1499,13 @@ pub struct MachineOutputCommandRunner;
 
 impl CommandRunner for MachineOutputCommandRunner {
     fn run(&self, program: &str, args: &[&str]) -> Result<(), InstallError> {
+        // The controller reaches this command through `ssh -tt` for sudo.
+        // A remote PTY merges stdout and stderr, so either child stream would
+        // corrupt the single JSON document written by the installer itself.
         let status = Command::new(program)
             .args(args)
             .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .status()?;
         if status.success() {
             Ok(())

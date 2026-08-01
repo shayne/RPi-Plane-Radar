@@ -247,6 +247,16 @@ fn machine_output_runner_reserves_stdout_for_the_result_document() {
 }
 
 #[test]
+fn machine_output_runner_reserves_the_remote_pty_for_the_result_document() {
+    MachineOutputCommandRunner
+        .run(
+            "sh",
+            &["-c", "test -c /dev/fd/2 && printf package-diagnostic >&2"],
+        )
+        .expect("machine-output child stderr is /dev/null");
+}
+
+#[test]
 fn installer_verifies_then_installs_once_and_is_idempotent() {
     let original_boot = "[all]\ndtparam=audio=on\n";
     let fixture = Fixture::new(original_boot);
