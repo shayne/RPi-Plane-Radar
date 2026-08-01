@@ -251,11 +251,11 @@ fn driver_lock_matches_the_accepted_stable_release_gate() {
         lock.repository,
         "https://github.com/shayne/hyperpixel2r-kms"
     );
-    assert_eq!(lock.version.to_string(), "0.1.0");
-    assert_eq!(lock.commit, "224cc7ab781710c2edb43e4b5dbf0aedee5ee4d7");
+    assert_eq!(lock.version.to_string(), "0.1.1");
+    assert_eq!(lock.commit, "261a29f45963ef3fcaf1a23e8e444b4e68d4c370");
     assert_eq!(
         lock.manifest_sha256,
-        "7a10d873c49858e5066f7120189068ff446c4c926bda5a2883070d9230e6994d"
+        "b75adb56cb6298d648f7e78e640e003bf611a3d48628b6ff881c3c845b7934ba"
     );
 }
 

@@ -36,9 +36,9 @@
   "minimum_control_version": "0.1.0",
   "driver": {
     "repository": "https://github.com/shayne/hyperpixel2r-kms",
-    "version": "0.1.0",
-    "commit": "224cc7ab781710c2edb43e4b5dbf0aedee5ee4d7",
-    "manifest_sha256": "7a10d873c49858e5066f7120189068ff446c4c926bda5a2883070d9230e6994d",
+    "version": "0.1.1",
+    "commit": "261a29f45963ef3fcaf1a23e8e444b4e68d4c370",
+    "manifest_sha256": "b75adb56cb6298d648f7e78e640e003bf611a3d48628b6ff881c3c845b7934ba",
     "lifecycle_protocol": "accepted-driver-v2"
   },
   "artifacts": {

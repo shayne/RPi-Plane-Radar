@@ -113,7 +113,7 @@ that future application releases consume:
 
 ```sh
 mise run driver:sync
-mise run driver:update -- 0.1.0
+mise run driver:update -- 0.1.1
 ```
 
 `driver:sync` verifies and materializes the exact release already named in

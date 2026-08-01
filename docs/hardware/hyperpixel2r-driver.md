@@ -21,7 +21,7 @@ mise run driver:sync
 Verify and update it to a published version:
 
 ```sh
-mise run driver:update -- 0.1.0
+mise run driver:update -- 0.1.1
 mise run driver:sync
 ```
 
