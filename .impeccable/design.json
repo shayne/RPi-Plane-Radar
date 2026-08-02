@@ -1,0 +1,142 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-08-02T16:54:39Z",
+  "title": "Design System: Plane Radar",
+  "extensions": {
+    "colorMeta": {
+      "canvas": { "role": "neutral", "displayName": "Flight Deck Black-Green", "canonical": "oklch(14% 0.012 155)", "tonalRamp": ["oklch(15% 0.012 155)", "oklch(25% 0.012 155)", "oklch(35% 0.012 155)", "oklch(45% 0.012 155)", "oklch(55% 0.012 155)", "oklch(65% 0.012 155)", "oklch(80% 0.012 155)", "oklch(95% 0.012 155)"] },
+      "surface": { "role": "neutral", "displayName": "Radar Console Surface", "canonical": "oklch(18% 0.014 155)", "tonalRamp": ["oklch(15% 0.014 155)", "oklch(25% 0.014 155)", "oklch(35% 0.014 155)", "oklch(45% 0.014 155)", "oklch(55% 0.014 155)", "oklch(65% 0.014 155)", "oklch(80% 0.014 155)", "oklch(95% 0.014 155)"] },
+      "surface-raised": { "role": "neutral", "displayName": "Raised Instrument Surface", "canonical": "oklch(22% 0.016 155)", "tonalRamp": ["oklch(15% 0.016 155)", "oklch(25% 0.016 155)", "oklch(35% 0.016 155)", "oklch(45% 0.016 155)", "oklch(55% 0.016 155)", "oklch(65% 0.016 155)", "oklch(80% 0.016 155)", "oklch(95% 0.016 155)"] },
+      "surface-active": { "role": "neutral", "displayName": "Active Instrument Surface", "canonical": "oklch(28% 0.025 155)", "tonalRamp": ["oklch(15% 0.025 155)", "oklch(25% 0.025 155)", "oklch(35% 0.025 155)", "oklch(45% 0.025 155)", "oklch(55% 0.025 155)", "oklch(65% 0.025 155)", "oklch(80% 0.025 155)", "oklch(95% 0.025 155)"] },
+      "text": { "role": "neutral", "displayName": "Warm Chart White", "canonical": "oklch(94% 0.012 100)", "tonalRamp": ["oklch(15% 0.012 100)", "oklch(25% 0.012 100)", "oklch(35% 0.012 100)", "oklch(45% 0.012 100)", "oklch(55% 0.012 100)", "oklch(65% 0.012 100)", "oklch(80% 0.012 100)", "oklch(95% 0.012 100)"] },
+      "text-muted": { "role": "neutral", "displayName": "Muted Sage Gray", "canonical": "oklch(72% 0.022 165)", "tonalRamp": ["oklch(15% 0.022 165)", "oklch(25% 0.022 165)", "oklch(35% 0.022 165)", "oklch(45% 0.022 165)", "oklch(55% 0.022 165)", "oklch(65% 0.022 165)", "oklch(80% 0.022 165)", "oklch(95% 0.022 165)"] },
+      "text-faint": { "role": "neutral", "displayName": "Faint Sage Gray", "canonical": "oklch(60% 0.018 165)", "tonalRamp": ["oklch(15% 0.018 165)", "oklch(25% 0.018 165)", "oklch(35% 0.018 165)", "oklch(45% 0.018 165)", "oklch(55% 0.018 165)", "oklch(65% 0.018 165)", "oklch(80% 0.018 165)", "oklch(95% 0.018 165)"] },
+      "border": { "role": "neutral", "displayName": "Quiet Radar Rule", "canonical": "oklch(35% 0.022 155)", "tonalRamp": ["oklch(15% 0.022 155)", "oklch(25% 0.022 155)", "oklch(35% 0.022 155)", "oklch(45% 0.022 155)", "oklch(55% 0.022 155)", "oklch(65% 0.022 155)", "oklch(80% 0.022 155)", "oklch(95% 0.022 155)"] },
+      "border-strong": { "role": "neutral", "displayName": "Instrument Outline", "canonical": "oklch(48% 0.04 150)", "tonalRamp": ["oklch(15% 0.04 150)", "oklch(25% 0.04 150)", "oklch(35% 0.04 150)", "oklch(45% 0.04 150)", "oklch(55% 0.04 150)", "oklch(65% 0.04 150)", "oklch(80% 0.04 150)", "oklch(95% 0.04 150)"] },
+      "accent": { "role": "primary", "displayName": "Guidance Green", "canonical": "oklch(78% 0.14 145)", "tonalRamp": ["oklch(15% 0.14 145)", "oklch(25% 0.14 145)", "oklch(35% 0.14 145)", "oklch(45% 0.14 145)", "oklch(55% 0.14 145)", "oklch(65% 0.14 145)", "oklch(80% 0.14 145)", "oklch(95% 0.14 145)"] },
+      "accent-hover": { "role": "primary", "displayName": "Bright Guidance Green", "canonical": "oklch(84% 0.15 145)", "tonalRamp": ["oklch(15% 0.15 145)", "oklch(25% 0.15 145)", "oklch(35% 0.15 145)", "oklch(45% 0.15 145)", "oklch(55% 0.15 145)", "oklch(65% 0.15 145)", "oklch(80% 0.15 145)", "oklch(95% 0.15 145)"] },
+      "accent-ink": { "role": "primary", "displayName": "Deep Green Ink", "canonical": "oklch(18% 0.035 145)", "tonalRamp": ["oklch(15% 0.035 145)", "oklch(25% 0.035 145)", "oklch(35% 0.035 145)", "oklch(45% 0.035 145)", "oklch(55% 0.035 145)", "oklch(65% 0.035 145)", "oklch(80% 0.035 145)", "oklch(95% 0.035 145)"] },
+      "warning": { "role": "secondary", "displayName": "Amber Advisory", "canonical": "oklch(80% 0.13 80)", "tonalRamp": ["oklch(15% 0.13 80)", "oklch(25% 0.13 80)", "oklch(35% 0.13 80)", "oklch(45% 0.13 80)", "oklch(55% 0.13 80)", "oklch(65% 0.13 80)", "oklch(80% 0.13 80)", "oklch(95% 0.13 80)"] },
+      "warning-surface": { "role": "secondary", "displayName": "Deep Amber Surface", "canonical": "oklch(23% 0.035 80)", "tonalRamp": ["oklch(15% 0.035 80)", "oklch(25% 0.035 80)", "oklch(35% 0.035 80)", "oklch(45% 0.035 80)", "oklch(55% 0.035 80)", "oklch(65% 0.035 80)", "oklch(80% 0.035 80)", "oklch(95% 0.035 80)"] },
+      "danger": { "role": "secondary", "displayName": "Coral Alert", "canonical": "oklch(74% 0.17 28)", "tonalRamp": ["oklch(15% 0.17 28)", "oklch(25% 0.17 28)", "oklch(35% 0.17 28)", "oklch(45% 0.17 28)", "oklch(55% 0.17 28)", "oklch(65% 0.17 28)", "oklch(80% 0.17 28)", "oklch(95% 0.17 28)"] },
+      "danger-surface": { "role": "secondary", "displayName": "Deep Alert Surface", "canonical": "oklch(22% 0.045 28)", "tonalRamp": ["oklch(15% 0.045 28)", "oklch(25% 0.045 28)", "oklch(35% 0.045 28)", "oklch(45% 0.045 28)", "oklch(55% 0.045 28)", "oklch(65% 0.045 28)", "oklch(80% 0.045 28)", "oklch(95% 0.045 28)"] },
+      "success-surface": { "role": "secondary", "displayName": "Confirmed Green Surface", "canonical": "oklch(23% 0.04 145)", "tonalRamp": ["oklch(15% 0.04 145)", "oklch(25% 0.04 145)", "oklch(35% 0.04 145)", "oklch(45% 0.04 145)", "oklch(55% 0.04 145)", "oklch(65% 0.04 145)", "oklch(80% 0.04 145)", "oklch(95% 0.04 145)"] },
+      "radar-line": { "role": "neutral", "displayName": "Radar Grid Green", "canonical": "oklch(31% 0.045 150)", "tonalRamp": ["oklch(15% 0.045 150)", "oklch(25% 0.045 150)", "oklch(35% 0.045 150)", "oklch(45% 0.045 150)", "oklch(55% 0.045 150)", "oklch(65% 0.045 150)", "oklch(80% 0.045 150)", "oklch(95% 0.045 150)"] },
+      "focus": { "role": "primary", "displayName": "High-Visibility Focus Green", "canonical": "oklch(88% 0.14 145)", "tonalRamp": ["oklch(15% 0.14 145)", "oklch(25% 0.14 145)", "oklch(35% 0.14 145)", "oklch(45% 0.14 145)", "oklch(55% 0.14 145)", "oklch(65% 0.14 145)", "oklch(80% 0.14 145)", "oklch(95% 0.14 145)"] }
+    },
+    "typographyMeta": {
+      "display": { "displayName": "Display", "purpose": "Product identity in the masthead." },
+      "headline": { "displayName": "Headline", "purpose": "Primary configuration regions." },
+      "title": { "displayName": "Title", "purpose": "Local subsections and status titles." },
+      "body": { "displayName": "Body", "purpose": "Instructions and general copy." },
+      "label": { "displayName": "Label", "purpose": "Controls, buttons, and field names." },
+      "eyebrow": { "displayName": "Eyebrow", "purpose": "Sparse uppercase appliance metadata." }
+    },
+    "shadows": [
+      { "name": "status-inner-ring", "value": "inset 0 0 0 2px var(--canvas)", "purpose": "Separates the status fill from its outline without adding elevation." }
+    ],
+    "motion": [
+      { "name": "state-ease-out", "value": "160ms cubic-bezier(0.25, 1, 0.5, 1)", "purpose": "Color, border, and press feedback only; reduced to 0.01ms for reduced motion." }
+    ],
+    "breakpoints": [
+      { "name": "paired-fields", "value": "34rem" },
+      { "name": "console-split", "value": "52rem" }
+    ]
+  },
+  "components": [
+    {
+      "name": "Primary Button",
+      "kind": "button",
+      "refersTo": "button-primary",
+      "description": "Applies settings or confirms the page's primary action.",
+      "html": "<button class=\"ds-btn-primary\" type=\"button\">Apply settings</button>",
+      "css": ".ds-btn-primary { min-height: 44px; border: 1px solid var(--accent); border-radius: var(--radius-sm); background: var(--accent); color: var(--accent-ink); cursor: pointer; font: 700 0.875rem/1.2 -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif; padding: 0.75rem 1rem; transition: background-color 160ms var(--ease-out), border-color 160ms var(--ease-out), transform 160ms var(--ease-out); } .ds-btn-primary:hover { border-color: var(--accent-hover); background: var(--accent-hover); } .ds-btn-primary:focus-visible { outline: 3px solid var(--focus); outline-offset: 3px; } .ds-btn-primary:active { transform: translateY(1px); }"
+    },
+    {
+      "name": "Secondary Button",
+      "kind": "button",
+      "refersTo": "button-secondary",
+      "description": "Supports search and secondary confirmation actions.",
+      "html": "<button class=\"ds-btn-secondary\" type=\"button\">Search places</button>",
+      "css": ".ds-btn-secondary { min-height: 44px; border: 1px solid var(--border-strong); border-radius: var(--radius-sm); background: var(--surface-raised); color: var(--text); cursor: pointer; font: 700 0.875rem/1.2 -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif; padding: 0.75rem 1rem; transition: background-color 160ms var(--ease-out), border-color 160ms var(--ease-out), transform 160ms var(--ease-out); } .ds-btn-secondary:hover { border-color: var(--text-muted); background: var(--surface-active); } .ds-btn-secondary:focus-visible { outline: 3px solid var(--focus); outline-offset: 3px; } .ds-btn-secondary:active { transform: translateY(1px); }"
+    },
+    {
+      "name": "Text Field",
+      "kind": "input",
+      "refersTo": "input",
+      "description": "Collects places, coordinates, and numeric configuration values.",
+      "html": "<label class=\"ds-field\" for=\"ds-place\">Place or address<input id=\"ds-place\" type=\"search\" placeholder=\"City or airport\"></label>",
+      "css": ".ds-field { display: grid; gap: var(--space-sm); color: var(--text); font: 700 0.875rem/1.2 -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif; } .ds-field input { width: 100%; min-height: 44px; border: 1px solid var(--border-strong); border-radius: var(--radius-sm); background: var(--surface); color: var(--text); font: 400 1rem/1.55 -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif; padding: 0.65rem 0.75rem; } .ds-field input:hover { border-color: var(--text-muted); } .ds-field input:focus-visible { outline: 3px solid var(--focus); outline-offset: 3px; } .ds-field input::placeholder { color: var(--text-faint); opacity: 1; }"
+    },
+    {
+      "name": "Segmented Control",
+      "kind": "custom",
+      "refersTo": "segmented-selected",
+      "description": "Offers a short set of mutually exclusive radar values.",
+      "html": "<div class=\"ds-segmented\"><label><input type=\"radio\" name=\"units-demo\"><span>Kilometres</span></label><label><input type=\"radio\" name=\"units-demo\" checked><span>Miles</span></label></div>",
+      "css": ".ds-segmented { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1px; overflow: hidden; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--border); } .ds-segmented label { position: relative; display: flex; cursor: pointer; } .ds-segmented input { position: absolute; width: 1px; height: 1px; opacity: 0; } .ds-segmented span { display: flex; flex: 1; min-height: 44px; align-items: center; justify-content: center; background: var(--surface); color: var(--text-muted); font: 700 0.875rem/1.2 -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif; padding: var(--space-sm); } .ds-segmented input:checked + span { background: var(--accent); color: var(--accent-ink); } .ds-segmented input:focus-visible + span { position: relative; z-index: 1; outline: 3px solid var(--focus); outline-offset: -3px; }"
+    },
+    {
+      "name": "Settings Switch",
+      "kind": "custom",
+      "description": "Toggles an optional display feature with plain-language supporting copy.",
+      "html": "<label class=\"ds-switch\"><input type=\"checkbox\" checked><span class=\"ds-switch-track\"></span><span class=\"ds-switch-copy\"><strong>Show callsign</strong><small>Include the flight callsign in aircraft labels.</small></span></label>",
+      "css": ".ds-switch { min-height: 44px; display: grid; grid-template-columns: auto minmax(0, 1fr); gap: var(--space-md); align-items: center; color: var(--text); cursor: pointer; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif; } .ds-switch > input { position: absolute; width: 1px; height: 1px; opacity: 0; } .ds-switch-track { position: relative; width: 3rem; height: 1.75rem; border: 1px solid var(--border-strong); border-radius: 999px; background: var(--surface-raised); } .ds-switch-track::after { position: absolute; top: 0.25rem; left: 0.25rem; width: 1.125rem; height: 1.125rem; border-radius: 50%; background: var(--text-muted); content: ''; transition: background-color 160ms var(--ease-out), transform 160ms var(--ease-out); } .ds-switch input:checked + .ds-switch-track { border-color: var(--accent); background: var(--accent); } .ds-switch input:checked + .ds-switch-track::after { background: var(--accent-ink); transform: translateX(1.2rem); } .ds-switch input:focus-visible + .ds-switch-track { outline: 3px solid var(--focus); outline-offset: 3px; } .ds-switch-copy { display: grid; gap: 0.125rem; } .ds-switch-copy strong { font-size: 0.875rem; } .ds-switch-copy small { color: var(--text-muted); font-size: 0.8125rem; font-weight: 400; line-height: 1.45; }"
+    },
+    {
+      "name": "Option Disclosure",
+      "kind": "custom",
+      "description": "Reveals optional settings without turning each group into a card.",
+      "html": "<details class=\"ds-disclosure\" open><summary>Aircraft labels</summary><div><p>Route and aircraft details are optional.</p></div></details>",
+      "css": ".ds-disclosure { min-width: 0; border-top: 1px solid var(--border); border-bottom: 1px solid var(--border); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif; } .ds-disclosure summary { min-height: 44px; padding: var(--space-md) 0; color: var(--text-muted); cursor: pointer; font-size: 0.9375rem; font-weight: 750; } .ds-disclosure[open] summary { color: var(--text); } .ds-disclosure summary:hover { color: var(--accent); } .ds-disclosure summary:focus-visible { outline: 3px solid var(--focus); outline-offset: 3px; } .ds-disclosure div { padding: var(--space-sm) 0 var(--space-xl); } .ds-disclosure p { margin: 0; color: var(--text-muted); font-size: 0.8125rem; line-height: 1.5; }"
+    },
+    {
+      "name": "Validation Notice",
+      "kind": "custom",
+      "description": "Reports validation errors with a symbol, outline, and tinted surface.",
+      "html": "<p class=\"ds-notice\">Check the highlighted settings and try again.</p>",
+      "css": ".ds-notice { display: flex; gap: var(--space-md); align-items: flex-start; margin: 0; padding: var(--space-md) var(--space-lg); border: 1px solid currentColor; border-radius: var(--radius-sm); background: var(--danger-surface); color: var(--danger); font: 650 0.9375rem/1.55 -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif; } .ds-notice::before { flex: 0 0 auto; content: '!'; font-weight: 900; }"
+    },
+    {
+      "name": "Radar Status",
+      "kind": "custom",
+      "description": "Shows appliance readiness as a compact instrument row.",
+      "html": "<div class=\"ds-status\"><span class=\"ds-status-mark\"></span><div><strong>Radar configured</strong><span>New York, NY</span></div></div>",
+      "css": ".ds-status { display: flex; gap: var(--space-md); align-items: center; padding: var(--space-lg) 0; border-bottom: 1px solid var(--border); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif; } .ds-status-mark { flex: 0 0 auto; width: 0.75rem; height: 0.75rem; border: 2px solid var(--accent); border-radius: 50%; background: var(--accent); box-shadow: inset 0 0 0 2px var(--canvas); } .ds-status div { display: grid; gap: 0.125rem; } .ds-status strong { font-size: 0.875rem; } .ds-status div span { color: var(--text-muted); font-size: 0.875rem; }"
+    }
+  ],
+  "narrative": {
+    "northStar": "The Quiet Radar Console",
+    "overview": "Plane Radar borrows the clarity of a civilian aviation instrument, then softens it for a dedicated appliance at home. The surface is dark because it belongs beside an always-on radar display, but the restrained green guidance color and generous touch targets keep configuration approachable rather than theatrical.\n\nInformation is arranged as a calm sequence of structural rules, native controls, and progressive disclosure. Identity appears in the radar mark and compact masthead; everything below serves location and display configuration. The system explicitly rejects generic SaaS dashboards, military command software, neon hacker tooling, and novelty retro terminals.",
+    "keyCharacteristics": [
+      "Calm, precise, and instrument-like.",
+      "Dark tonal layers with one rare guidance-green accent.",
+      "Flat structural separation instead of decorative cards.",
+      "Familiar native controls with strong focus and touch affordances.",
+      "Mobile-first flow that becomes a two-column console at desktop widths."
+    ],
+    "rules": [
+      { "name": "The One Guidance Color Rule", "body": "Guidance Green marks an action, selection, readiness, or focus state. It is not decoration.", "section": "colors" },
+      { "name": "The Native Instrument Rule", "body": "Use the system stack everywhere; hierarchy comes from weight, size, and spacing, never a decorative display face.", "section": "typography" },
+      { "name": "The Structural Depth Rule", "body": "Separate regions with tone, spacing, or a 1px rule. Do not float configuration in decorative cards.", "section": "elevation" }
+    ],
+    "dos": [
+      "**Do** keep primary touch targets at least 44px high and keyboard focus visible with the 3px `focus` outline.",
+      "**Do** use native form semantics, labels, fieldsets, and `details` disclosure before inventing a custom interaction.",
+      "**Do** use Guidance Green only for actions, selections, readiness, and focus.",
+      "**Do** preserve the single-column phone flow, paired fields above 34rem, and the location/preferences split above 52rem.",
+      "**Do** use spacing, tonal surfaces, and 1px rules to make hierarchy obvious.",
+      "**Do** keep prose to 68ch or less and wrap provider/privacy explanations naturally."
+    ],
+    "donts": [
+      "**Don't** make the interface resemble a generic SaaS dashboard.",
+      "**Don't** make it feel like military command software.",
+      "**Don't** use neon hacker tooling or novelty retro-terminal styling.",
+      "**Don't** introduce decorative cards, nested cards, or identical card grids.",
+      "**Don't** add excessive instrumentation or visual effects that compete with configuration.",
+      "**Don't** use colored side-stripe borders, gradient text, glassmorphism, or decorative motion.",
+      "**Don't** use full-saturation accents on inactive states or introduce a second decorative accent color.",
+      "**Don't** replace familiar native controls with invented affordances."
+    ]
+  }
+}
