@@ -4,7 +4,7 @@ use std::sync::mpsc::Receiver;
 use std::time::Duration;
 
 use crate::http::{HttpClient, HttpError};
-use crate::model::RuntimeModel;
+use crate::model::{Location, RuntimeModel};
 use crate::time::Clock;
 use crate::weather::{WeatherClient, WeatherError};
 
@@ -32,6 +32,8 @@ impl<C: HttpClient, K: Clock, W: Waiter> WeatherWorker<C, K, W> {
 
     pub fn run(&self, commands: Receiver<WorkerCommand>, stop: Arc<AtomicBool>) {
         let mut failures = 0_u32;
+        let mut active_location: Option<Location> = None;
+        let mut deadline: Option<Duration> = None;
 
         loop {
             if stop.load(Ordering::Acquire)
@@ -42,18 +44,34 @@ impl<C: HttpClient, K: Clock, W: Waiter> WeatherWorker<C, K, W> {
 
             let snapshot = self.model.snapshot();
             let Some(location) = snapshot.settings.location.clone() else {
-                failures = 0;
+                active_location = None;
+                deadline = None;
                 if !wait_for_command(&self.waiter, &commands, &stop, IDLE_INTERVAL) {
                     return;
                 }
                 continue;
             };
             if !snapshot.settings.footer.needs_environment() {
-                failures = 0;
+                active_location = None;
+                deadline = None;
                 if !wait_for_command(&self.waiter, &commands, &stop, IDLE_INTERVAL) {
                     return;
                 }
                 continue;
+            }
+
+            if active_location.as_ref() == Some(&location) {
+                if let Some(deadline) = deadline {
+                    let remaining = deadline.saturating_sub(self.clock.monotonic());
+                    if !remaining.is_zero() {
+                        if !wait_for_command(&self.waiter, &commands, &stop, remaining) {
+                            return;
+                        }
+                        continue;
+                    }
+                }
+            } else {
+                active_location = Some(location.clone());
             }
 
             let started_at = self.clock.monotonic();
@@ -89,16 +107,7 @@ impl<C: HttpClient, K: Clock, W: Waiter> WeatherWorker<C, K, W> {
                     failure_interval(failures)
                 }
             };
-
-            let elapsed = self.clock.monotonic().saturating_sub(started_at);
-            if !wait_for_command(
-                &self.waiter,
-                &commands,
-                &stop,
-                interval.saturating_sub(elapsed),
-            ) {
-                return;
-            }
+            deadline = Some(started_at.saturating_add(interval));
         }
     }
 }

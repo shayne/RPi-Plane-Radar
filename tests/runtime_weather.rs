@@ -44,6 +44,7 @@ impl Clock for FakeClock {
 enum WaitOutcome {
     TimedOut,
     Action(Box<dyn FnOnce() + Send>),
+    ActionAfter(Duration, Box<dyn FnOnce() + Send>),
     Stop,
 }
 
@@ -90,6 +91,11 @@ impl Waiter for ScriptedWaiter {
                 WaitResult::TimedOut
             }
             WaitOutcome::Action(action) => {
+                action();
+                WaitResult::Command(WorkerCommand::SettingsChanged(RadarSettings::default()))
+            }
+            WaitOutcome::ActionAfter(elapsed, action) => {
+                self.clock.advance(elapsed);
                 action();
                 WaitResult::Command(WorkerCommand::SettingsChanged(RadarSettings::default()))
             }
@@ -296,6 +302,146 @@ fn first_fetch_is_immediate_and_successes_are_fifteen_minutes_apart() {
             .expect("environment")
             .fetched_at,
         SUCCESS_INTERVAL
+    );
+}
+
+#[test]
+fn irrelevant_settings_change_preserves_the_remaining_success_deadline() {
+    let clock = FakeClock::default();
+    let model = RuntimeModel::new(configured(weather_footer()), "http://local".to_owned());
+    let changed_model = model.clone();
+    let (http, requests) = FakeHttp::new(clock.clone(), [ok(), ok(), ok()]);
+    let (waiter, waits) = ScriptedWaiter::new(
+        clock.clone(),
+        [
+            WaitOutcome::ActionAfter(
+                Duration::from_secs(120),
+                Box::new(move || {
+                    let mut settings = configured(weather_footer());
+                    settings.range_index = 2;
+                    changed_model.replace_settings(settings);
+                }),
+            ),
+            WaitOutcome::TimedOut,
+            WaitOutcome::Stop,
+        ],
+    );
+
+    run(http, model, clock, waiter);
+
+    assert_eq!(
+        requests
+            .lock()
+            .expect("requests")
+            .iter()
+            .map(|(at, _)| *at)
+            .collect::<Vec<_>>(),
+        [Duration::ZERO, SUCCESS_INTERVAL]
+    );
+    assert_eq!(
+        *waits.lock().expect("waits"),
+        [
+            SUCCESS_INTERVAL,
+            Duration::from_secs(13 * 60),
+            SUCCESS_INTERVAL,
+        ]
+    );
+}
+
+#[test]
+fn irrelevant_settings_change_preserves_the_remaining_failure_deadline() {
+    let clock = FakeClock::default();
+    let model = RuntimeModel::new(configured(weather_footer()), "http://local".to_owned());
+    let changed_model = model.clone();
+    let (http, requests) = FakeHttp::new(
+        clock.clone(),
+        [
+            Err(HttpError::Timeout),
+            Err(HttpError::Timeout),
+            Err(HttpError::Timeout),
+        ],
+    );
+    let (waiter, waits) = ScriptedWaiter::new(
+        clock.clone(),
+        [
+            WaitOutcome::ActionAfter(
+                Duration::from_secs(10),
+                Box::new(move || {
+                    let mut settings = configured(weather_footer());
+                    settings.range_index = 2;
+                    changed_model.replace_settings(settings);
+                }),
+            ),
+            WaitOutcome::TimedOut,
+            WaitOutcome::Stop,
+        ],
+    );
+
+    run(http, model, clock, waiter);
+
+    assert_eq!(
+        requests
+            .lock()
+            .expect("requests")
+            .iter()
+            .map(|(at, _)| *at)
+            .collect::<Vec<_>>(),
+        [Duration::ZERO, Duration::from_secs(30)]
+    );
+    assert_eq!(
+        *waits.lock().expect("waits"),
+        [
+            Duration::from_secs(30),
+            Duration::from_secs(20),
+            Duration::from_secs(60),
+        ]
+    );
+}
+
+#[test]
+fn disable_then_reenable_preserves_failure_progression() {
+    let clock = FakeClock::default();
+    let model = RuntimeModel::new(configured(weather_footer()), "http://local".to_owned());
+    let disabled_model = model.clone();
+    let enabled_model = model.clone();
+    let (http, requests) = FakeHttp::new(
+        clock.clone(),
+        [Err(HttpError::Timeout), Err(HttpError::Timeout)],
+    );
+    let (waiter, waits) = ScriptedWaiter::new(
+        clock.clone(),
+        [
+            WaitOutcome::ActionAfter(
+                Duration::from_secs(10),
+                Box::new(move || {
+                    disabled_model.replace_settings(configured(FooterSettings::default()));
+                }),
+            ),
+            WaitOutcome::Action(Box::new(move || {
+                enabled_model.replace_settings(configured(weather_footer()));
+            })),
+            WaitOutcome::Stop,
+        ],
+    );
+
+    run(http, model, clock, waiter);
+
+    assert_eq!(
+        requests
+            .lock()
+            .expect("requests")
+            .iter()
+            .map(|(at, _)| *at)
+            .collect::<Vec<_>>(),
+        [Duration::ZERO, Duration::from_secs(10)]
+    );
+    assert_eq!(
+        *waits.lock().expect("waits"),
+        [
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+        ]
     );
 }
 
