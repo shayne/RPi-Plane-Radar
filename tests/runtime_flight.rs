@@ -1,9 +1,10 @@
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Receiver;
-use std::sync::{Arc, Barrier, Mutex};
+use std::sync::{Arc, Barrier, Mutex, Once};
 use std::time::Duration;
 
+use log::{Log, Metadata, Record};
 use planeradar::flight_data::{
     EnrichmentNeeds, FlightDataClient, FlightDataError, FlightDataService, FlightLookup,
     LookupValue,
@@ -16,6 +17,44 @@ use planeradar::time::{Clock, Sleeper};
 type RecordedRequests = Arc<Mutex<Vec<(Duration, HttpRequest)>>>;
 type RecordedSleeps = Arc<Mutex<Vec<Duration>>>;
 type TestClient = FlightDataClient<FakeHttp, FakeClock, FakeSleeper>;
+
+struct RecordingLogger {
+    messages: Mutex<Vec<String>>,
+}
+
+static RECORDING_LOGGER: RecordingLogger = RecordingLogger {
+    messages: Mutex::new(Vec::new()),
+};
+static INSTALL_RECORDING_LOGGER: Once = Once::new();
+
+impl Log for RecordingLogger {
+    fn enabled(&self, _metadata: &Metadata<'_>) -> bool {
+        true
+    }
+
+    fn log(&self, record: &Record<'_>) {
+        if self.enabled(record.metadata()) {
+            self.messages
+                .lock()
+                .expect("log messages")
+                .push(record.args().to_string());
+        }
+    }
+
+    fn flush(&self) {}
+}
+
+fn reset_recorded_logs() {
+    INSTALL_RECORDING_LOGGER.call_once(|| {
+        log::set_logger(&RECORDING_LOGGER).expect("recording logger");
+        log::set_max_level(log::LevelFilter::Warn);
+    });
+    RECORDING_LOGGER
+        .messages
+        .lock()
+        .expect("log messages")
+        .clear();
+}
 
 #[derive(Clone, Debug, Default)]
 struct FakeClock(Arc<Mutex<Duration>>);
@@ -470,6 +509,76 @@ fn network_failure_requests_a_thirty_second_wait() {
     run(service, model, clock, waiter);
 
     assert_eq!(*waits.lock().expect("waits"), [Duration::from_secs(30)]);
+}
+
+#[test]
+fn successful_lookup_does_not_reset_the_thirty_second_failure_log_throttle() {
+    reset_recorded_logs();
+    let clock = FakeClock::default();
+    let settings = configured(false, true);
+    let model = RuntimeModel::new(settings.clone(), "http://local".to_owned());
+    model.record_aircraft(
+        vec![aircraft("throttle-a", "aa1", 40.01, -74.0)],
+        Duration::ZERO,
+    );
+    let (service, calls) = FakeService::new(
+        clock.clone(),
+        [
+            Err(FlightDataError::Http(HttpError::Timeout)),
+            found_model("737-800"),
+            Err(FlightDataError::Http(HttpError::Transport)),
+        ],
+    );
+    let replacement_model = model.clone();
+    let (waiter, waits) = ScriptedWaiter::new(
+        clock.clone(),
+        [
+            WaitOutcome::SettingsChanged(settings),
+            WaitOutcome::Action(Box::new(move || {
+                replacement_model.record_aircraft(
+                    vec![aircraft("throttle-b", "bb2", 40.02, -74.0)],
+                    Duration::from_millis(750),
+                );
+            })),
+            WaitOutcome::Stop,
+        ],
+    );
+
+    run(service, model, clock, waiter);
+
+    assert_eq!(
+        calls
+            .lock()
+            .expect("calls")
+            .iter()
+            .map(|(at, aircraft, _)| (*at, aircraft.hex.as_str()))
+            .collect::<Vec<_>>(),
+        [
+            (Duration::ZERO, "throttle-a"),
+            (Duration::ZERO, "throttle-a"),
+            (Duration::from_millis(750), "throttle-b"),
+        ]
+    );
+    assert_eq!(
+        *waits.lock().expect("waits"),
+        [
+            Duration::from_secs(30),
+            Duration::from_millis(750),
+            Duration::from_secs(30),
+        ]
+    );
+    let throttle_logs = RECORDING_LOGGER
+        .messages
+        .lock()
+        .expect("log messages")
+        .iter()
+        .filter(|message| message.contains("THROTTLE"))
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(
+        throttle_logs,
+        ["provider=ADSBDB category=timeout aircraft=THROTTLEA/AA1"]
+    );
 }
 
 #[test]

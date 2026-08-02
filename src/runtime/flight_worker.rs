@@ -31,10 +31,6 @@ struct FailureLogRecord {
 }
 
 impl FailureLogWindow {
-    fn clear(&mut self) {
-        self.logged_at = None;
-    }
-
     fn record(
         &mut self,
         error: &FlightDataError,
@@ -88,14 +84,12 @@ impl<D: FlightDataService, K: Clock, W: Waiter> FlightDataWorker<D, K, W> {
             let snapshot = self.model.snapshot();
             let needs = needs_for(&snapshot.settings);
             let Some(location) = snapshot.settings.location.clone() else {
-                failure_logs.clear();
                 if !wait_for_command(&self.waiter, &commands, &stop, FAILURE_INTERVAL) {
                     return;
                 }
                 continue;
             };
             if needs == EnrichmentNeeds::default() {
-                failure_logs.clear();
                 if !wait_for_command(&self.waiter, &commands, &stop, FAILURE_INTERVAL) {
                     return;
                 }
@@ -143,7 +137,6 @@ impl<D: FlightDataService, K: Clock, W: Waiter> FlightDataWorker<D, K, W> {
 
             match result {
                 Ok(lookup) => {
-                    failure_logs.clear();
                     let now = self.clock.monotonic();
                     self.cache.record(&aircraft, pending, &lookup, now);
                     if !matches!(command_drain, CommandDrain::Changed) {
