@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::flight_data::AircraftEnrichment;
+use crate::flight_data::{AircraftEnrichment, EnrichmentNeeds};
 
 pub const SETTINGS_SCHEMA_VERSION: u32 = 2;
 
@@ -310,16 +310,27 @@ impl RuntimeModel {
         enrichment: AircraftEnrichment,
     ) -> Option<u64> {
         let mut snapshot = self.snapshot.write().expect("runtime model lock");
-        if !snapshot
-            .aircraft
-            .iter()
-            .any(|aircraft| aircraft.hex == key.hex && aircraft.flight_callsign == key.callsign)
-            || snapshot.enrichment.get(key) == Some(&enrichment)
+        record_enrichment(&mut snapshot, key, enrichment)
+    }
+
+    pub fn record_enrichment_if_current(
+        &self,
+        expected_location: &Location,
+        expected_needs: EnrichmentNeeds,
+        key: &AircraftKey,
+        enrichment: AircraftEnrichment,
+    ) -> Option<u64> {
+        let mut snapshot = self.snapshot.write().expect("runtime model lock");
+        let current_needs = EnrichmentNeeds {
+            route: snapshot.settings.show_route,
+            model: snapshot.settings.show_expanded_model,
+        };
+        if snapshot.settings.location.as_ref() != Some(expected_location)
+            || current_needs != expected_needs
         {
             return None;
         }
-        Arc::make_mut(&mut snapshot.enrichment).insert(key.clone(), enrichment);
-        Some(bump(&mut snapshot))
+        record_enrichment(&mut snapshot, key, enrichment)
     }
 
     pub fn record_environment_if_location(
@@ -379,6 +390,23 @@ impl RuntimeModel {
         snapshot.ip_url = ip_url;
         bump(&mut snapshot)
     }
+}
+
+fn record_enrichment(
+    snapshot: &mut RuntimeSnapshot,
+    key: &AircraftKey,
+    enrichment: AircraftEnrichment,
+) -> Option<u64> {
+    if !snapshot
+        .aircraft
+        .iter()
+        .any(|aircraft| aircraft.hex == key.hex && aircraft.flight_callsign == key.callsign)
+        || snapshot.enrichment.get(key) == Some(&enrichment)
+    {
+        return None;
+    }
+    Arc::make_mut(&mut snapshot.enrichment).insert(key.clone(), enrichment);
+    Some(bump(snapshot))
 }
 
 fn retain_displayed_enrichment(snapshot: &mut RuntimeSnapshot) {

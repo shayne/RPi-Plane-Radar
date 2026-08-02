@@ -1,3 +1,6 @@
+mod flight_worker;
+pub use flight_worker::FlightDataWorker;
+
 use std::collections::HashSet;
 use std::fs;
 use std::net::SocketAddr;
@@ -201,13 +204,16 @@ impl<C: HttpClient, K: Clock, W: Waiter> AdsbWorker<C, K, W> {
     }
 }
 
-enum CommandDrain {
+pub(crate) enum CommandDrain {
     Unchanged,
     Changed,
     Stop,
 }
 
-fn drain_commands(commands: &Receiver<WorkerCommand>, stop: &AtomicBool) -> CommandDrain {
+pub(crate) fn drain_commands(
+    commands: &Receiver<WorkerCommand>,
+    stop: &AtomicBool,
+) -> CommandDrain {
     let mut changed = false;
     for command in commands.try_iter() {
         match command {
@@ -225,7 +231,7 @@ fn drain_commands(commands: &Receiver<WorkerCommand>, stop: &AtomicBool) -> Comm
     }
 }
 
-fn wait_for_command<W: Waiter>(
+pub(crate) fn wait_for_command<W: Waiter>(
     waiter: &W,
     commands: &Receiver<WorkerCommand>,
     stop: &AtomicBool,
