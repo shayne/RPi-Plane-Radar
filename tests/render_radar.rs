@@ -1,5 +1,6 @@
 mod support;
 
+use std::collections::HashMap;
 use std::fs;
 use std::sync::Arc;
 use std::time::Duration;
@@ -132,6 +133,8 @@ fn configured_settings() -> RadarSettings {
 fn empty_snapshot(fetched_at: Option<Duration>) -> RadarSnapshot {
     RadarSnapshot {
         aircraft: Arc::from([]),
+        enrichment: Arc::new(HashMap::new()),
+        environment: None,
         fetched_at,
         last_error_at: None,
     }
@@ -227,6 +230,8 @@ fn cardinal_labels_fit_the_north_south_east_west_bounds() {
 fn east_aircraft_uses_unrounded_projection_and_draws_tag_and_heading() {
     let snapshot = RadarSnapshot {
         aircraft: Arc::from([aircraft(5.0, 120.0)]),
+        enrichment: Arc::new(HashMap::new()),
+        environment: None,
         fetched_at: Some(Duration::ZERO),
         last_error_at: None,
     };
@@ -251,6 +256,8 @@ fn transparent_aircraft_tag_preserves_static_pixels_and_draws_text_last() {
     let plane = aircraft(11.6, 0.0);
     let snapshot = RadarSnapshot {
         aircraft: Arc::from([plane.clone()]),
+        enrichment: Arc::new(HashMap::new()),
+        environment: None,
         fetched_at: Some(Duration::ZERO),
         last_error_at: None,
     };
@@ -417,6 +424,8 @@ fn whitespace_runway_label_does_not_mask_radar_geometry() {
 fn traffic_outside_the_aircraft_safe_ring_is_a_red_dot_on_the_238_pixel_rim() {
     let snapshot = RadarSnapshot {
         aircraft: Arc::from([aircraft(13.0, 0.0)]),
+        enrichment: Arc::new(HashMap::new()),
+        environment: None,
         fetched_at: Some(Duration::ZERO),
         last_error_at: None,
     };
@@ -465,6 +474,8 @@ fn runway_toggle_removes_lines_and_labels_from_the_cached_background() {
 fn speed_vector_is_clipped_to_the_214_pixel_grid_ring() {
     let snapshot = RadarSnapshot {
         aircraft: Arc::from([aircraft(11.6, 2_000.0)]),
+        enrichment: Arc::new(HashMap::new()),
+        environment: None,
         fetched_at: Some(Duration::ZERO),
         last_error_at: None,
     };
@@ -547,6 +558,8 @@ fn empty_and_unrenderable_tag_strings_do_not_panic() {
     plane.altitude = "🛩".repeat(1_024);
     let snapshot = RadarSnapshot {
         aircraft: Arc::from([plane]),
+        enrichment: Arc::new(HashMap::new()),
+        environment: None,
         fetched_at: Some(Duration::ZERO),
         last_error_at: None,
     };

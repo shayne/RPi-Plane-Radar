@@ -221,6 +221,8 @@ impl PlaneRadarApp {
                 self.refresh_visible_airports()?;
                 let radar_snapshot = RadarSnapshot {
                     aircraft: self.snapshot.aircraft.clone(),
+                    enrichment: self.snapshot.enrichment.clone(),
+                    environment: self.snapshot.environment.clone(),
                     fetched_at: self.snapshot.fetched_at,
                     last_error_at: self.snapshot.last_error_at,
                 };

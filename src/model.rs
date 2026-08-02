@@ -1,7 +1,10 @@
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+
+use crate::flight_data::AircraftEnrichment;
 
 pub const SETTINGS_SCHEMA_VERSION: u32 = 2;
 
@@ -183,6 +186,8 @@ pub struct Airport {
 #[derive(Clone, Debug, PartialEq)]
 pub struct RadarSnapshot {
     pub aircraft: Arc<[Aircraft]>,
+    pub enrichment: Arc<HashMap<AircraftKey, AircraftEnrichment>>,
+    pub environment: Option<EnvironmentReading>,
     pub fetched_at: Option<Duration>,
     pub last_error_at: Option<Duration>,
 }
@@ -200,6 +205,9 @@ pub struct EnvironmentReading {
 pub struct RuntimeSnapshot {
     pub settings: RadarSettings,
     pub aircraft: Arc<[Aircraft]>,
+    pub enrichment: Arc<HashMap<AircraftKey, AircraftEnrichment>>,
+    pub environment: Option<EnvironmentReading>,
+    pub environment_last_error_at: Option<Duration>,
     pub fetched_at: Option<Duration>,
     pub has_successful_fetch_for_current_location: bool,
     pub last_error_at: Option<Duration>,
@@ -219,6 +227,9 @@ impl RuntimeModel {
             snapshot: Arc::new(RwLock::new(RuntimeSnapshot {
                 settings,
                 aircraft: Arc::from([]),
+                enrichment: Arc::new(HashMap::new()),
+                environment: None,
+                environment_last_error_at: None,
                 fetched_at: None,
                 has_successful_fetch_for_current_location: false,
                 last_error_at: None,
@@ -253,7 +264,10 @@ impl RuntimeModel {
                 .collect::<Vec<_>>()
                 .into();
         }
+        retain_displayed_enrichment(&mut snapshot);
         if location_changed {
+            snapshot.environment = None;
+            snapshot.environment_last_error_at = None;
             snapshot.has_successful_fetch_for_current_location = false;
         }
         bump(&mut snapshot)
@@ -262,6 +276,7 @@ impl RuntimeModel {
     pub fn record_aircraft(&self, aircraft: Vec<Aircraft>, fetched_at: Duration) -> u64 {
         let mut snapshot = self.snapshot.write().expect("runtime model lock");
         snapshot.aircraft = Arc::from(aircraft);
+        retain_displayed_enrichment(&mut snapshot);
         snapshot.fetched_at = Some(fetched_at);
         snapshot.has_successful_fetch_for_current_location = true;
         bump(&mut snapshot)
@@ -283,8 +298,53 @@ impl RuntimeModel {
             return None;
         }
         snapshot.aircraft = Arc::from(aircraft);
+        retain_displayed_enrichment(&mut snapshot);
         snapshot.fetched_at = Some(fetched_at);
         snapshot.has_successful_fetch_for_current_location = true;
+        Some(bump(&mut snapshot))
+    }
+
+    pub fn record_enrichment_if_aircraft(
+        &self,
+        key: &AircraftKey,
+        enrichment: AircraftEnrichment,
+    ) -> Option<u64> {
+        let mut snapshot = self.snapshot.write().expect("runtime model lock");
+        if !snapshot
+            .aircraft
+            .iter()
+            .any(|aircraft| aircraft.hex == key.hex && aircraft.flight_callsign == key.callsign)
+            || snapshot.enrichment.get(key) == Some(&enrichment)
+        {
+            return None;
+        }
+        Arc::make_mut(&mut snapshot.enrichment).insert(key.clone(), enrichment);
+        Some(bump(&mut snapshot))
+    }
+
+    pub fn record_environment_if_location(
+        &self,
+        expected_location: &Location,
+        reading: EnvironmentReading,
+    ) -> Option<u64> {
+        let mut snapshot = self.snapshot.write().expect("runtime model lock");
+        if snapshot.settings.location.as_ref() != Some(expected_location) {
+            return None;
+        }
+        snapshot.environment = Some(reading);
+        Some(bump(&mut snapshot))
+    }
+
+    pub fn record_environment_error_if_location(
+        &self,
+        expected_location: &Location,
+        at: Duration,
+    ) -> Option<u64> {
+        let mut snapshot = self.snapshot.write().expect("runtime model lock");
+        if snapshot.settings.location.as_ref() != Some(expected_location) {
+            return None;
+        }
+        snapshot.environment_last_error_at = Some(at);
         Some(bump(&mut snapshot))
     }
 
@@ -318,6 +378,15 @@ impl RuntimeModel {
         snapshot.ip_url = ip_url;
         bump(&mut snapshot)
     }
+}
+
+fn retain_displayed_enrichment(snapshot: &mut RuntimeSnapshot) {
+    let displayed_keys = snapshot
+        .aircraft
+        .iter()
+        .map(Aircraft::key)
+        .collect::<HashSet<_>>();
+    Arc::make_mut(&mut snapshot.enrichment).retain(|key, _| displayed_keys.contains(key));
 }
 
 fn bump(snapshot: &mut RuntimeSnapshot) -> u64 {

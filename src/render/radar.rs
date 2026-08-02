@@ -1,4 +1,5 @@
 use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
@@ -597,6 +598,8 @@ fn fixture_settings() -> RadarSettings {
 fn fixture_snapshot(aircraft: Vec<Aircraft>, fetched_at: Option<Duration>) -> RadarSnapshot {
     RadarSnapshot {
         aircraft: Arc::from(aircraft),
+        enrichment: Arc::new(HashMap::new()),
+        environment: None,
         fetched_at,
         last_error_at: None,
     }

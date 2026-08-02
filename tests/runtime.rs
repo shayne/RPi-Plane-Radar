@@ -5,8 +5,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use planeradar::adsb::{AdsbClient, AltitudeFilter};
+use planeradar::flight_data::AircraftEnrichment;
 use planeradar::http::{HttpClient, HttpError, HttpRequest, HttpResponse};
-use planeradar::model::{Aircraft, AppState, Location, RadarSettings, Units};
+use planeradar::model::{Aircraft, AppState, EnvironmentReading, Location, RadarSettings, Units};
 use planeradar::runtime::{
     AdsbWorker, ChannelWaiter, RuntimeConfig, RuntimeHealthSource, RuntimeModel,
     RuntimeSettingsService, WaitResult, Waiter, WorkerCommand,
@@ -55,6 +56,16 @@ fn aircraft_at(hex: &str, altitude_feet: Option<i32>) -> Aircraft {
     }
 }
 
+fn environment(fetched_at: Duration) -> EnvironmentReading {
+    EnvironmentReading {
+        temperature_celsius: 21.5,
+        humidity_percent: 48,
+        weather_code: 2,
+        utc_offset_seconds: -14_400,
+        fetched_at,
+    }
+}
+
 #[test]
 fn snapshot_updates_are_immutable_and_generation_is_monotonic() {
     let model = RuntimeModel::new(
@@ -69,8 +80,217 @@ fn snapshot_updates_are_immutable_and_generation_is_monotonic() {
 
     assert!(before.settings.location.is_none());
     assert!(before.aircraft.is_empty());
+    assert!(before.enrichment.is_empty());
+    assert_eq!(before.environment, None);
+    assert_eq!(before.environment_last_error_at, None);
     assert_eq!(after.aircraft.len(), 1);
     assert_eq!(after.generation, 2);
+}
+
+#[test]
+fn enrichment_publication_requires_an_exact_displayed_aircraft_key() {
+    let model = RuntimeModel::new(configured(), "http://planeradar.local".to_owned());
+    let displayed = aircraft_at("a00001", Some(12_000));
+    let displayed_key = displayed.key();
+    model.record_aircraft(vec![displayed], Duration::from_secs(10));
+    let enrichment = AircraftEnrichment {
+        route: Some("KJFK → KBOS".to_owned()),
+        model: Some("Airbus A320".to_owned()),
+    };
+
+    let before = model.snapshot().generation;
+    assert_eq!(
+        model.record_enrichment_if_aircraft(&displayed_key, enrichment.clone()),
+        Some(before + 1)
+    );
+    let published = model.snapshot();
+    assert_eq!(published.enrichment.get(&displayed_key), Some(&enrichment));
+    assert_eq!(published.generation, before + 1);
+
+    assert_eq!(
+        model.record_enrichment_if_aircraft(&displayed_key, enrichment.clone()),
+        None,
+        "byte-identical enrichment must not republish"
+    );
+    assert_eq!(model.snapshot().generation, published.generation);
+
+    let same_hex_departed_callsign = Aircraft {
+        flight_callsign: "DEPARTED".to_owned(),
+        ..aircraft_at("a00001", Some(12_000))
+    }
+    .key();
+    assert_eq!(
+        model.record_enrichment_if_aircraft(&same_hex_departed_callsign, enrichment),
+        None,
+        "matching only the hex is not an exact aircraft identity"
+    );
+    assert_eq!(model.snapshot().generation, published.generation);
+}
+
+#[test]
+fn replacing_aircraft_prunes_only_departed_enrichment() {
+    let model = RuntimeModel::new(configured(), "http://planeradar.local".to_owned());
+    let kept = aircraft_at("kept", Some(15_000));
+    let departed = aircraft_at("changed", Some(20_000));
+    let kept_key = kept.key();
+    let departed_key = departed.key();
+    model.record_aircraft(vec![kept.clone(), departed], Duration::from_secs(10));
+    let kept_enrichment = AircraftEnrichment {
+        route: Some("KEPT ROUTE".to_owned()),
+        model: None,
+    };
+    let departed_enrichment = AircraftEnrichment {
+        route: None,
+        model: Some("Old model".to_owned()),
+    };
+    assert!(
+        model
+            .record_enrichment_if_aircraft(&kept_key, kept_enrichment.clone())
+            .is_some()
+    );
+    assert!(
+        model
+            .record_enrichment_if_aircraft(&departed_key, departed_enrichment)
+            .is_some()
+    );
+
+    let replacement = Aircraft {
+        flight_callsign: "new-callsign".to_owned(),
+        ..aircraft_at("changed", Some(20_000))
+    };
+    let before = model.snapshot().generation;
+    assert_eq!(
+        model.record_aircraft(vec![kept, replacement], Duration::from_secs(11)),
+        before + 1
+    );
+    let snapshot = model.snapshot();
+    assert_eq!(snapshot.enrichment.len(), 1);
+    assert_eq!(snapshot.enrichment.get(&kept_key), Some(&kept_enrichment));
+    assert!(!snapshot.enrichment.contains_key(&departed_key));
+}
+
+#[test]
+fn immediate_altitude_pruning_removes_enrichment_for_filtered_aircraft() {
+    let model = RuntimeModel::new(configured(), "http://planeradar.local".to_owned());
+    let low = aircraft_at("low", Some(5_000));
+    let high = aircraft_at("high", Some(25_000));
+    let low_key = low.key();
+    let high_key = high.key();
+    model.record_aircraft(vec![low, high], Duration::from_secs(10));
+    assert!(
+        model
+            .record_enrichment_if_aircraft(
+                &low_key,
+                AircraftEnrichment {
+                    route: Some("LOW".to_owned()),
+                    model: None,
+                },
+            )
+            .is_some()
+    );
+    assert!(
+        model
+            .record_enrichment_if_aircraft(
+                &high_key,
+                AircraftEnrichment {
+                    route: Some("HIGH".to_owned()),
+                    model: None,
+                },
+            )
+            .is_some()
+    );
+
+    let mut filtered = configured();
+    filtered.minimum_altitude_feet = Some(10_000);
+    let before = model.snapshot().generation;
+    assert_eq!(model.replace_settings(filtered), before + 1);
+    let snapshot = model.snapshot();
+    assert!(!snapshot.enrichment.contains_key(&low_key));
+    assert!(snapshot.enrichment.contains_key(&high_key));
+    assert_eq!(snapshot.generation, before + 1);
+}
+
+#[test]
+fn environment_publications_require_the_current_requested_location() {
+    let settings = configured();
+    let location = settings.location.clone().expect("location");
+    let stale_location = Location {
+        latitude: 34.0,
+        longitude: -118.0,
+        label: "stale".to_owned(),
+    };
+    let model = RuntimeModel::new(settings, "http://planeradar.local".to_owned());
+    let reading = environment(Duration::from_secs(20));
+
+    let before = model.snapshot().generation;
+    assert_eq!(
+        model.record_environment_if_location(&location, reading.clone()),
+        Some(before + 1)
+    );
+    let published = model.snapshot();
+    assert_eq!(published.environment, Some(reading.clone()));
+    assert_eq!(published.environment_last_error_at, None);
+    assert_eq!(published.last_error_at, None);
+    assert_eq!(published.generation, before + 1);
+
+    assert_eq!(
+        model.record_environment_if_location(&stale_location, environment(Duration::from_secs(21))),
+        None
+    );
+    assert_eq!(
+        model.record_environment_error_if_location(&stale_location, Duration::from_secs(22)),
+        None
+    );
+    assert_eq!(model.snapshot().generation, published.generation);
+
+    assert_eq!(
+        model.record_environment_error_if_location(&location, Duration::from_secs(23)),
+        Some(published.generation + 1)
+    );
+    let after_error = model.snapshot();
+    assert_eq!(after_error.environment, Some(reading));
+    assert_eq!(
+        after_error.environment_last_error_at,
+        Some(Duration::from_secs(23))
+    );
+    assert_eq!(after_error.last_error_at, None);
+    assert_eq!(after_error.generation, published.generation + 1);
+}
+
+#[test]
+fn location_change_clears_environment_and_its_error_timestamp() {
+    let settings = configured();
+    let old_location = settings.location.clone().expect("location");
+    let model = RuntimeModel::new(settings, "http://planeradar.local".to_owned());
+    assert!(
+        model
+            .record_environment_if_location(&old_location, environment(Duration::from_secs(20)))
+            .is_some()
+    );
+    assert!(
+        model
+            .record_environment_error_if_location(&old_location, Duration::from_secs(21))
+            .is_some()
+    );
+
+    let mut moved = configured();
+    moved.location = Some(Location {
+        latitude: 41.0,
+        longitude: -73.0,
+        label: "new place".to_owned(),
+    });
+    let before = model.snapshot().generation;
+    assert_eq!(model.replace_settings(moved), before + 1);
+    let snapshot = model.snapshot();
+    assert_eq!(snapshot.environment, None);
+    assert_eq!(snapshot.environment_last_error_at, None);
+    assert_eq!(snapshot.generation, before + 1);
+
+    assert_eq!(
+        model.record_environment_if_location(&old_location, environment(Duration::from_secs(22))),
+        None
+    );
+    assert_eq!(model.snapshot().generation, snapshot.generation);
 }
 
 #[test]
