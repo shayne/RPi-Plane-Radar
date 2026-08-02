@@ -1,3 +1,4 @@
+use std::io::Read;
 use std::time::Duration;
 
 use thiserror::Error;
@@ -98,10 +99,27 @@ fn read_response_body(
     body: &mut ureq::Body,
     max_response_bytes: usize,
 ) -> Result<Vec<u8>, HttpError> {
-    body.with_config()
-        .limit(max_response_bytes as u64)
-        .read_to_vec()
-        .map_err(map_body_error)
+    let mut reader = body.with_config().limit(max_response_bytes as u64).reader();
+    let mut bytes = Vec::with_capacity(max_response_bytes.min(8192));
+    let mut buffer = [0_u8; 8192];
+
+    loop {
+        let remaining = max_response_bytes.saturating_sub(bytes.len());
+        if remaining == 0 {
+            return match reader.read(&mut buffer[..1]) {
+                Ok(0) => Ok(bytes),
+                Ok(_) => Err(HttpError::BodyTooLarge),
+                Err(error) => Err(map_body_error(error.into())),
+            };
+        }
+
+        let read_limit = remaining.min(buffer.len());
+        match reader.read(&mut buffer[..read_limit]) {
+            Ok(0) => return Ok(bytes),
+            Ok(read) => bytes.extend_from_slice(&buffer[..read]),
+            Err(error) => return Err(map_body_error(error.into())),
+        }
+    }
 }
 
 fn map_request_error(error: ureq::Error) -> HttpError {
@@ -121,6 +139,12 @@ fn map_body_error(error: ureq::Error) -> HttpError {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
+    use std::thread;
+
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
+
     use super::*;
 
     fn request() -> HttpRequest {
@@ -175,6 +199,40 @@ mod tests {
             map_body_error(ureq::Error::RequireHttpsOnly("not a body limit".to_owned())),
             HttpError::Body
         );
+    }
+
+    #[test]
+    fn gzip_expansion_cannot_exceed_the_decoded_response_limit() {
+        let decoded = vec![b'x'; 4096];
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&decoded).expect("gzip input");
+        let compressed = encoder.finish().expect("gzip output");
+        assert!(compressed.len() < 128, "fixture must fit the wire limit");
+
+        let server = tiny_http::Server::http("127.0.0.1:0").expect("HTTP server");
+        let address = server.server_addr();
+        let server_thread = thread::spawn(move || {
+            let request = server.recv().expect("request");
+            let response = tiny_http::Response::from_data(compressed).with_header(
+                tiny_http::Header::from_bytes("Content-Encoding", "gzip").expect("gzip header"),
+            );
+            request.respond(response).expect("response");
+        });
+
+        let agent = ureq::Agent::config_builder()
+            .https_only(false)
+            .build()
+            .new_agent();
+        let mut response = agent
+            .get(format!("http://{address}"))
+            .call()
+            .expect("response");
+
+        assert_eq!(
+            read_response_body(response.body_mut(), 128),
+            Err(HttpError::BodyTooLarge)
+        );
+        server_thread.join().expect("server thread");
     }
 
     #[test]
