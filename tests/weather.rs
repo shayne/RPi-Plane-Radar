@@ -504,6 +504,41 @@ fn temperature_units_round_to_zero_decimals_without_changing_source_data() {
 }
 
 #[test]
+fn temperature_half_ties_round_to_even_in_celsius_and_fahrenheit() {
+    let cases = [
+        (TemperatureUnit::Celsius, 2.5, "2°C"),
+        (TemperatureUnit::Celsius, -2.5, "-2°C"),
+        (TemperatureUnit::Fahrenheit, 2.5, "36°F"),
+        (TemperatureUnit::Fahrenheit, -42.5, "-44°F"),
+    ];
+
+    for (temperature_unit, temperature_celsius, expected) in cases {
+        let settings = FooterSettings {
+            show_temperature: true,
+            temperature_unit,
+            ..FooterSettings::default()
+        };
+        assert_eq!(
+            footer_content(
+                &settings,
+                Some(&reading(
+                    temperature_celsius,
+                    54,
+                    0,
+                    0,
+                    Duration::ZERO,
+                )),
+                Duration::ZERO,
+                0,
+            )
+            .environment,
+            vec![item(expected, FooterTone::Temperature)],
+            "unit={temperature_unit:?}, celsius={temperature_celsius}",
+        );
+    }
+}
+
+#[test]
 fn temperature_rounding_normalizes_negative_zero_in_both_units() {
     let celsius = FooterSettings {
         show_temperature: true,
@@ -529,6 +564,27 @@ fn temperature_rounding_normalizes_negative_zero_in_both_units() {
         footer_content(
             &fahrenheit,
             Some(&reading(-17.8, 54, 0, 0, Duration::ZERO)),
+            Duration::ZERO,
+            0,
+        )
+        .environment,
+        vec![item("0°F", FooterTone::Temperature)]
+    );
+
+    assert_eq!(
+        footer_content(
+            &celsius,
+            Some(&reading(0.4, 54, 0, 0, Duration::ZERO)),
+            Duration::ZERO,
+            0,
+        )
+        .environment,
+        vec![item("0°C", FooterTone::Temperature)]
+    );
+    assert_eq!(
+        footer_content(
+            &fahrenheit,
+            Some(&reading(-17.7, 54, 0, 0, Duration::ZERO)),
             Duration::ZERO,
             0,
         )

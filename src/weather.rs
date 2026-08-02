@@ -296,9 +296,9 @@ fn format_temperature(temperature_celsius: f64, unit: TemperatureUnit) -> String
             (temperature_fahrenheit, "°F")
         }
     };
-    let rounded = temperature.round();
-    let rounded = if rounded == 0.0 { 0.0 } else { rounded };
-    format!("{rounded:.0}{suffix}")
+    let rounded = format!("{temperature:.0}");
+    let rounded = if rounded == "-0" { "0" } else { &rounded };
+    format!("{rounded}{suffix}")
 }
 
 fn display_date_time(
