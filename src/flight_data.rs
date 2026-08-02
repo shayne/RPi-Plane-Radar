@@ -154,9 +154,29 @@ impl EnrichmentCache {
     }
 
     fn next_access_serial(&mut self) -> u64 {
-        self.access_serial = self.access_serial.saturating_add(1);
+        if self.access_serial == u64::MAX {
+            self.access_serial = rebase_access_serials(&mut self.route_entries)
+                .max(rebase_access_serials(&mut self.model_entries));
+        }
+        self.access_serial = self
+            .access_serial
+            .checked_add(1)
+            .expect("bounded cache serial has room after rebasing");
         self.access_serial
     }
+}
+
+fn rebase_access_serials(entries: &mut HashMap<String, CacheEntry>) -> u64 {
+    let mut oldest_first: Vec<_> = entries.values_mut().collect();
+    oldest_first.sort_unstable_by_key(|entry| entry.access_serial);
+
+    let mut highest = 0;
+    for (index, entry) in oldest_first.into_iter().enumerate() {
+        let serial = u64::try_from(index + 1).unwrap_or(u64::MAX);
+        entry.access_serial = serial;
+        highest = serial;
+    }
+    highest
 }
 
 fn normalized_aircraft_key(aircraft: &Aircraft) -> crate::model::AircraftKey {
@@ -505,4 +525,37 @@ fn compact_model(model: &str) -> String {
 
 fn normalized_text(value: &str) -> String {
     value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn access_serial_rebases_at_u64_max_without_losing_lru_order() {
+        let mut cache = EnrichmentCache::new(2);
+        cache.route_entries.insert(
+            "OLDER".to_owned(),
+            CacheEntry {
+                value: Some("JFK→LAX".to_owned()),
+                expires_at: Duration::from_secs(u64::MAX),
+                access_serial: u64::MAX - 1,
+            },
+        );
+        cache.route_entries.insert(
+            "NEWER".to_owned(),
+            CacheEntry {
+                value: Some("SFO→SEA".to_owned()),
+                expires_at: Duration::from_secs(u64::MAX),
+                access_serial: u64::MAX,
+            },
+        );
+        cache.access_serial = u64::MAX;
+
+        let next = cache.next_access_serial();
+
+        assert_eq!(next, 3);
+        assert_eq!(cache.route_entries["OLDER"].access_serial, 1);
+        assert_eq!(cache.route_entries["NEWER"].access_serial, 2);
+    }
 }
