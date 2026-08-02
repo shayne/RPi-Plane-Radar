@@ -39,6 +39,7 @@ pub struct BackgroundKey {
     range_index: u8,
     units: Units,
     show_runways: bool,
+    radar_text_scale_percent: u8,
 }
 
 impl BackgroundKey {
@@ -54,6 +55,7 @@ impl BackgroundKey {
             range_index: settings.range_index,
             units: settings.units,
             show_runways: settings.show_runways,
+            radar_text_scale_percent: settings.radar_text_scale_percent,
         })
     }
 }
@@ -108,7 +110,7 @@ impl RadarRenderer {
                 theme::CENTER.0,
                 44.0,
                 TextStyle {
-                    cap_height: theme::STALE_CAP_HEIGHT,
+                    cap_height: text_scale(settings, theme::STALE_CAP_HEIGHT),
                     color: theme::STALE,
                     horizontal: HorizontalAnchor::Center,
                     vertical: VerticalAnchor::Top,
@@ -180,7 +182,7 @@ impl RadarRenderer {
     ) -> Result<(), RenderError> {
         let text = TextRasterizer::new(self.font.font());
         let cardinal = |horizontal, vertical| TextStyle {
-            cap_height: theme::CARDINAL_CAP_HEIGHT,
+            cap_height: text_scale(settings, theme::CARDINAL_CAP_HEIGHT),
             color: theme::LABEL,
             horizontal,
             vertical,
@@ -218,7 +220,7 @@ impl RadarRenderer {
         let range_label = format_range_label(preset, settings.units);
         let anchor_x = theme::CENTER.0 + theme::GRID_OUTER_RADIUS - 12.0;
         let style = TextStyle {
-            cap_height: theme::SCALE_CAP_HEIGHT,
+            cap_height: text_scale(settings, theme::SCALE_CAP_HEIGHT),
             color: theme::GRID,
             horizontal: HorizontalAnchor::Right,
             vertical: VerticalAnchor::Middle,
@@ -324,7 +326,7 @@ impl RadarRenderer {
                 label_x as f32,
                 label_y as f32,
                 TextStyle {
-                    cap_height: theme::RUNWAY_LABEL_CAP_HEIGHT,
+                    cap_height: text_scale(settings, theme::RUNWAY_LABEL_CAP_HEIGHT),
                     color: theme::RUNWAY_LABEL,
                     horizontal: HorizontalAnchor::Center,
                     vertical: VerticalAnchor::Bottom,
@@ -391,7 +393,7 @@ impl RadarRenderer {
             draw_heading_triangle(pixmap, aircraft.nose_degrees, *x, *y);
         }
         for (aircraft, x, y, _) in inside {
-            self.draw_aircraft_tag(pixmap, aircraft, x, y);
+            self.draw_aircraft_tag(pixmap, snapshot, settings, aircraft, x, y);
         }
         Ok(())
     }
@@ -437,40 +439,89 @@ impl RadarRenderer {
         );
     }
 
-    fn draw_aircraft_tag(&self, pixmap: &mut Pixmap, aircraft: &Aircraft, x: f32, y: f32) {
+    fn draw_aircraft_tag(
+        &self,
+        pixmap: &mut Pixmap,
+        snapshot: &RadarSnapshot,
+        settings: &RadarSettings,
+        aircraft: &Aircraft,
+        x: f32,
+        y: f32,
+    ) {
         let text = TextRasterizer::new(self.font.font());
-        let lines = [
-            (&aircraft.callsign, theme::LABEL),
-            (&aircraft.aircraft_type, theme::TAG_TYPE),
-            (&aircraft.altitude, theme::TAG_ALTITUDE),
-        ];
-        let widths = lines.map(|(line, _)| text.measure(line, theme::AIRCRAFT_TAG_CAP_HEIGHT).0);
-        let line_height = text.measure("H", theme::AIRCRAFT_TAG_CAP_HEIGHT).1;
-        let block_width = widths.into_iter().fold(0.0_f32, f32::max);
-        let block_height = line_height * 3.0;
+        let enrichment = snapshot.enrichment.get(&aircraft.key());
+        let mut requested_lines = Vec::with_capacity(4);
+        if settings.show_callsign && !aircraft.callsign.is_empty() {
+            requested_lines.push((aircraft.callsign.as_str(), theme::LABEL));
+        }
+        if settings.show_route
+            && let Some(route) = enrichment
+                .and_then(|enrichment| enrichment.route.as_deref())
+                .filter(|route| !route.is_empty())
+        {
+            requested_lines.push((route, theme::LABEL));
+        }
+        let model = if settings.show_expanded_model {
+            enrichment
+                .and_then(|enrichment| enrichment.model.as_deref())
+                .filter(|model| !model.is_empty())
+                .unwrap_or(&aircraft.aircraft_type)
+        } else {
+            &aircraft.aircraft_type
+        };
+        if !model.is_empty() {
+            requested_lines.push((model, theme::TAG_TYPE));
+        }
+        if !aircraft.altitude.is_empty() {
+            requested_lines.push((aircraft.altitude.as_str(), theme::TAG_ALTITUDE));
+        }
+
+        let cap_height = text_scale(settings, theme::AIRCRAFT_TAG_CAP_HEIGHT);
+        let line_height = text.measure("H", cap_height).1;
         let symbol_half = theme::AIRCRAFT_NOSE_LENGTH + theme::AIRCRAFT_TAIL_HALF_WIDTH;
         let on_right = x < theme::CENTER.0;
-        let (anchor_x, horizontal) = if on_right {
+        let (preferred_anchor_x, max_width, horizontal) = if on_right {
             (
-                (x + symbol_half + theme::AIRCRAFT_LABEL_GAP)
-                    .min(theme::SIZE as f32 - block_width - 1.0),
+                x + symbol_half + theme::AIRCRAFT_LABEL_GAP,
+                theme::SIZE as f32 - (x + symbol_half + theme::AIRCRAFT_LABEL_GAP) - 1.0,
                 HorizontalAnchor::Left,
             )
         } else {
             (
-                (x - symbol_half - theme::AIRCRAFT_LABEL_GAP).max(block_width + 1.0),
+                x - symbol_half - theme::AIRCRAFT_LABEL_GAP,
+                x - symbol_half - theme::AIRCRAFT_LABEL_GAP - 1.0,
                 HorizontalAnchor::Right,
             )
+        };
+        let lines = requested_lines
+            .into_iter()
+            .filter_map(|(line, color)| {
+                let fitted = text.fit_with_ellipsis(line, cap_height, max_width);
+                (!fitted.is_empty()).then_some((fitted, color))
+            })
+            .collect::<Vec<_>>();
+        if lines.is_empty() {
+            return;
+        }
+        let block_width = lines
+            .iter()
+            .map(|(line, _)| text.measure(line, cap_height).0)
+            .fold(0.0_f32, f32::max);
+        let block_height = line_height * lines.len() as f32;
+        let anchor_x = if on_right {
+            preferred_anchor_x.min(theme::SIZE as f32 - block_width - 1.0)
+        } else {
+            preferred_anchor_x.max(block_width + 1.0)
         };
         let top = (y - block_height / 2.0).clamp(1.0, theme::SIZE as f32 - block_height - 1.0);
         for (index, (line, color)) in lines.into_iter().enumerate() {
             text.draw(
                 pixmap,
-                line,
+                &line,
                 anchor_x,
                 top + line_height * index as f32,
                 TextStyle {
-                    cap_height: theme::AIRCRAFT_TAG_CAP_HEIGHT,
+                    cap_height,
                     color,
                     horizontal,
                     vertical: VerticalAnchor::Top,
@@ -486,6 +537,7 @@ pub fn write_fixtures(output: &Path) -> Result<(), RenderError> {
         ("radar-empty.png", fixture_empty()?),
         ("radar-traffic.png", fixture_traffic()?),
         ("radar-stale.png", fixture_stale()?),
+        ("radar-enriched.png", fixture_enriched()?),
     ] {
         frame.save_png(&output.join(name))?;
     }
@@ -544,6 +596,48 @@ pub fn fixture_stale() -> Result<Frame, RenderError> {
         &fixture_settings(),
         &[],
         Duration::from_secs(30),
+    )
+}
+
+pub fn fixture_enriched() -> Result<Frame, RenderError> {
+    let point = fixture_point(5.0, -3.0);
+    let aircraft = Aircraft {
+        hex: "a00001".to_owned(),
+        flight_callsign: "DAL123".to_owned(),
+        latitude: point.latitude,
+        longitude: point.longitude,
+        nose_degrees: 45.0,
+        track_degrees: 75.0,
+        ground_speed_knots: 280.0,
+        callsign: "DAL123".to_owned(),
+        aircraft_type: "B738".to_owned(),
+        altitude_feet: Some(12_000),
+        altitude: "12000 ft".to_owned(),
+    };
+    let key = aircraft.key();
+    let snapshot = RadarSnapshot {
+        aircraft: Arc::from([aircraft]),
+        enrichment: Arc::new(HashMap::from([(
+            key,
+            crate::flight_data::AircraftEnrichment {
+                route: Some("JFK→LAX".to_owned()),
+                model: Some("737-800".to_owned()),
+            },
+        )])),
+        environment: None,
+        fetched_at: Some(Duration::ZERO),
+        last_error_at: None,
+    };
+    let settings = RadarSettings {
+        show_route: true,
+        show_expanded_model: true,
+        ..fixture_settings()
+    };
+    fixture_renderer()?.render(
+        &snapshot,
+        &settings,
+        &[fixture_airport()],
+        Duration::from_secs(5),
     )
 }
 
@@ -642,6 +736,10 @@ fn validate_settings(settings: &RadarSettings) -> Result<(), RenderError> {
     }
     range_preset(settings.range_index)?;
     Ok(())
+}
+
+fn text_scale(settings: &RadarSettings, cap_height: f32) -> f32 {
+    cap_height * f32::from(settings.radar_text_scale_percent) / 100.0
 }
 
 fn valid_coordinate(latitude: f64, longitude: f64) -> bool {

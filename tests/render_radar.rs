@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use fontdue::{Font, FontSettings};
+use planeradar::flight_data::AircraftEnrichment;
 use planeradar::geometry::offset_km;
 use planeradar::model::{
     Aircraft, Airport, GeoPoint, Location, RadarSettings, RadarSnapshot, Runway, Units,
@@ -18,12 +19,12 @@ use planeradar::render::theme::{
     AIRCRAFT_TAG_CAP_HEIGHT, AIRCRAFT_TAIL_HALF_WIDTH, AIRCRAFT_TAIL_LENGTH, BACKGROUND,
     CARDINAL_CAP_HEIGHT, CENTER, CENTER_DOT_RADIUS, GRID, GRID_OUTER_RADIUS, GRID_STROKE_WIDTH,
     LABEL, RIM_DOT_RADIUS, RIM_RADIUS, RUNWAY, RUNWAY_LABEL_CAP_HEIGHT, RUNWAY_LABEL_GAP,
-    RUNWAY_STROKE_WIDTH, SCALE_CAP_HEIGHT, SIZE, STALE, STALE_CAP_HEIGHT, TAG_TYPE, TRACK,
-    TRACK_MIN_LENGTH, TRACK_STROKE_WIDTH,
+    RUNWAY_STROKE_WIDTH, SCALE_CAP_HEIGHT, SIZE, STALE, STALE_CAP_HEIGHT, TAG_ALTITUDE, TAG_TYPE,
+    TRACK, TRACK_MIN_LENGTH, TRACK_STROKE_WIDTH,
 };
 use planeradar::render::{FontAsset, Frame, RenderError};
 use support::FrameAssertions;
-use tiny_skia::Pixmap;
+use tiny_skia::{IntSize, Pixmap};
 
 const ORIGIN_LATITUDE: f64 = 40.0;
 const ORIGIN_LONGITUDE: f64 = -75.0;
@@ -182,6 +183,125 @@ fn runway_airport() -> Airport {
     }
 }
 
+fn tag_snapshot(plane: Aircraft, enrichment: AircraftEnrichment) -> RadarSnapshot {
+    let key = plane.key();
+    RadarSnapshot {
+        aircraft: Arc::from([plane]),
+        enrichment: Arc::new(HashMap::from([(key, enrichment)])),
+        environment: None,
+        fetched_at: Some(Duration::ZERO),
+        last_error_at: None,
+    }
+}
+
+fn render_tag(settings: &RadarSettings, plane: Aircraft, enrichment: AircraftEnrichment) -> Frame {
+    test_renderer()
+        .render(
+            &tag_snapshot(plane, enrichment),
+            settings,
+            &[],
+            Duration::ZERO,
+        )
+        .expect("tag render")
+}
+
+fn expected_tag(settings: &RadarSettings, plane: &Aircraft, lines: &[(&str, [u8; 4])]) -> Frame {
+    let mut unlabelled = plane.clone();
+    unlabelled.callsign.clear();
+    unlabelled.aircraft_type.clear();
+    unlabelled.altitude.clear();
+    let mut base_settings = settings.clone();
+    base_settings.show_callsign = false;
+    base_settings.show_route = false;
+    base_settings.show_expanded_model = false;
+    let base = render_tag(&base_settings, unlabelled, AircraftEnrichment::default());
+    let mut pixmap = Pixmap::from_vec(
+        base.pixels().to_vec(),
+        IntSize::from_wh(SIZE, SIZE).expect("radar size"),
+    )
+    .expect("base frame pixmap");
+    let font = Font::from_bytes(
+        include_bytes!("../src/assets/DejaVuSans-Bold.ttf") as &[u8],
+        FontSettings::default(),
+    )
+    .expect("embedded DejaVu font");
+    let text = TextRasterizer::new(&font);
+    let cap_height = AIRCRAFT_TAG_CAP_HEIGHT * f32::from(settings.radar_text_scale_percent) / 100.0;
+    let line_height = text.measure("H", cap_height).1;
+    let block_width = lines
+        .iter()
+        .map(|(line, _)| text.measure(line, cap_height).0)
+        .fold(0.0_f32, f32::max);
+    let block_height = line_height * lines.len() as f32;
+    let location = settings.location.as_ref().expect("configured location");
+    let preset = range_preset(settings.range_index).expect("configured range");
+    let aircraft_offset = offset_km(location, plane.latitude, plane.longitude);
+    let pixels_per_kilometre = f64::from(GRID_OUTER_RADIUS) / preset.outer_km;
+    let x = CENTER.0 + (aircraft_offset.east * pixels_per_kilometre) as f32;
+    let y = CENTER.1 - (aircraft_offset.north * pixels_per_kilometre) as f32;
+    let symbol_half = AIRCRAFT_NOSE_LENGTH + AIRCRAFT_TAIL_HALF_WIDTH;
+    let on_right = x < CENTER.0;
+    let (anchor_x, horizontal) = if on_right {
+        (
+            (x + symbol_half + AIRCRAFT_LABEL_GAP).min(SIZE as f32 - block_width - 1.0),
+            HorizontalAnchor::Left,
+        )
+    } else {
+        (
+            (x - symbol_half - AIRCRAFT_LABEL_GAP).max(block_width + 1.0),
+            HorizontalAnchor::Right,
+        )
+    };
+    let top = (y - block_height / 2.0).clamp(1.0, SIZE as f32 - block_height - 1.0);
+    for (index, (line, color)) in lines.iter().enumerate() {
+        text.draw(
+            &mut pixmap,
+            line,
+            anchor_x,
+            top + line_height * index as f32,
+            TextStyle {
+                cap_height,
+                color: *color,
+                horizontal,
+                vertical: VerticalAnchor::Top,
+            },
+        );
+    }
+    Frame::new(SIZE, SIZE, pixmap.take()).expect("expected tag frame")
+}
+
+fn color_bounds(frame: &Frame, wanted: [u8; 4]) -> (u32, u32, u32, u32) {
+    let mut left = SIZE;
+    let mut top = SIZE;
+    let mut right = 0;
+    let mut bottom = 0;
+    for y in 0..SIZE {
+        for x in 0..SIZE {
+            if frame.pixel(x, y) == wanted {
+                left = left.min(x);
+                top = top.min(y);
+                right = right.max(x);
+                bottom = bottom.max(y);
+            }
+        }
+    }
+    assert!(
+        left <= right && top <= bottom,
+        "frame must contain requested color"
+    );
+    (left, top, right - left + 1, bottom - top + 1)
+}
+
+fn region_pixels(frame: &Frame, left: u32, top: u32, width: u32, height: u32) -> Vec<u8> {
+    let mut pixels = Vec::new();
+    for y in top..top + height {
+        for x in left..left + width {
+            pixels.extend_from_slice(&frame.pixel(x, y));
+        }
+    }
+    pixels
+}
+
 #[test]
 fn empty_radar_has_exact_size_palette_rings_and_center() {
     let mut renderer = test_renderer();
@@ -248,6 +368,252 @@ fn east_aircraft_uses_unrounded_projection_and_draws_tag_and_heading() {
         frame.region_is_white(220, 195, 100, 90),
         "callsign tag is drawn toward the center"
     );
+}
+
+#[test]
+fn enriched_tag_draws_callsign_route_compact_model_and_altitude_in_order() {
+    let mut settings = configured_settings();
+    settings.show_route = true;
+    settings.show_expanded_model = true;
+    let mut plane = aircraft(0.0, 0.0);
+    plane.callsign = "DAL123".to_owned();
+    plane.aircraft_type = "B738".to_owned();
+    plane.altitude = "12000 ft".to_owned();
+    let enrichment = AircraftEnrichment {
+        route: Some("JFK→LAX".to_owned()),
+        model: Some("737-800".to_owned()),
+    };
+
+    let actual = render_tag(&settings, plane.clone(), enrichment);
+    let expected = expected_tag(
+        &settings,
+        &plane,
+        &[
+            ("DAL123", LABEL),
+            ("JFK→LAX", LABEL),
+            ("737-800", TAG_TYPE),
+            ("12000 ft", TAG_ALTITUDE),
+        ],
+    );
+
+    assert_eq!(actual.pixels(), expected.pixels());
+}
+
+#[test]
+fn hidden_callsign_places_the_known_route_on_the_first_tag_line() {
+    let mut settings = configured_settings();
+    settings.show_callsign = false;
+    settings.show_route = true;
+    settings.show_expanded_model = true;
+    let mut plane = aircraft(0.0, 0.0);
+    plane.callsign = "HIDDEN".to_owned();
+    plane.aircraft_type = "B738".to_owned();
+    plane.altitude = "12000 ft".to_owned();
+    let enrichment = AircraftEnrichment {
+        route: Some("JFK→LAX".to_owned()),
+        model: Some("737-800".to_owned()),
+    };
+
+    let actual = render_tag(&settings, plane.clone(), enrichment);
+    let expected = expected_tag(
+        &settings,
+        &plane,
+        &[
+            ("JFK→LAX", LABEL),
+            ("737-800", TAG_TYPE),
+            ("12000 ft", TAG_ALTITUDE),
+        ],
+    );
+
+    assert_eq!(actual.pixels(), expected.pixels());
+}
+
+#[test]
+fn expanded_model_miss_falls_back_to_the_current_short_type() {
+    let mut settings = configured_settings();
+    settings.show_callsign = false;
+    settings.show_expanded_model = true;
+    let mut plane = aircraft(0.0, 0.0);
+    plane.aircraft_type = "B738".to_owned();
+    plane.altitude.clear();
+
+    let actual = render_tag(
+        &settings,
+        plane.clone(),
+        AircraftEnrichment {
+            route: None,
+            model: None,
+        },
+    );
+    let expected = expected_tag(&settings, &plane, &[("B738", TAG_TYPE)]);
+
+    assert_eq!(actual.pixels(), expected.pixels());
+}
+
+#[test]
+fn route_miss_does_not_reserve_a_blank_tag_line() {
+    let mut settings = configured_settings();
+    settings.show_callsign = false;
+    settings.show_route = true;
+    settings.show_expanded_model = true;
+    let mut plane = aircraft(0.0, 0.0);
+    plane.aircraft_type = "B738".to_owned();
+    plane.altitude = "12000 ft".to_owned();
+
+    let actual = render_tag(
+        &settings,
+        plane.clone(),
+        AircraftEnrichment {
+            route: None,
+            model: Some("737-800".to_owned()),
+        },
+    );
+    let expected = expected_tag(
+        &settings,
+        &plane,
+        &[("737-800", TAG_TYPE), ("12000 ft", TAG_ALTITUDE)],
+    );
+
+    assert_eq!(actual.pixels(), expected.pixels());
+}
+
+#[test]
+fn aircraft_tag_block_uses_measured_sizes_at_80_100_and_130_percent() {
+    let mut plane = aircraft(0.0, 0.0);
+    plane.callsign.clear();
+    plane.aircraft_type = "737-800".to_owned();
+    plane.altitude.clear();
+    let mut bounds = Vec::new();
+
+    for scale in [80, 100, 130] {
+        let mut settings = configured_settings();
+        settings.show_callsign = false;
+        settings.radar_text_scale_percent = scale;
+        let actual = render_tag(&settings, plane.clone(), AircraftEnrichment::default());
+        let expected = expected_tag(&settings, &plane, &[("737-800", TAG_TYPE)]);
+        assert_eq!(actual.pixels(), expected.pixels(), "text scale {scale}%");
+        bounds.push(color_bounds(&actual, TAG_TYPE));
+    }
+
+    assert!(bounds[0].2 < bounds[1].2 && bounds[1].2 < bounds[2].2);
+    assert!(bounds[0].3 < bounds[1].3 && bounds[1].3 < bounds[2].3);
+}
+
+#[test]
+fn overlong_expanded_model_is_ellipsized_to_its_actual_side_width() {
+    let settings = RadarSettings {
+        show_callsign: false,
+        show_expanded_model: true,
+        ..configured_settings()
+    };
+    let font = Font::from_bytes(
+        include_bytes!("../src/assets/DejaVuSans-Bold.ttf") as &[u8],
+        FontSettings::default(),
+    )
+    .expect("embedded DejaVu font");
+    let text = TextRasterizer::new(&font);
+    let expected_model = "HHHHHHHHHHHH…";
+    let wider_model = "HHHHHHHHHHHHH…";
+    let expected_width = text.measure(expected_model, AIRCRAFT_TAG_CAP_HEIGHT).0;
+    let wider_width = text.measure(wider_model, AIRCRAFT_TAG_CAP_HEIGHT).0;
+    let available_width = (expected_width + wider_width) / 2.0;
+    let aircraft_x = available_width
+        + 1.0
+        + AIRCRAFT_NOSE_LENGTH
+        + AIRCRAFT_TAIL_HALF_WIDTH
+        + AIRCRAFT_LABEL_GAP;
+    assert!((CENTER.0..CENTER.0 + AIRCRAFT_SAFE_RADIUS).contains(&aircraft_x));
+    let preset = range_preset(settings.range_index).expect("configured range");
+    let east_km = f64::from(aircraft_x - CENTER.0) * preset.outer_km / f64::from(GRID_OUTER_RADIUS);
+    let mut plane = aircraft(east_km, 0.0);
+    plane.callsign.clear();
+    plane.aircraft_type = "B738".to_owned();
+    plane.altitude.clear();
+    let actual = render_tag(
+        &settings,
+        plane.clone(),
+        AircraftEnrichment {
+            route: None,
+            model: Some("H".repeat(1_024)),
+        },
+    );
+    let expected = expected_tag(&settings, &plane, &[(expected_model, TAG_TYPE)]);
+
+    assert_eq!(actual.pixels(), expected.pixels());
+    let (left, _, width, _) = color_bounds(&actual, TAG_TYPE);
+    assert!(left >= 1);
+    assert!(left + width < SIZE);
+}
+
+#[test]
+fn text_scale_changes_all_existing_radar_text_without_scaling_geometry() {
+    let airport = runway_airport();
+    let mut static_frames = Vec::new();
+    let mut tag_frames = Vec::new();
+    for scale in [80, 100, 130] {
+        let mut settings = configured_settings();
+        settings.radar_text_scale_percent = scale;
+        static_frames.push(
+            test_renderer()
+                .render(
+                    &empty_snapshot(Some(Duration::ZERO)),
+                    &settings,
+                    std::slice::from_ref(&airport),
+                    Duration::from_secs(30),
+                )
+                .expect("scaled static render"),
+        );
+        let mut plane = aircraft(5.0, 120.0);
+        plane.callsign.clear();
+        plane.altitude.clear();
+        settings.show_callsign = false;
+        tag_frames.push(render_tag(&settings, plane, AircraftEnrichment::default()));
+    }
+
+    let cardinal_counts = static_frames
+        .iter()
+        .map(|frame| frame.color_count(LABEL, 210, 0, 60, 50))
+        .collect::<Vec<_>>();
+    let runway_label_counts = static_frames
+        .iter()
+        .map(|frame| frame.color_count(planeradar::render::theme::RUNWAY_LABEL, 0, 0, SIZE, SIZE))
+        .collect::<Vec<_>>();
+    let stale_counts = static_frames
+        .iter()
+        .map(|frame| frame.color_count(STALE, 130, 30, 220, 60))
+        .collect::<Vec<_>>();
+    let tag_counts = tag_frames
+        .iter()
+        .map(|frame| frame.color_count(TAG_TYPE, 0, 0, SIZE, SIZE))
+        .collect::<Vec<_>>();
+    for counts in [
+        cardinal_counts,
+        runway_label_counts,
+        stale_counts,
+        tag_counts,
+    ] {
+        assert!(counts[0] < counts[1] && counts[1] < counts[2], "{counts:?}");
+    }
+    for pair in static_frames.windows(2) {
+        assert_ne!(
+            region_pixels(&pair[0], 370, 220, 80, 40),
+            region_pixels(&pair[1], 370, 220, 80, 40),
+            "range text must change with scale"
+        );
+        assert_eq!(pair[0].pixel(240, 240), pair[1].pixel(240, 240));
+        assert_eq!(pair[0].pixel(454, 240), pair[1].pixel(454, 240));
+        assert_eq!(pair[0].pixel(230, 240), pair[1].pixel(230, 240));
+    }
+    for pair in tag_frames.windows(2) {
+        assert_eq!(
+            pair[0].color_count(AIRCRAFT, 0, 0, SIZE, SIZE),
+            pair[1].color_count(AIRCRAFT, 0, 0, SIZE, SIZE)
+        );
+        assert_eq!(
+            pair[0].color_count(TRACK, 0, 0, SIZE, SIZE),
+            pair[1].color_count(TRACK, 0, 0, SIZE, SIZE)
+        );
+    }
 }
 
 #[test]
@@ -604,6 +970,28 @@ fn background_key_uses_exact_float_bits_and_every_static_setting() {
         base,
         BackgroundKey::from_settings(&changed).expect("runway key")
     );
+    changed = base_settings.clone();
+    changed.radar_text_scale_percent = 110;
+    assert_ne!(
+        base,
+        BackgroundKey::from_settings(&changed).expect("text-scale key")
+    );
+
+    for mutate_dynamic_setting in [
+        |settings: &mut RadarSettings| settings.show_callsign = false,
+        |settings: &mut RadarSettings| settings.show_route = true,
+        |settings: &mut RadarSettings| settings.show_expanded_model = true,
+        |settings: &mut RadarSettings| settings.footer.show_condition = true,
+        |settings: &mut RadarSettings| settings.minimum_altitude_feet = Some(5_000),
+        |settings: &mut RadarSettings| settings.maximum_altitude_feet = Some(25_000),
+    ] {
+        changed = base_settings.clone();
+        mutate_dynamic_setting(&mut changed);
+        assert_eq!(
+            base,
+            BackgroundKey::from_settings(&changed).expect("dynamic setting key")
+        );
+    }
 }
 
 #[test]
@@ -676,4 +1064,10 @@ fn traffic_fixture_matches_golden() {
 fn stale_fixture_matches_golden() {
     let fixture = planeradar::render::radar::fixture_stale().expect("stale fixture");
     fixture.assert_matches_golden("radar-stale");
+}
+
+#[test]
+fn enriched_fixture_matches_golden() {
+    let fixture = planeradar::render::radar::fixture_enriched().expect("enriched fixture");
+    fixture.assert_matches_golden("radar-enriched");
 }

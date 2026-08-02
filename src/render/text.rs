@@ -44,6 +44,42 @@ impl<'a> TextRasterizer<'a> {
         (width, height)
     }
 
+    pub fn fit_with_ellipsis(&self, text: &str, cap_height: f32, max_width: f32) -> String {
+        let sanitized = display_characters(text).collect::<String>();
+        if sanitized.is_empty()
+            || !cap_height.is_finite()
+            || cap_height <= 0.0
+            || max_width.is_nan()
+            || max_width <= 0.0
+        {
+            return String::new();
+        }
+        if self.measure(&sanitized, cap_height).0 <= max_width {
+            return sanitized;
+        }
+        if self.measure("…", cap_height).0 > max_width {
+            return String::new();
+        }
+
+        let mut prefix = sanitized.chars().collect::<Vec<_>>();
+        prefix.truncate(MAX_TEXT_GLYPHS.saturating_sub(1));
+        loop {
+            while prefix.last() == Some(&'…') {
+                prefix.pop();
+            }
+            let candidate = prefix
+                .iter()
+                .chain(std::iter::once(&'…'))
+                .collect::<String>();
+            if self.measure(&candidate, cap_height).0 <= max_width {
+                return candidate;
+            }
+            if prefix.pop().is_none() {
+                return String::new();
+            }
+        }
+    }
+
     pub fn draw(&self, pixmap: &mut Pixmap, text: &str, x: f32, y: f32, style: TextStyle) {
         if text.is_empty() || !style.cap_height.is_finite() || style.cap_height <= 0.0 {
             return;
@@ -190,5 +226,69 @@ fn blend_glyph(
             }
             data[offset + 3] = 255;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MAX_TEXT_GLYPHS, TextRasterizer};
+    use fontdue::{Font, FontSettings};
+
+    fn rasterizer() -> TextRasterizer<'static> {
+        let font = Font::from_bytes(
+            include_bytes!("../assets/DejaVuSans-Bold.ttf") as &[u8],
+            FontSettings::default(),
+        )
+        .expect("embedded DejaVu font");
+        TextRasterizer::new(Box::leak(Box::new(font)))
+    }
+
+    #[test]
+    fn fit_with_ellipsis_keeps_fitting_text_unchanged() {
+        let text = rasterizer();
+        let max_width = text.measure("RADAR7", 21.0).0;
+
+        assert_eq!(text.fit_with_ellipsis("RADAR7", 21.0, max_width), "RADAR7");
+    }
+
+    #[test]
+    fn fit_with_ellipsis_truncates_on_unicode_boundaries_with_one_ellipsis() {
+        let text = rasterizer();
+        let max_width = text.measure("航班…", 21.0).0;
+
+        let fitted = text.fit_with_ellipsis("航班ABCD", 21.0, max_width);
+
+        assert_eq!(fitted, "航班…");
+        assert_eq!(
+            fitted.chars().filter(|&character| character == '…').count(),
+            1
+        );
+        assert!(text.measure(&fitted, 21.0).0 <= max_width);
+    }
+
+    #[test]
+    fn fit_with_ellipsis_returns_empty_when_even_ellipsis_cannot_fit() {
+        let text = rasterizer();
+        let max_width = text.measure("…", 21.0).0 - 0.1;
+
+        assert_eq!(text.fit_with_ellipsis("RADAR7", 21.0, max_width), "");
+    }
+
+    #[test]
+    fn fit_with_ellipsis_sanitizes_controls_through_existing_glyph_rules() {
+        let text = rasterizer();
+
+        assert_eq!(
+            text.fit_with_ellipsis("A\tB\0C", 21.0, f32::INFINITY),
+            "A B\u{fffd}C"
+        );
+    }
+
+    #[test]
+    fn fit_with_ellipsis_never_returns_more_than_the_display_glyph_limit() {
+        let text = rasterizer();
+        let fitted = text.fit_with_ellipsis(&"A".repeat(MAX_TEXT_GLYPHS + 20), 21.0, f32::INFINITY);
+
+        assert_eq!(fitted.chars().count(), MAX_TEXT_GLYPHS);
     }
 }
