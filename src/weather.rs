@@ -130,23 +130,20 @@ fn parse_response(body: &[u8], fetched_at: Duration) -> Result<EnvironmentReadin
         ))?;
     let humidity_percent = current
         .get("relative_humidity_2m")
-        .and_then(Value::as_u64)
-        .and_then(|value| u8::try_from(value).ok())
+        .and_then(checked_json_u8)
         .filter(|value| *value <= 100)
         .ok_or(WeatherError::Schema(
             "relative_humidity_2m must be an integer from 0 through 100",
         ))?;
     let weather_code = current
         .get("weather_code")
-        .and_then(Value::as_u64)
-        .and_then(|value| u8::try_from(value).ok())
+        .and_then(checked_json_u8)
         .ok_or(WeatherError::Schema(
             "weather_code must be an unsigned 8-bit integer",
         ))?;
     let utc_offset_seconds = root
         .get("utc_offset_seconds")
-        .and_then(Value::as_i64)
-        .and_then(|value| i32::try_from(value).ok())
+        .and_then(checked_json_i32)
         .filter(|value| (-86_400..=86_400).contains(value))
         .ok_or(WeatherError::Schema(
             "utc_offset_seconds must be an integer from -86400 through 86400",
@@ -159,6 +156,26 @@ fn parse_response(body: &[u8], fetched_at: Duration) -> Result<EnvironmentReadin
         utc_offset_seconds,
         fetched_at,
     })
+}
+
+fn checked_json_u8(value: &Value) -> Option<u8> {
+    let value = finite_whole_number(value)?;
+    (0.0..=f64::from(u8::MAX))
+        .contains(&value)
+        .then_some(value as u8)
+}
+
+fn checked_json_i32(value: &Value) -> Option<i32> {
+    let value = finite_whole_number(value)?;
+    (f64::from(i32::MIN)..=f64::from(i32::MAX))
+        .contains(&value)
+        .then_some(value as i32)
+}
+
+fn finite_whole_number(value: &Value) -> Option<f64> {
+    value
+        .as_f64()
+        .filter(|value| value.is_finite() && value.fract() == 0.0)
 }
 
 pub fn environment_is_stale(reading: Option<&EnvironmentReading>, monotonic_now: Duration) -> bool {
@@ -292,7 +309,7 @@ fn display_date_time(
         TimeZone::Zulu => Some(date_time),
         TimeZone::RadarLocal => {
             let offset = time::UtcOffset::from_whole_seconds(reading?.utc_offset_seconds).ok()?;
-            Some(date_time.to_offset(offset))
+            date_time.checked_to_offset(offset)
         }
     }
 }

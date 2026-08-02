@@ -179,6 +179,14 @@ fn malformed_json_missing_fields_and_wrong_numeric_types_are_rejected() {
                 "weather_code": 2.5
             }
         })),
+        json_response(serde_json::json!({
+            "utc_offset_seconds": -14400.5,
+            "current": {
+                "temperature_2m": 22.2,
+                "relative_humidity_2m": 54,
+                "weather_code": 2
+            }
+        })),
     ];
 
     for response in cases {
@@ -276,6 +284,25 @@ fn offset_boundary_values_and_integer_weather_fields_are_accepted() {
         assert_eq!(reading.humidity_percent, 100);
         assert_eq!(reading.weather_code, 255);
     }
+}
+
+#[test]
+fn integral_float_weather_fields_are_accepted() {
+    let (client, _) = client(json_response(serde_json::json!({
+        "utc_offset_seconds": -14400.0,
+        "current": {
+            "temperature_2m": 22.2,
+            "relative_humidity_2m": 54.0,
+            "weather_code": 2.0
+        }
+    })));
+
+    assert_eq!(
+        client
+            .fetch(&location(), Duration::from_secs(123))
+            .expect("integral float fields"),
+        reading(22.2, 54, 2, -14_400, Duration::from_secs(123))
+    );
 }
 
 #[test]
@@ -567,6 +594,27 @@ fn radar_local_offsets_roll_the_date_forward_and_backward() {
         vec![
             item("23:30", FooterTone::Time),
             item("01 AUG", FooterTone::Date),
+        ]
+    );
+}
+
+#[test]
+fn out_of_range_local_offset_at_maximum_timestamp_uses_placeholders() {
+    let settings = FooterSettings {
+        show_time: true,
+        show_date: true,
+        time_zone: TimeZone::RadarLocal,
+        ..FooterSettings::default()
+    };
+    let reading = reading(0.0, 0, 0, 3_600, Duration::ZERO);
+    let maximum_timestamp = u64::try_from(PrimitiveDateTime::MAX.assume_utc().unix_timestamp())
+        .expect("maximum timestamp is positive");
+
+    assert_eq!(
+        footer_content(&settings, Some(&reading), Duration::ZERO, maximum_timestamp,).temporal,
+        vec![
+            item("--:--", FooterTone::Time),
+            item("-- ---", FooterTone::Date),
         ]
     );
 }
