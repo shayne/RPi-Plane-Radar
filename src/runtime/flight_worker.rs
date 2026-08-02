@@ -149,15 +149,15 @@ impl<D: FlightDataService, K: Clock, W: Waiter> FlightDataWorker<D, K, W> {
                 aircraft: normalized_aircraft_key(&aircraft),
                 needs: pending,
             };
-            if let Some(backoff) = failure_backoff.as_ref() {
-                if backoff.identity == lookup_identity {
-                    let remaining = backoff.deadline.saturating_sub(self.clock.monotonic());
-                    if !remaining.is_zero() {
-                        if !wait_for_command(&self.waiter, &commands, &stop, remaining) {
-                            return;
-                        }
-                        continue;
+            if let Some(backoff) = failure_backoff.as_ref()
+                && backoff.identity == lookup_identity
+            {
+                let remaining = backoff.deadline.saturating_sub(self.clock.monotonic());
+                if !remaining.is_zero() {
+                    if !wait_for_command(&self.waiter, &commands, &stop, remaining) {
+                        return;
                     }
+                    continue;
                 }
             }
 

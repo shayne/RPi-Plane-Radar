@@ -490,21 +490,14 @@ fn endpoint_selection_normalizes_identifiers_and_sends_only_required_data() {
 
 #[test]
 fn oversized_noisy_identifiers_are_bounded_before_url_construction() {
-    let (mut client, http, _) =
-        client([ok(include_bytes!("fixtures/adsbdb/combined.json"))]);
+    let (mut client, http, _) = client([ok(include_bytes!("fixtures/adsbdb/combined.json"))]);
 
     client
-        .lookup(
-            &aircraft("ab-c123def456☃", "aa-l 12345✈xyz"),
-            both(),
-        )
+        .lookup(&aircraft("ab-c123def456☃", "aa-l 12345✈xyz"), both())
         .expect("bounded combined lookup");
 
     let request = &http.requests()[0].1;
-    assert_eq!(
-        request.url,
-        "https://api.adsbdb.test/v0/aircraft/ABC123"
-    );
+    assert_eq!(request.url, "https://api.adsbdb.test/v0/aircraft/ABC123");
     assert_eq!(
         request.query,
         vec![("callsign".to_owned(), "AAL12345".to_owned())]

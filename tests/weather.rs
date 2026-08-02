@@ -521,13 +521,7 @@ fn temperature_half_ties_round_to_even_in_celsius_and_fahrenheit() {
         assert_eq!(
             footer_content(
                 &settings,
-                Some(&reading(
-                    temperature_celsius,
-                    54,
-                    0,
-                    0,
-                    Duration::ZERO,
-                )),
+                Some(&reading(temperature_celsius, 54, 0, 0, Duration::ZERO,)),
                 Duration::ZERO,
                 0,
             )
