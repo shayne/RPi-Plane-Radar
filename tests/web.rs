@@ -1368,6 +1368,30 @@ fn optional_settings_presence_sentinels_save_every_unchecked_switch_as_false() {
 }
 
 #[test]
+fn optional_settings_runway_sentinel_accepts_legacy_explicit_false() {
+    let initial = optional_settings_enabled();
+    let server = TestServer::new(initial, Vec::new());
+    let session = server.session();
+
+    let response = server.post_form(
+        "/settings",
+        &[
+            ("latitude", "51.5072"),
+            ("longitude", "-0.1276"),
+            ("show_runways_present", "true"),
+            ("show_runways", "false"),
+        ],
+        &session,
+        Some(&server.current_ip_origin()),
+        None,
+    );
+
+    assert_eq!(response.status, 303);
+    assert!(!server.settings.current().show_runways);
+    assert_eq!(server.settings.replacement_count(), 1);
+}
+
+#[test]
 fn optional_settings_invalid_duplicate_and_unknown_values_are_atomic() {
     let cases: &[(&str, &[(&str, &str)], Option<&str>)] = &[
         (

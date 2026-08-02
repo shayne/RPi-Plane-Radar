@@ -708,14 +708,20 @@ fn candidate_from_form(current: &RadarSettings, form: &Form) -> Result<RadarSett
     {
         candidate.range_index = range_index.parse().map_err(|_| FormError::generic(None))?;
     }
-    candidate.show_runways = if form
-        .fields
-        .iter()
-        .any(|(name, _)| name == "show_runways_present")
+    candidate.show_runways = match form
+        .single("show_runways_present")
+        .map_err(|()| FormError::generic(None))?
     {
-        checkbox(form, "show_runways", candidate.show_runways)?
-    } else {
-        match form
+        Some("true") => match form
+            .single("show_runways")
+            .map_err(|()| FormError::generic(None))?
+        {
+            Some("true" | "on") => true,
+            None | Some("false") => false,
+            Some(_) => return Err(FormError::generic(None)),
+        },
+        Some(_) => return Err(FormError::generic(None)),
+        None => match form
             .single("show_runways")
             .map_err(|()| FormError::generic(None))?
         {
@@ -723,7 +729,7 @@ fn candidate_from_form(current: &RadarSettings, form: &Form) -> Result<RadarSett
             Some("false") => false,
             None => candidate.show_runways,
             Some(_) => return Err(FormError::generic(None)),
-        }
+        },
     };
     candidate.show_callsign = checkbox(form, "show_callsign", candidate.show_callsign)
         .map_err(|error| error.in_section(SettingsSection::Aircraft))?;
