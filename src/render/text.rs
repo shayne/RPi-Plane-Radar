@@ -45,7 +45,15 @@ impl<'a> TextRasterizer<'a> {
     }
 
     pub fn fit_with_ellipsis(&self, text: &str, cap_height: f32, max_width: f32) -> String {
-        let sanitized = display_characters(text).collect::<String>();
+        let exceeds_glyph_cap = text.chars().nth(MAX_TEXT_GLYPHS).is_some();
+        let mut sanitized = display_characters(text).collect::<String>();
+        if exceeds_glyph_cap {
+            sanitized = sanitized
+                .chars()
+                .take(MAX_TEXT_GLYPHS.saturating_sub(1))
+                .chain(std::iter::once('…'))
+                .collect();
+        }
         if sanitized.is_empty()
             || !cap_height.is_finite()
             || cap_height <= 0.0
@@ -285,10 +293,22 @@ mod tests {
     }
 
     #[test]
-    fn fit_with_ellipsis_never_returns_more_than_the_display_glyph_limit() {
+    fn fit_with_ellipsis_marks_glyph_cap_overflow_with_terminal_ellipsis() {
         let text = rasterizer();
-        let fitted = text.fit_with_ellipsis(&"A".repeat(MAX_TEXT_GLYPHS + 20), 21.0, f32::INFINITY);
+        let input = format!("{}\0{}", "A".repeat(MAX_TEXT_GLYPHS - 2), "B".repeat(20));
 
-        assert_eq!(fitted.chars().count(), MAX_TEXT_GLYPHS);
+        let fitted = text.fit_with_ellipsis(&input, 21.0, f32::INFINITY);
+        let fitted = fitted.chars().collect::<Vec<_>>();
+
+        assert_eq!(fitted.len(), MAX_TEXT_GLYPHS);
+        assert_eq!(fitted[MAX_TEXT_GLYPHS - 2], '\u{fffd}');
+        assert_eq!(fitted[MAX_TEXT_GLYPHS - 1], '…');
+        assert_eq!(
+            fitted[..MAX_TEXT_GLYPHS - 1]
+                .iter()
+                .filter(|&&character| character == 'A')
+                .count(),
+            MAX_TEXT_GLYPHS - 2
+        );
     }
 }
