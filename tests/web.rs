@@ -1393,7 +1393,9 @@ fn optional_settings_runway_sentinel_accepts_legacy_explicit_false() {
 
 #[test]
 fn optional_settings_invalid_duplicate_and_unknown_values_are_atomic() {
-    let cases: &[(&str, &[(&str, &str)], Option<&str>)] = &[
+    type InvalidOptionalSettingCase<'a> = (&'a str, &'a [(&'a str, &'a str)], Option<&'a str>);
+
+    let cases: &[InvalidOptionalSettingCase<'_>] = &[
         (
             "duplicate checkbox",
             &[
