@@ -187,6 +187,15 @@ pub struct RadarSnapshot {
     pub last_error_at: Option<Duration>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct EnvironmentReading {
+    pub temperature_celsius: f64,
+    pub humidity_percent: u8,
+    pub weather_code: u8,
+    pub utc_offset_seconds: i32,
+    pub fetched_at: Duration,
+}
+
 #[derive(Clone, Debug)]
 pub struct RuntimeSnapshot {
     pub settings: RadarSettings,

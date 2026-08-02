@@ -31,6 +31,7 @@ signal-hook = "0.3"
 subtle = "2.6"
 tempfile = "3.20"
 thiserror = "2.0"
+time = { version = "0.3", features = ["formatting"] }
 tiny_http = "0.12"
 tiny-skia = "0.11"
 ureq = { version = "3.1", features = ["json"] }

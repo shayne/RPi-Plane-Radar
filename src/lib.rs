@@ -20,4 +20,5 @@ pub mod runtime;
 pub mod settings;
 pub mod time;
 pub mod touch;
+pub mod weather;
 pub mod web;

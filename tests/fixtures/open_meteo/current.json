@@ -1,0 +1,9 @@
+{
+  "utc_offset_seconds": -14400,
+  "current": {
+    "time": "2026-08-02T10:15",
+    "temperature_2m": 22.2,
+    "relative_humidity_2m": 54,
+    "weather_code": 2
+  }
+}
