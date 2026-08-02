@@ -84,10 +84,12 @@ both means those values may share one request. Weather and radar-local time
 send the configured coordinates to Open-Meteo. Zulu-only time and date send
 nothing to Open-Meteo.
 
-The location is stored only on the Pi. Plane Radar does not request browser
-geolocation, and it does not configure the network. A short tap advances the
-saved range. A three-second hold opens the QR screen; tapping that screen
-returns to the radar.
+The saved location is persisted locally on the Pi. When an enabled feature
+requires Open-Meteo, Plane Radar also transmits the configured coordinates as
+described above. Plane Radar does not control Open-Meteo's retention or
+handling of transmitted data. Plane Radar does not request browser geolocation,
+and it does not configure the network. A short tap advances the saved range. A
+three-second hold opens the QR screen; tapping that screen returns to the radar.
 
 ## Operate it from the Mac
 
