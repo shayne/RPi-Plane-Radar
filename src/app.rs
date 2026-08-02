@@ -27,6 +27,7 @@ pub trait AppRuntime: Send {
     fn snapshot(&self) -> RuntimeSnapshot;
     fn cycle_range(&self) -> Result<RadarSettings, RuntimeError>;
     fn monotonic(&self) -> Duration;
+    fn unix_seconds(&self) -> u64;
     fn stop_requested(&self) -> bool;
     fn shutdown(self: Box<Self>) -> Result<(), RuntimeError>;
 }
@@ -42,6 +43,10 @@ impl AppRuntime for RuntimeHandle {
 
     fn monotonic(&self) -> Duration {
         RuntimeHandle::monotonic(self)
+    }
+
+    fn unix_seconds(&self) -> u64 {
+        RuntimeHandle::unix_seconds(self)
     }
 
     fn stop_requested(&self) -> bool {

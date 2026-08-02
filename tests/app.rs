@@ -29,6 +29,7 @@ struct FakeControl {
     model: RuntimeModel,
     store: Arc<SettingsStore>,
     now_ms: Arc<AtomicU64>,
+    unix_seconds: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
     shutdown: Arc<AtomicBool>,
 }
@@ -52,6 +53,10 @@ impl AppRuntime for FakeRuntime {
 
     fn monotonic(&self) -> Duration {
         Duration::from_millis(self.control.now_ms.load(Ordering::Acquire))
+    }
+
+    fn unix_seconds(&self) -> u64 {
+        self.control.unix_seconds.load(Ordering::Acquire)
     }
 
     fn stop_requested(&self) -> bool {
@@ -122,6 +127,7 @@ fn app_fixture(
         model,
         store,
         now_ms: Arc::new(AtomicU64::new(0)),
+        unix_seconds: Arc::new(AtomicU64::new(1_775_000_000)),
         stop: Arc::new(AtomicBool::new(false)),
         shutdown: Arc::new(AtomicBool::new(false)),
     };

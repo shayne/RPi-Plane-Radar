@@ -59,13 +59,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     planeradar::network::local_url(hostname.trim())?
                 }
             };
-            let handle = RuntimeCoordinator::start(RuntimeConfig {
-                settings_path: settings,
-                geocode_cache_path: geocode_cache,
-                http_address: http,
-                local_url,
-                nominatim_url,
-            })?;
+            let mut runtime_config = RuntimeConfig::default();
+            (
+                runtime_config.settings_path,
+                runtime_config.geocode_cache_path,
+                runtime_config.http_address,
+                runtime_config.local_url,
+                runtime_config.nominatim_url,
+            ) = (settings, geocode_cache, http, local_url, nominatim_url);
+            let handle = RuntimeCoordinator::start(runtime_config)?;
             if headless {
                 while !handle.stop_requested() {
                     thread::sleep(Duration::from_millis(50));

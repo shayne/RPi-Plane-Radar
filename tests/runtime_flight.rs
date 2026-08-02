@@ -5,13 +5,16 @@ use std::sync::{Arc, Barrier, Mutex, Once};
 use std::time::Duration;
 
 use log::{Log, Metadata, Record};
+use planeradar::adsb::AdsbClient;
 use planeradar::flight_data::{
     EnrichmentNeeds, FlightDataClient, FlightDataError, FlightDataService, FlightLookup,
     LookupValue,
 };
 use planeradar::http::{HttpClient, HttpError, HttpRequest, HttpResponse};
 use planeradar::model::{Aircraft, Location, RadarSettings};
-use planeradar::runtime::{FlightDataWorker, RuntimeModel, WaitResult, Waiter, WorkerCommand};
+use planeradar::runtime::{
+    AdsbWorker, ChannelWaiter, FlightDataWorker, RuntimeModel, WaitResult, Waiter, WorkerCommand,
+};
 use planeradar::time::{Clock, Sleeper};
 
 type RecordedRequests = Arc<Mutex<Vec<(Duration, HttpRequest)>>>;
@@ -794,4 +797,91 @@ fn cached_result_republishes_for_a_returning_aircraft_without_a_network_request(
             Duration::from_secs(3),
         ]
     );
+}
+
+struct BlockingFlightService {
+    entered: std::sync::mpsc::SyncSender<()>,
+    release: Receiver<()>,
+}
+
+impl FlightDataService for BlockingFlightService {
+    fn lookup(
+        &mut self,
+        _aircraft: &Aircraft,
+        _needs: EnrichmentNeeds,
+    ) -> Result<FlightLookup, FlightDataError> {
+        self.entered.send(()).expect("flight entered");
+        self.release.recv().expect("release flight");
+        found_model("737-800")
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ImmediateAdsbHttp;
+
+impl HttpClient for ImmediateAdsbHttp {
+    fn execute(&self, _request: HttpRequest) -> Result<HttpResponse, HttpError> {
+        Ok(HttpResponse {
+            status: 200,
+            body: br#"{"ac":[]}"#.to_vec(),
+        })
+    }
+}
+
+#[test]
+fn blocked_flight_call_does_not_hold_the_model_lock_or_delay_adsb_publication() {
+    let model = RuntimeModel::new(configured(false, true), "http://local".to_owned());
+    model.record_aircraft(
+        vec![aircraft("abc123", "aal1", 40.01, -74.0)],
+        Duration::ZERO,
+    );
+    let stop = Arc::new(AtomicBool::new(false));
+    let (flight_entered_sender, flight_entered_receiver) = std::sync::mpsc::sync_channel(0);
+    let (flight_release_sender, flight_release_receiver) = std::sync::mpsc::channel();
+    let (flight_commands, flight_receiver) = std::sync::mpsc::channel();
+    let flight_model = model.clone();
+    let flight_stop = stop.clone();
+    let flight = std::thread::spawn(move || {
+        FlightDataWorker::new(
+            BlockingFlightService {
+                entered: flight_entered_sender,
+                release: flight_release_receiver,
+            },
+            flight_model,
+            FakeClock::default(),
+            ChannelWaiter,
+        )
+        .run(flight_receiver, flight_stop);
+    });
+    flight_entered_receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("flight call blocks");
+
+    let (adsb_commands, adsb_receiver) = std::sync::mpsc::channel();
+    let adsb_model = model.clone();
+    let adsb_stop = stop.clone();
+    let adsb = std::thread::spawn(move || {
+        AdsbWorker::new(
+            AdsbClient::new(ImmediateAdsbHttp),
+            adsb_model,
+            FakeClock::default(),
+            ChannelWaiter,
+        )
+        .run(adsb_receiver, adsb_stop);
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(1);
+    while !model.snapshot().aircraft.is_empty() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "ADS-B publication was blocked"
+        );
+        std::thread::yield_now();
+    }
+
+    assert!(model.snapshot().enrichment.is_empty());
+    adsb_commands.send(WorkerCommand::Stop).expect("stop ADS-B");
+    flight_release_sender.send(()).expect("release flight");
+    let _ = flight_commands.send(WorkerCommand::Stop);
+    adsb.join().expect("ADS-B joins");
+    flight.join().expect("flight joins");
 }

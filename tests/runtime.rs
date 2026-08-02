@@ -362,6 +362,8 @@ fn runtime_defaults_are_the_documented_production_values() {
         config.nominatim_url,
         "https://nominatim.openstreetmap.org/search"
     );
+    assert_eq!(config.flight_data_url, "https://api.adsbdb.com/v0");
+    assert_eq!(config.weather_url, "https://api.open-meteo.com/v1/forecast");
 }
 
 #[test]
@@ -380,7 +382,7 @@ fn settings_replace_is_persisted_then_published_and_failed_save_is_not_published
         "http://planeradar.local".to_owned(),
     );
     let (sender, _receiver) = mpsc::channel();
-    let service = RuntimeSettingsService::new(model.clone(), store.clone(), sender);
+    let service = RuntimeSettingsService::new(model.clone(), store.clone(), vec![sender]);
     let generation = model.snapshot().generation;
     service.replace(configured()).expect("replace");
     assert_eq!(model.snapshot().settings, configured());
@@ -391,11 +393,39 @@ fn settings_replace_is_persisted_then_published_and_failed_save_is_not_published
     std::fs::write(&blocked_parent, b"blocked").expect("create blocker");
     let failed_store = Arc::new(SettingsStore::new(blocked_parent.join("settings.json")));
     let (sender, _receiver) = mpsc::channel();
-    let failed = RuntimeSettingsService::new(model.clone(), failed_store, sender);
+    let failed = RuntimeSettingsService::new(model.clone(), failed_store, vec![sender]);
     let before = model.snapshot();
     assert!(failed.replace(RadarSettings::default()).is_err());
     assert_eq!(model.snapshot().generation, before.generation);
     assert_eq!(model.snapshot().settings, before.settings);
+}
+
+#[test]
+fn settings_replacement_is_broadcast_to_three_independent_workers() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let store = Arc::new(SettingsStore::new(directory.path().join("settings.json")));
+    let model = RuntimeModel::new(
+        RadarSettings::default(),
+        "http://planeradar.local".to_owned(),
+    );
+    let (adsb_sender, adsb_receiver) = mpsc::channel();
+    let (flight_sender, flight_receiver) = mpsc::channel();
+    let (weather_sender, weather_receiver) = mpsc::channel();
+    let service = RuntimeSettingsService::new(
+        model,
+        store,
+        vec![adsb_sender, flight_sender, weather_sender],
+    );
+
+    service.replace(configured()).expect("replace settings");
+
+    for receiver in [adsb_receiver, flight_receiver, weather_receiver] {
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(WorkerCommand::SettingsChanged(settings)) if settings == configured()
+        ));
+        assert!(receiver.try_recv().is_err());
+    }
 }
 
 #[test]

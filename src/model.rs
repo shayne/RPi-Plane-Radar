@@ -347,6 +347,22 @@ impl RuntimeModel {
         Some(bump(&mut snapshot))
     }
 
+    pub fn record_environment_if_current(
+        &self,
+        expected_location: &Location,
+        reading: EnvironmentReading,
+    ) -> Option<u64> {
+        let mut snapshot = self.snapshot.write().expect("runtime model lock");
+        if snapshot.settings.location.as_ref() != Some(expected_location)
+            || !snapshot.settings.footer.needs_environment()
+        {
+            return None;
+        }
+        snapshot.environment = Some(reading);
+        snapshot.environment_last_error_at = None;
+        Some(bump(&mut snapshot))
+    }
+
     pub fn record_environment_error_if_location(
         &self,
         expected_location: &Location,
@@ -354,6 +370,21 @@ impl RuntimeModel {
     ) -> Option<u64> {
         let mut snapshot = self.snapshot.write().expect("runtime model lock");
         if snapshot.settings.location.as_ref() != Some(expected_location) {
+            return None;
+        }
+        snapshot.environment_last_error_at = Some(at);
+        Some(bump(&mut snapshot))
+    }
+
+    pub fn record_environment_error_if_current(
+        &self,
+        expected_location: &Location,
+        at: Duration,
+    ) -> Option<u64> {
+        let mut snapshot = self.snapshot.write().expect("runtime model lock");
+        if snapshot.settings.location.as_ref() != Some(expected_location)
+            || !snapshot.settings.footer.needs_environment()
+        {
             return None;
         }
         snapshot.environment_last_error_at = Some(at);

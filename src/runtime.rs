@@ -1,5 +1,7 @@
 mod flight_worker;
+mod weather_worker;
 pub use flight_worker::FlightDataWorker;
+pub use weather_worker::WeatherWorker;
 
 use std::collections::HashSet;
 use std::fs;
@@ -16,6 +18,7 @@ use thiserror::Error;
 use url::Url;
 
 use crate::adsb::{AdsbClient, AltitudeFilter};
+use crate::flight_data::FlightDataClient;
 use crate::geocode::{GeocodeService, Geocoder};
 use crate::http::{HttpClient, UreqHttpClient};
 use crate::model::{AppState, RadarSettings};
@@ -23,6 +26,7 @@ use crate::network::{current_interfaces, discover_ip_url};
 use crate::range::{next_range_index, range_preset};
 use crate::settings::SettingsStore;
 use crate::time::{Clock, SystemClock, ThreadSleeper};
+use crate::weather::WeatherClient;
 use crate::web::{HealthSnapshot, HealthSource, SettingsServer, SettingsService, WebError};
 
 const SUCCESS_INTERVAL: Duration = Duration::from_secs(3);
@@ -39,6 +43,8 @@ pub struct RuntimeConfig {
     pub http_address: SocketAddr,
     pub local_url: String,
     pub nominatim_url: String,
+    pub flight_data_url: String,
+    pub weather_url: String,
 }
 
 impl Default for RuntimeConfig {
@@ -49,6 +55,8 @@ impl Default for RuntimeConfig {
             http_address: "0.0.0.0:80".parse().expect("valid default HTTP address"),
             local_url: "http://planeradar.local".to_owned(),
             nominatim_url: "https://nominatim.openstreetmap.org/search".to_owned(),
+            flight_data_url: "https://api.adsbdb.com/v0".to_owned(),
+            weather_url: "https://api.open-meteo.com/v1/forecast".to_owned(),
         }
     }
 }
@@ -261,13 +269,18 @@ trait SettingsNotifier: Send + Sync + 'static {
     fn settings_changed(&self, settings: RadarSettings) -> Result<(), ()>;
 }
 
-struct ChannelSettingsNotifier(Sender<WorkerCommand>);
+struct ChannelSettingsNotifier {
+    senders: Vec<Sender<WorkerCommand>>,
+}
 
 impl SettingsNotifier for ChannelSettingsNotifier {
     fn settings_changed(&self, settings: RadarSettings) -> Result<(), ()> {
-        self.0
-            .send(WorkerCommand::SettingsChanged(settings))
-            .map_err(|_| ())
+        for sender in &self.senders {
+            sender
+                .send(WorkerCommand::SettingsChanged(settings.clone()))
+                .map_err(|_| ())?;
+        }
+        Ok(())
     }
 }
 
@@ -282,12 +295,12 @@ impl RuntimeSettingsService {
     pub fn new(
         model: RuntimeModel,
         store: Arc<SettingsStore>,
-        commands: Sender<WorkerCommand>,
+        commands: Vec<Sender<WorkerCommand>>,
     ) -> Self {
         Self {
             model,
             store,
-            notifier: Arc::new(ChannelSettingsNotifier(commands)),
+            notifier: Arc::new(ChannelSettingsNotifier { senders: commands }),
             update: Mutex::new(()),
         }
     }
@@ -395,12 +408,14 @@ pub enum RuntimeError {
 
 pub struct RuntimeHandle {
     pub model: RuntimeModel,
-    pub commands: Sender<WorkerCommand>,
     pub stop: Arc<AtomicBool>,
     settings: Arc<RuntimeSettingsService>,
     clock: SharedClock,
+    commands: Vec<Sender<WorkerCommand>>,
     web_worker: Option<JoinHandle<Result<(), WebError>>>,
     adsb_worker: Option<JoinHandle<()>>,
+    flight_worker: Option<JoinHandle<()>>,
+    weather_worker: Option<JoinHandle<()>>,
 }
 
 impl RuntimeHandle {
@@ -412,15 +427,27 @@ impl RuntimeHandle {
         self.clock.monotonic()
     }
 
+    pub fn unix_seconds(&self) -> u64 {
+        self.clock.unix_seconds()
+    }
+
     pub fn stop_requested(&self) -> bool {
         self.stop.load(Ordering::Acquire)
     }
 
     pub fn shutdown(mut self) -> Result<(), RuntimeError> {
         self.stop.store(true, Ordering::Release);
-        let _ = self.commands.send(WorkerCommand::Stop);
+        for commands in &self.commands {
+            let _ = commands.send(WorkerCommand::Stop);
+        }
         let mut failed = false;
         if let Some(worker) = self.adsb_worker.take() {
+            failed |= worker.join().is_err();
+        }
+        if let Some(worker) = self.flight_worker.take() {
+            failed |= worker.join().is_err();
+        }
+        if let Some(worker) = self.weather_worker.take() {
             failed |= worker.join().is_err();
         }
         if let Some(worker) = self.web_worker.take() {
@@ -457,7 +484,14 @@ impl RuntimeCoordinator {
         let ip_url = discover_ip_url(&route_table, current_interfaces()?.into_iter());
         model.set_urls(config.local_url.clone(), ip_url);
 
-        let (commands, receiver) = mpsc::channel();
+        let (adsb_commands, adsb_receiver) = mpsc::channel();
+        let (flight_commands, flight_receiver) = mpsc::channel();
+        let (weather_commands, weather_receiver) = mpsc::channel();
+        let commands = vec![
+            adsb_commands.clone(),
+            flight_commands.clone(),
+            weather_commands.clone(),
+        ];
         let stop = Arc::new(AtomicBool::new(false));
         signal_hook::flag::register(SIGINT, stop.clone()).map_err(|_| RuntimeError::WorkerPanic)?;
         signal_hook::flag::register(SIGTERM, stop.clone())
@@ -504,16 +538,49 @@ impl RuntimeCoordinator {
                 adsb_clock,
                 ChannelWaiter,
             )
-            .run(receiver, adsb_stop);
+            .run(adsb_receiver, adsb_stop);
+        });
+        let flight_model = model.clone();
+        let flight_stop = stop.clone();
+        let flight_clock = clock.clone();
+        let flight_data_url = config.flight_data_url;
+        let flight_worker = thread::spawn(move || {
+            FlightDataWorker::new(
+                FlightDataClient::with_provider_base(
+                    UreqHttpClient,
+                    flight_clock.clone(),
+                    ThreadSleeper,
+                    flight_data_url,
+                ),
+                flight_model,
+                flight_clock,
+                ChannelWaiter,
+            )
+            .run(flight_receiver, flight_stop);
+        });
+        let weather_model = model.clone();
+        let weather_stop = stop.clone();
+        let weather_clock = clock.clone();
+        let weather_url = config.weather_url;
+        let weather_worker = thread::spawn(move || {
+            WeatherWorker::new(
+                WeatherClient::with_provider_base(UreqHttpClient, weather_url),
+                weather_model,
+                weather_clock,
+                ChannelWaiter,
+            )
+            .run(weather_receiver, weather_stop);
         });
         Ok(RuntimeHandle {
             model,
-            commands,
             stop,
             settings,
             clock,
+            commands,
             web_worker: Some(web_worker),
             adsb_worker: Some(adsb_worker),
+            flight_worker: Some(flight_worker),
+            weather_worker: Some(weather_worker),
         })
     }
 }
@@ -729,5 +796,94 @@ mod tests {
             .expect("transform");
         assert_eq!(transformed.range_index, 2);
         assert_eq!(model.snapshot().settings, transformed);
+    }
+
+    #[test]
+    fn shutdown_stops_and_joins_all_three_independent_workers() {
+        let model = RuntimeModel::new(
+            RadarSettings::default(),
+            "http://planeradar.local".to_owned(),
+        );
+        let writer = Arc::new(RecordingWriter::default());
+        let notifier = Arc::new(RecordingNotifier::default());
+        let settings = Arc::new(RuntimeSettingsService::with_components(
+            model.clone(),
+            writer,
+            notifier,
+        ));
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut commands = Vec::new();
+        let joined = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut workers = Vec::new();
+        for _ in 0..3 {
+            let (sender, receiver) = mpsc::channel();
+            commands.push(sender);
+            let joined = joined.clone();
+            workers.push(thread::spawn(move || {
+                assert!(matches!(receiver.recv(), Ok(WorkerCommand::Stop)));
+                joined.fetch_add(1, Ordering::AcqRel);
+            }));
+        }
+        let weather_worker = workers.pop();
+        let flight_worker = workers.pop();
+        let adsb_worker = workers.pop();
+        let handle = RuntimeHandle {
+            model,
+            stop: stop.clone(),
+            settings,
+            clock: SharedClock(Arc::new(SystemClock::new())),
+            commands,
+            web_worker: Some(thread::spawn(|| Ok(()))),
+            adsb_worker,
+            flight_worker,
+            weather_worker,
+        };
+
+        handle.shutdown().expect("shutdown");
+
+        assert!(stop.load(Ordering::Acquire));
+        assert_eq!(joined.load(Ordering::Acquire), 3);
+    }
+
+    #[test]
+    fn shutdown_preserves_worker_panic_error_after_joining_other_workers() {
+        let model = RuntimeModel::new(
+            RadarSettings::default(),
+            "http://planeradar.local".to_owned(),
+        );
+        let settings = Arc::new(RuntimeSettingsService::with_components(
+            model.clone(),
+            Arc::new(RecordingWriter::default()),
+            Arc::new(RecordingNotifier::default()),
+        ));
+        let stop = Arc::new(AtomicBool::new(false));
+        let joined = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut commands = Vec::new();
+        let mut workers = Vec::new();
+        for _ in 0..2 {
+            let (sender, receiver) = mpsc::channel();
+            commands.push(sender);
+            let joined = joined.clone();
+            workers.push(thread::spawn(move || {
+                assert!(matches!(receiver.recv(), Ok(WorkerCommand::Stop)));
+                joined.fetch_add(1, Ordering::AcqRel);
+            }));
+        }
+        let (panic_sender, _panic_receiver) = mpsc::channel();
+        commands.push(panic_sender);
+        let handle = RuntimeHandle {
+            model,
+            stop,
+            settings,
+            clock: SharedClock(Arc::new(SystemClock::new())),
+            commands,
+            web_worker: Some(thread::spawn(|| Ok(()))),
+            adsb_worker: Some(thread::spawn(|| panic!("test worker panic"))),
+            flight_worker: workers.pop(),
+            weather_worker: workers.pop(),
+        };
+
+        assert!(matches!(handle.shutdown(), Err(RuntimeError::WorkerPanic)));
+        assert_eq!(joined.load(Ordering::Acquire), 2);
     }
 }
