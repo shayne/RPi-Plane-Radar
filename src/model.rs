@@ -332,6 +332,7 @@ impl RuntimeModel {
             return None;
         }
         snapshot.environment = Some(reading);
+        snapshot.environment_last_error_at = None;
         Some(bump(&mut snapshot))
     }
 

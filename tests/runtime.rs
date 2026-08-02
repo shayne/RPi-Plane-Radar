@@ -258,6 +258,32 @@ fn environment_publications_require_the_current_requested_location() {
 }
 
 #[test]
+fn successful_environment_publication_clears_the_last_weather_error_once() {
+    let settings = configured();
+    let location = settings.location.clone().expect("location");
+    let model = RuntimeModel::new(settings, "http://planeradar.local".to_owned());
+    assert_eq!(
+        model.record_environment_error_if_location(&location, Duration::from_secs(20)),
+        Some(1)
+    );
+    let errored = model.snapshot();
+    assert_eq!(
+        errored.environment_last_error_at,
+        Some(Duration::from_secs(20))
+    );
+
+    let reading = environment(Duration::from_secs(21));
+    assert_eq!(
+        model.record_environment_if_location(&location, reading.clone()),
+        Some(errored.generation + 1)
+    );
+    let recovered = model.snapshot();
+    assert_eq!(recovered.environment, Some(reading));
+    assert_eq!(recovered.environment_last_error_at, None);
+    assert_eq!(recovered.generation, errored.generation + 1);
+}
+
+#[test]
 fn location_change_clears_environment_and_its_error_timestamp() {
     let settings = configured();
     let old_location = settings.location.clone().expect("location");
