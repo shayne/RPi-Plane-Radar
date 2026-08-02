@@ -81,9 +81,11 @@ impl<C: HttpClient, K: Clock, W: Waiter> WeatherWorker<C, K, W> {
             {
                 return;
             }
+            let completed_at = self.clock.monotonic();
 
             let interval = match result {
-                Ok(reading) => {
+                Ok(mut reading) => {
+                    reading.fetched_at = completed_at;
                     if self
                         .model
                         .record_environment_if_current(&location, reading)
@@ -97,7 +99,7 @@ impl<C: HttpClient, K: Clock, W: Waiter> WeatherWorker<C, K, W> {
                 Err(error) => {
                     if self
                         .model
-                        .record_environment_error_if_current(&location, self.clock.monotonic())
+                        .record_environment_error_if_current(&location, completed_at)
                         .is_none()
                     {
                         continue;
@@ -107,7 +109,7 @@ impl<C: HttpClient, K: Clock, W: Waiter> WeatherWorker<C, K, W> {
                     failure_interval(failures)
                 }
             };
-            deadline = Some(started_at.saturating_add(interval));
+            deadline = Some(completed_at.saturating_add(interval));
         }
     }
 }

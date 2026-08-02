@@ -306,6 +306,58 @@ fn first_fetch_is_immediate_and_successes_are_fifteen_minutes_apart() {
 }
 
 #[test]
+fn successful_request_completion_anchors_freshness_and_refresh_deadline() {
+    let clock = FakeClock::default();
+    let model = RuntimeModel::new(configured(weather_footer()), "http://local".to_owned());
+    let request_clock = clock.clone();
+    let (http, _) = FakeHttp::new(clock.clone(), [ok()]);
+    let http = http.with_action(move || request_clock.advance(Duration::from_secs(7)));
+    let (waiter, waits) = ScriptedWaiter::new(clock.clone(), [WaitOutcome::Stop]);
+
+    run(http, model.clone(), clock, waiter);
+
+    assert_eq!(
+        model
+            .snapshot()
+            .environment
+            .expect("environment")
+            .fetched_at,
+        Duration::from_secs(7)
+    );
+    assert_eq!(*waits.lock().expect("waits"), [SUCCESS_INTERVAL]);
+}
+
+#[test]
+fn failed_request_completion_anchors_retry_deadline() {
+    let clock = FakeClock::default();
+    let model = RuntimeModel::new(configured(weather_footer()), "http://local".to_owned());
+    let request_clock = clock.clone();
+    let (http, requests) = FakeHttp::new(
+        clock.clone(),
+        [Err(HttpError::Timeout), Err(HttpError::Timeout)],
+    );
+    let http = http.with_action(move || request_clock.advance(Duration::from_secs(7)));
+    let (waiter, waits) =
+        ScriptedWaiter::new(clock.clone(), [WaitOutcome::TimedOut, WaitOutcome::Stop]);
+
+    run(http, model, clock, waiter);
+
+    assert_eq!(
+        requests
+            .lock()
+            .expect("requests")
+            .iter()
+            .map(|(at, _)| *at)
+            .collect::<Vec<_>>(),
+        [Duration::ZERO, Duration::from_secs(37)]
+    );
+    assert_eq!(
+        *waits.lock().expect("waits"),
+        [Duration::from_secs(30), Duration::from_secs(60)]
+    );
+}
+
+#[test]
 fn irrelevant_settings_change_preserves_the_remaining_success_deadline() {
     let clock = FakeClock::default();
     let model = RuntimeModel::new(configured(weather_footer()), "http://local".to_owned());
