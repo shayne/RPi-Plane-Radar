@@ -614,6 +614,28 @@ fn optional_settings_page_exposes_semantic_progressive_disclosure_controls() {
 }
 
 #[test]
+fn footer_disclosure_summary_reports_zero_one_and_multiple_selections() {
+    let off = TestServer::new(RadarSettings::default(), Vec::new()).get("/");
+    assert!(off.body.contains("<summary>Footer — Off</summary>"));
+
+    let mut one = RadarSettings::default();
+    one.footer.show_time = true;
+    let one = TestServer::new(one, Vec::new()).get("/");
+    assert!(one.body.contains("<summary>Footer — Time</summary>"));
+
+    let mut multiple = RadarSettings::default();
+    multiple.footer.show_temperature = true;
+    multiple.footer.show_time = true;
+    multiple.footer.show_date = true;
+    let multiple = TestServer::new(multiple, Vec::new()).get("/");
+    assert!(
+        multiple
+            .body
+            .contains("<summary>Footer — Temperature, time, date</summary>")
+    );
+}
+
+#[test]
 fn range_choices_use_display_values_in_the_selected_units() {
     let kilometres = TestServer::new(RadarSettings::default(), Vec::new()).get("/");
     for label in ["5 km", "10 km", "15 km", "25 km"] {

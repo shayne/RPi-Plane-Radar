@@ -14,8 +14,8 @@ use url::Url;
 
 use crate::geocode::{GeocodeResult, GeocodeService};
 use crate::model::{
-    AppState, ClockFormat, Location, RadarSettings, SETTINGS_SCHEMA_VERSION, TemperatureUnit,
-    TimeZone, Units,
+    AppState, ClockFormat, FooterSettings, Location, RadarSettings, SETTINGS_SCHEMA_VERSION,
+    TemperatureUnit, TimeZone, Units,
 };
 use crate::range::{format_range_label, range_preset};
 use crate::settings::validate_settings;
@@ -1039,6 +1039,30 @@ fn render_range_options(settings: &RadarSettings) -> String {
         .collect()
 }
 
+fn footer_summary(footer: &FooterSettings) -> String {
+    let labels = [
+        (footer.show_condition, "Condition", "condition"),
+        (footer.show_temperature, "Temperature", "temperature"),
+        (footer.show_humidity, "Humidity", "humidity"),
+        (footer.show_time, "Time", "time"),
+        (footer.show_date, "Date", "date"),
+    ];
+    let mut selected = labels
+        .into_iter()
+        .filter(|(enabled, _, _)| *enabled)
+        .map(|(_, first, rest)| (first, rest));
+    let Some((first, _)) = selected.next() else {
+        return "Footer — Off".to_owned();
+    };
+
+    let mut summary = format!("Footer — {first}");
+    for (_, label) in selected {
+        summary.push_str(", ");
+        summary.push_str(label);
+    }
+    summary
+}
+
 fn render_page(
     settings: &RadarSettings,
     local_url: &str,
@@ -1087,6 +1111,7 @@ fn render_page(
     } else {
         ""
     };
+    let footer_summary = footer_summary(&settings.footer);
     let traffic_open =
         if settings.altitude_filter_active() || error_section == Some(SettingsSection::Traffic) {
             " open"
@@ -1790,7 +1815,7 @@ Radar text size
 </div>
 </details>
 <details class="option-group" data-section="footer"{footer_open}>
-<summary>Footer</summary>
+<summary>{footer_summary}</summary>
 <div class="option-content">
 <p class="disclosure-copy">Weather fields and radar-local time send the configured radar coordinates to Open-Meteo. When only Zulu time or date is enabled, no weather request is made.</p>
 <input type="hidden" name="footer_show_condition_present" value="true">
