@@ -289,13 +289,16 @@ fn weather_code_label(weather_code: u8) -> &'static str {
 }
 
 fn format_temperature(temperature_celsius: f64, unit: TemperatureUnit) -> String {
-    match unit {
-        TemperatureUnit::Celsius => format!("{temperature_celsius:.0}°C"),
+    let (temperature, suffix) = match unit {
+        TemperatureUnit::Celsius => (temperature_celsius, "°C"),
         TemperatureUnit::Fahrenheit => {
             let temperature_fahrenheit = temperature_celsius.mul_add(9.0 / 5.0, 32.0);
-            format!("{temperature_fahrenheit:.0}°F")
+            (temperature_fahrenheit, "°F")
         }
-    }
+    };
+    let rounded = temperature.round();
+    let rounded = if rounded == 0.0 { 0.0 } else { rounded };
+    format!("{rounded:.0}{suffix}")
 }
 
 fn display_date_time(

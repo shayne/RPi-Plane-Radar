@@ -504,6 +504,40 @@ fn temperature_units_round_to_zero_decimals_without_changing_source_data() {
 }
 
 #[test]
+fn temperature_rounding_normalizes_negative_zero_in_both_units() {
+    let celsius = FooterSettings {
+        show_temperature: true,
+        temperature_unit: TemperatureUnit::Celsius,
+        ..FooterSettings::default()
+    };
+    let fahrenheit = FooterSettings {
+        temperature_unit: TemperatureUnit::Fahrenheit,
+        ..celsius.clone()
+    };
+
+    assert_eq!(
+        footer_content(
+            &celsius,
+            Some(&reading(-0.4, 54, 0, 0, Duration::ZERO)),
+            Duration::ZERO,
+            0,
+        )
+        .environment,
+        vec![item("0°C", FooterTone::Temperature)]
+    );
+    assert_eq!(
+        footer_content(
+            &fahrenheit,
+            Some(&reading(-17.8, 54, 0, 0, Duration::ZERO)),
+            Duration::ZERO,
+            0,
+        )
+        .environment,
+        vec![item("0°F", FooterTone::Temperature)]
+    );
+}
+
+#[test]
 fn no_reading_collapses_selected_weather_and_keeps_zulu_time_independent() {
     let settings = FooterSettings {
         show_condition: true,
