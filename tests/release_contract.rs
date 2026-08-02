@@ -44,6 +44,36 @@ fn sha256(path: &Path) -> String {
     )
 }
 
+fn create_bootstrap_archive(payload: &Path, archive: &Path, members: &[&str]) {
+    let mut tar = Command::new("tar")
+        .args(["--format=ustar", "-cf", "-", "-C"])
+        .arg(payload)
+        .args(members)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start portable tar fixture");
+    let tar_stdout = tar.stdout.take().expect("tar stdout");
+    let zstd_output = Command::new("zstd")
+        .args(["-19", "-T1", "--no-progress", "-o"])
+        .arg(archive)
+        .stdin(Stdio::from(tar_stdout))
+        .output()
+        .expect("compress bootstrap archive");
+    let tar_output = tar.wait_with_output().expect("finish portable tar fixture");
+
+    assert!(
+        tar_output.status.success(),
+        "portable tar fixture failed: {}",
+        String::from_utf8_lossy(&tar_output.stderr)
+    );
+    assert!(
+        zstd_output.status.success(),
+        "bootstrap archive compression failed: {}",
+        String::from_utf8_lossy(&zstd_output.stderr)
+    );
+}
+
 fn driver_lock_field(name: &str) -> String {
     read("driver.lock.toml")
         .lines()
@@ -391,6 +421,19 @@ fn packager_has_deterministic_source_and_archive_guards() {
         !dockerfile.contains("deb.debian.org") && !dockerfile.contains("security.debian.org"),
         "the build must not consult mutable Debian repositories"
     );
+}
+
+#[test]
+fn bootstrap_fixture_archive_creation_uses_portable_system_tar() {
+    let temporary = tempfile::tempdir().expect("temporary archive fixture");
+    let payload = temporary.path().join("payload");
+    let archive = temporary.path().join("planeradarctl.tar.zst");
+    fs::create_dir(&payload).expect("payload directory");
+    fs::write(payload.join("planeradarctl"), b"fixture").expect("payload fixture");
+
+    create_bootstrap_archive(&payload, &archive, &["planeradarctl"]);
+
+    assert!(archive.is_file());
 }
 
 #[test]
@@ -1867,28 +1910,14 @@ finally:
             .expect("size sparse member");
     }
     let archive = fixture.join("planeradarctl-aarch64-apple-darwin.tar.zst");
-    let tar_program = if Path::new("/opt/homebrew/bin/gtar").exists() {
-        "/opt/homebrew/bin/gtar"
-    } else {
-        "tar"
-    };
-    let mut archive_command = format!(
-        "{tar_program} --sort=name --format=gnu --owner=0 --group=0 --numeric-owner --mode=0755 --mtime=@0 -cf - -C \"$PLANERADAR_PAYLOAD\" planeradarctl"
-    );
+    let mut archive_members = vec!["planeradarctl"];
     if matches!(scenario, BootstrapScenario::ExtraArchiveMember) {
-        archive_command.push_str(" extra");
+        archive_members.push("extra");
     }
     if matches!(scenario, BootstrapScenario::DuplicateArchiveMember) {
-        archive_command.push_str(" planeradarctl");
+        archive_members.push("planeradarctl");
     }
-    archive_command.push_str(" | zstd -19 -T1 --no-progress -o \"$PLANERADAR_ARCHIVE\"");
-    let status = Command::new("/bin/bash")
-        .args(["-c", &archive_command])
-        .env("PLANERADAR_PAYLOAD", &payload)
-        .env("PLANERADAR_ARCHIVE", &archive)
-        .status()
-        .expect("create bootstrap archive");
-    assert!(status.success());
+    create_bootstrap_archive(&payload, &archive, &archive_members);
     if matches!(scenario, BootstrapScenario::OversizedCompressedArchive) {
         let mut state = 0x6d2b_79f5_u32;
         let mut incompressible = vec![0_u8; 17 * 1024 * 1024];
