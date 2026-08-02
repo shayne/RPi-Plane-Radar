@@ -82,6 +82,8 @@ enum WaitOutcome {
     TimedOut,
     Action(Box<dyn FnOnce() + Send>),
     SettingsChanged(RadarSettings),
+    SettingsChangedAfter(Duration, RadarSettings),
+    ActionSettingsChangedAfter(Duration, Box<dyn FnOnce() + Send>),
     Stop,
 }
 
@@ -134,6 +136,15 @@ impl Waiter for ScriptedWaiter {
             }
             WaitOutcome::SettingsChanged(settings) => {
                 WaitResult::Command(WorkerCommand::SettingsChanged(settings))
+            }
+            WaitOutcome::SettingsChangedAfter(elapsed, settings) => {
+                self.clock.advance(elapsed);
+                WaitResult::Command(WorkerCommand::SettingsChanged(settings))
+            }
+            WaitOutcome::ActionSettingsChangedAfter(elapsed, action) => {
+                self.clock.advance(elapsed);
+                action();
+                WaitResult::Command(WorkerCommand::SettingsChanged(RadarSettings::default()))
             }
             WaitOutcome::Stop => {
                 stop.store(true, Ordering::Release);
@@ -533,14 +544,23 @@ fn successful_lookup_does_not_reset_the_thirty_second_failure_log_throttle() {
         ],
     );
     let replacement_model = model.clone();
+    let second_replacement_model = model.clone();
     let (waiter, waits) = ScriptedWaiter::new(
         clock.clone(),
         [
-            WaitOutcome::SettingsChanged(settings),
+            WaitOutcome::ActionSettingsChangedAfter(
+                Duration::from_secs(10),
+                Box::new(move || {
+                    replacement_model.record_aircraft(
+                        vec![aircraft("aaa002", "bb2", 40.02, -74.0)],
+                        Duration::from_secs(10),
+                    );
+                }),
+            ),
             WaitOutcome::Action(Box::new(move || {
-                replacement_model.record_aircraft(
-                    vec![aircraft("aaa002", "bb2", 40.02, -74.0)],
-                    Duration::from_millis(750),
+                second_replacement_model.record_aircraft(
+                    vec![aircraft("aaa003", "cc3", 40.03, -74.0)],
+                    Duration::from_millis(10_750),
                 );
             })),
             WaitOutcome::Stop,
@@ -558,8 +578,8 @@ fn successful_lookup_does_not_reset_the_thirty_second_failure_log_throttle() {
             .collect::<Vec<_>>(),
         [
             (Duration::ZERO, "aaa001"),
-            (Duration::ZERO, "aaa001"),
-            (Duration::from_millis(750), "aaa002"),
+            (Duration::from_secs(10), "aaa002"),
+            (Duration::from_millis(10_750), "aaa003"),
         ]
     );
     assert_eq!(
@@ -585,7 +605,214 @@ fn successful_lookup_does_not_reset_the_thirty_second_failure_log_throttle() {
 }
 
 #[test]
-fn settings_change_wakes_disabled_and_failed_waits() {
+fn unchanged_settings_notification_preserves_the_failure_deadline() {
+    let clock = FakeClock::default();
+    let settings = configured(false, true);
+    let model = RuntimeModel::new(settings.clone(), "http://local".to_owned());
+    model.record_aircraft(
+        vec![aircraft("abc123", "aal1", 40.01, -74.0)],
+        Duration::ZERO,
+    );
+    let (service, calls) = FakeService::new(
+        clock.clone(),
+        [
+            Err(FlightDataError::Http(HttpError::Timeout)),
+            Err(FlightDataError::Http(HttpError::Timeout)),
+            Err(FlightDataError::Http(HttpError::Timeout)),
+        ],
+    );
+    let (waiter, waits) = ScriptedWaiter::new(
+        clock.clone(),
+        [
+            WaitOutcome::SettingsChangedAfter(Duration::from_secs(10), settings),
+            WaitOutcome::TimedOut,
+            WaitOutcome::Stop,
+        ],
+    );
+
+    run(service, model, clock, waiter);
+
+    assert_eq!(
+        calls
+            .lock()
+            .expect("calls")
+            .iter()
+            .map(|(at, _, _)| *at)
+            .collect::<Vec<_>>(),
+        [Duration::ZERO, Duration::from_secs(30)]
+    );
+    assert_eq!(
+        *waits.lock().expect("waits"),
+        [
+            Duration::from_secs(30),
+            Duration::from_secs(20),
+            Duration::from_secs(30),
+        ]
+    );
+}
+
+#[test]
+fn unrelated_settings_notification_preserves_the_failure_deadline() {
+    let clock = FakeClock::default();
+    let settings = configured(false, true);
+    let model = RuntimeModel::new(settings, "http://local".to_owned());
+    model.record_aircraft(
+        vec![aircraft("abc123", "aal1", 40.01, -74.0)],
+        Duration::ZERO,
+    );
+    let changed_model = model.clone();
+    let (service, calls) = FakeService::new(
+        clock.clone(),
+        [
+            Err(FlightDataError::Http(HttpError::Timeout)),
+            Err(FlightDataError::Http(HttpError::Timeout)),
+            Err(FlightDataError::Http(HttpError::Timeout)),
+        ],
+    );
+    let (waiter, _) = ScriptedWaiter::new(
+        clock.clone(),
+        [
+            WaitOutcome::ActionSettingsChangedAfter(
+                Duration::from_secs(10),
+                Box::new(move || {
+                    let mut changed = configured(false, true);
+                    changed.radar_text_scale_percent = 110;
+                    changed_model.replace_settings(changed);
+                }),
+            ),
+            WaitOutcome::TimedOut,
+            WaitOutcome::Stop,
+        ],
+    );
+
+    run(service, model, clock, waiter);
+
+    assert_eq!(
+        calls
+            .lock()
+            .expect("calls")
+            .iter()
+            .map(|(at, _, _)| *at)
+            .collect::<Vec<_>>(),
+        [Duration::ZERO, Duration::from_secs(30)]
+    );
+}
+
+#[test]
+fn material_needs_or_active_identity_change_can_retry_immediately() {
+    let clock = FakeClock::default();
+    let model = RuntimeModel::new(configured(false, true), "http://local".to_owned());
+    model.record_aircraft(
+        vec![aircraft("abc123", "aal1", 40.01, -74.0)],
+        Duration::ZERO,
+    );
+    let needs_model = model.clone();
+    let identity_model = model.clone();
+    let (service, calls) = FakeService::new(
+        clock.clone(),
+        [
+            Err(FlightDataError::Http(HttpError::Timeout)),
+            Err(FlightDataError::Http(HttpError::Timeout)),
+            Err(FlightDataError::Http(HttpError::Timeout)),
+        ],
+    );
+    let (waiter, _) = ScriptedWaiter::new(
+        clock.clone(),
+        [
+            WaitOutcome::ActionSettingsChangedAfter(
+                Duration::from_secs(5),
+                Box::new(move || {
+                    needs_model.replace_settings(configured(true, false));
+                }),
+            ),
+            WaitOutcome::ActionSettingsChangedAfter(
+                Duration::from_secs(5),
+                Box::new(move || {
+                    identity_model.record_aircraft(
+                        vec![aircraft("def456", "dal2", 40.02, -74.0)],
+                        Duration::from_secs(10),
+                    );
+                }),
+            ),
+            WaitOutcome::Stop,
+        ],
+    );
+
+    run(service, model, clock, waiter);
+
+    assert_eq!(
+        calls
+            .lock()
+            .expect("calls")
+            .iter()
+            .map(|(at, aircraft, needs)| (*at, aircraft.hex.as_str(), *needs))
+            .collect::<Vec<_>>(),
+        [
+            (
+                Duration::ZERO,
+                "abc123",
+                EnrichmentNeeds {
+                    route: false,
+                    model: true,
+                },
+            ),
+            (
+                Duration::from_secs(5),
+                "abc123",
+                EnrichmentNeeds {
+                    route: true,
+                    model: false,
+                },
+            ),
+            (
+                Duration::from_secs(10),
+                "def456",
+                EnrichmentNeeds {
+                    route: true,
+                    model: false,
+                },
+            ),
+        ]
+    );
+}
+
+#[test]
+fn disabling_during_failure_backoff_stops_lookup_work_immediately() {
+    let clock = FakeClock::default();
+    let model = RuntimeModel::new(configured(false, true), "http://local".to_owned());
+    model.record_aircraft(
+        vec![aircraft("abc123", "aal1", 40.01, -74.0)],
+        Duration::ZERO,
+    );
+    let disabled_model = model.clone();
+    let (service, calls) = FakeService::new(
+        clock.clone(),
+        [Err(FlightDataError::Http(HttpError::Timeout))],
+    );
+    let (waiter, waits) = ScriptedWaiter::new(
+        clock.clone(),
+        [
+            WaitOutcome::ActionSettingsChangedAfter(
+                Duration::from_secs(10),
+                Box::new(move || {
+                    disabled_model.replace_settings(configured(false, false));
+                }),
+            ),
+            WaitOutcome::Stop,
+        ],
+    );
+
+    run(service, model, clock, waiter);
+
+    assert_eq!(calls.lock().expect("calls").len(), 1);
+    assert_eq!(
+        *waits.lock().expect("waits"),
+        [Duration::from_secs(30), Duration::from_secs(30)]
+    );
+}
+
+#[test]
+fn settings_change_wakes_disabled_wait() {
     let disabled_clock = FakeClock::default();
     let disabled_settings = configured(false, false);
     let disabled_model = RuntimeModel::new(disabled_settings.clone(), "http://local".to_owned());
@@ -612,44 +839,6 @@ fn settings_change_wakes_disabled_and_failed_waits() {
     assert_eq!(
         *disabled_waits.lock().expect("waits"),
         [Duration::from_secs(30), Duration::from_secs(30)]
-    );
-
-    let failed_clock = FakeClock::default();
-    let failed_settings = configured(false, true);
-    let failed_model = RuntimeModel::new(failed_settings.clone(), "http://local".to_owned());
-    failed_model.record_aircraft(
-        vec![aircraft("abc123", "aal1", 40.01, -74.0)],
-        Duration::ZERO,
-    );
-    let missing = br#"{"response":"unknown aircraft"}"#;
-    let (failed_service, requests, sleeps) = client(
-        failed_clock.clone(),
-        [Err(HttpError::Timeout), response(missing)],
-    );
-    let (failed_waiter, failed_waits) = ScriptedWaiter::new(
-        failed_clock.clone(),
-        [
-            WaitOutcome::SettingsChanged(failed_settings),
-            WaitOutcome::Stop,
-        ],
-    );
-    run(failed_service, failed_model, failed_clock, failed_waiter);
-    assert_eq!(
-        requests
-            .lock()
-            .expect("requests")
-            .iter()
-            .map(|(at, _)| *at)
-            .collect::<Vec<_>>(),
-        [Duration::ZERO, Duration::from_millis(750)]
-    );
-    assert_eq!(
-        *sleeps.lock().expect("sleeps"),
-        [Duration::from_millis(750)]
-    );
-    assert_eq!(
-        *failed_waits.lock().expect("waits"),
-        [Duration::from_secs(30), Duration::from_millis(750)]
     );
 }
 

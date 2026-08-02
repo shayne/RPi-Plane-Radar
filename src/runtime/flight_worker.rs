@@ -6,11 +6,11 @@ use std::time::Duration;
 
 use crate::flight_data::{
     AircraftEnrichment, EnrichmentCache, EnrichmentNeeds, FlightDataError, FlightDataService,
-    normalize_aircraft_hex, normalize_flight_callsign,
+    normalize_aircraft_hex, normalize_flight_callsign, normalized_aircraft_key,
 };
 use crate::geometry::offset_km;
 use crate::http::HttpError;
-use crate::model::{Aircraft, Location, RadarSettings, RuntimeModel};
+use crate::model::{Aircraft, AircraftKey, Location, RadarSettings, RuntimeModel};
 use crate::time::Clock;
 
 use super::{CommandDrain, Waiter, WorkerCommand, drain_commands, wait_for_command};
@@ -29,6 +29,17 @@ struct FailureLogRecord {
     provider: &'static str,
     category: &'static str,
     identity: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LookupIdentity {
+    aircraft: AircraftKey,
+    needs: EnrichmentNeeds,
+}
+
+struct FailureBackoff {
+    identity: LookupIdentity,
+    deadline: Duration,
 }
 
 impl FailureLogWindow {
@@ -74,6 +85,7 @@ impl<D: FlightDataService, K: Clock, W: Waiter> FlightDataWorker<D, K, W> {
 
     pub fn run(mut self, commands: Receiver<WorkerCommand>, stop: Arc<AtomicBool>) {
         let mut failure_logs = FailureLogWindow::default();
+        let mut failure_backoff: Option<FailureBackoff> = None;
 
         loop {
             if stop.load(Ordering::Acquire)
@@ -85,12 +97,14 @@ impl<D: FlightDataService, K: Clock, W: Waiter> FlightDataWorker<D, K, W> {
             let snapshot = self.model.snapshot();
             let needs = needs_for(&snapshot.settings);
             let Some(location) = snapshot.settings.location.clone() else {
+                failure_backoff = None;
                 if !wait_for_command(&self.waiter, &commands, &stop, FAILURE_INTERVAL) {
                     return;
                 }
                 continue;
             };
             if needs == EnrichmentNeeds::default() {
+                failure_backoff = None;
                 if !wait_for_command(&self.waiter, &commands, &stop, FAILURE_INTERVAL) {
                     return;
                 }
@@ -124,11 +138,28 @@ impl<D: FlightDataService, K: Clock, W: Waiter> FlightDataWorker<D, K, W> {
             }
 
             let Some((_, aircraft, pending)) = candidate else {
+                failure_backoff = None;
                 if !wait_for_command(&self.waiter, &commands, &stop, NO_CANDIDATE_INTERVAL) {
                     return;
                 }
                 continue;
             };
+
+            let lookup_identity = LookupIdentity {
+                aircraft: normalized_aircraft_key(&aircraft),
+                needs: pending,
+            };
+            if let Some(backoff) = failure_backoff.as_ref() {
+                if backoff.identity == lookup_identity {
+                    let remaining = backoff.deadline.saturating_sub(self.clock.monotonic());
+                    if !remaining.is_zero() {
+                        if !wait_for_command(&self.waiter, &commands, &stop, remaining) {
+                            return;
+                        }
+                        continue;
+                    }
+                }
+            }
 
             let result = self.service.lookup(&aircraft, pending);
             let command_drain = drain_commands(&commands, &stop);
@@ -138,6 +169,7 @@ impl<D: FlightDataService, K: Clock, W: Waiter> FlightDataWorker<D, K, W> {
 
             match result {
                 Ok(lookup) => {
+                    failure_backoff = None;
                     let now = self.clock.monotonic();
                     self.cache.record(&aircraft, pending, &lookup, now);
                     if !matches!(command_drain, CommandDrain::Changed) {
@@ -152,6 +184,10 @@ impl<D: FlightDataService, K: Clock, W: Waiter> FlightDataWorker<D, K, W> {
                     }
                 }
                 Err(error) => {
+                    failure_backoff = Some(FailureBackoff {
+                        identity: lookup_identity,
+                        deadline: self.clock.monotonic().saturating_add(FAILURE_INTERVAL),
+                    });
                     if matches!(command_drain, CommandDrain::Changed) {
                         continue;
                     }
