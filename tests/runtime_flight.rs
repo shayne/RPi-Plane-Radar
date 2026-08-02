@@ -452,8 +452,8 @@ fn successful_and_missing_cache_entries_suppress_duplicates_and_space_starts() {
     let model = RuntimeModel::new(configured(false, true), "http://local".to_owned());
     model.record_aircraft(
         vec![
-            aircraft("near", "near1", 40.01, -74.0),
-            aircraft("far", "far1", 40.02, -74.0),
+            aircraft("abc001", "near1", 40.01, -74.0),
+            aircraft("abc002", "far1", 40.02, -74.0),
         ],
         Duration::ZERO,
     );
@@ -475,8 +475,8 @@ fn successful_and_missing_cache_entries_suppress_duplicates_and_space_starts() {
     assert_eq!(requests.len(), 2);
     assert_eq!(requests[0].0, Duration::ZERO);
     assert_eq!(requests[1].0, Duration::from_millis(750));
-    assert!(requests[0].1.url.ends_with("/aircraft/NEAR"));
-    assert!(requests[1].1.url.ends_with("/aircraft/FAR"));
+    assert!(requests[0].1.url.ends_with("/aircraft/ABC001"));
+    assert!(requests[1].1.url.ends_with("/aircraft/ABC002"));
     assert_eq!(
         *waits.lock().expect("waits"),
         [
@@ -489,7 +489,7 @@ fn successful_and_missing_cache_entries_suppress_duplicates_and_space_starts() {
         model
             .snapshot()
             .enrichment
-            .get(&aircraft("near", "near1", 0.0, 0.0).key())
+            .get(&aircraft("abc001", "near1", 0.0, 0.0).key())
             .and_then(|enrichment| enrichment.model.as_deref()),
         Some("737-800")
     );
@@ -521,7 +521,7 @@ fn successful_lookup_does_not_reset_the_thirty_second_failure_log_throttle() {
     let settings = configured(false, true);
     let model = RuntimeModel::new(settings.clone(), "http://local".to_owned());
     model.record_aircraft(
-        vec![aircraft("throttle-a", "aa1", 40.01, -74.0)],
+        vec![aircraft("aaa001", "aa1", 40.01, -74.0)],
         Duration::ZERO,
     );
     let (service, calls) = FakeService::new(
@@ -539,7 +539,7 @@ fn successful_lookup_does_not_reset_the_thirty_second_failure_log_throttle() {
             WaitOutcome::SettingsChanged(settings),
             WaitOutcome::Action(Box::new(move || {
                 replacement_model.record_aircraft(
-                    vec![aircraft("throttle-b", "bb2", 40.02, -74.0)],
+                    vec![aircraft("aaa002", "bb2", 40.02, -74.0)],
                     Duration::from_millis(750),
                 );
             })),
@@ -557,9 +557,9 @@ fn successful_lookup_does_not_reset_the_thirty_second_failure_log_throttle() {
             .map(|(at, aircraft, _)| (*at, aircraft.hex.as_str()))
             .collect::<Vec<_>>(),
         [
-            (Duration::ZERO, "throttle-a"),
-            (Duration::ZERO, "throttle-a"),
-            (Duration::from_millis(750), "throttle-b"),
+            (Duration::ZERO, "aaa001"),
+            (Duration::ZERO, "aaa001"),
+            (Duration::from_millis(750), "aaa002"),
         ]
     );
     assert_eq!(
@@ -575,12 +575,12 @@ fn successful_lookup_does_not_reset_the_thirty_second_failure_log_throttle() {
         .lock()
         .expect("log messages")
         .iter()
-        .filter(|message| message.contains("THROTTLE"))
+        .filter(|message| message.contains("AAA001"))
         .cloned()
         .collect::<Vec<_>>();
     assert_eq!(
         throttle_logs,
-        ["provider=ADSBDB category=timeout aircraft=THROTTLEA/AA1"]
+        ["provider=ADSBDB category=timeout aircraft=AAA001/AA1"]
     );
 }
 

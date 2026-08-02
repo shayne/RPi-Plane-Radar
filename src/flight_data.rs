@@ -16,6 +16,8 @@ const MAX_RESPONSE_BYTES: usize = 256 * 1024;
 const MINIMUM_REQUEST_INTERVAL: Duration = Duration::from_millis(750);
 const SUCCESS_TTL: Duration = Duration::from_secs(6 * 60 * 60);
 const MISSING_TTL: Duration = Duration::from_secs(10 * 60);
+const MODE_S_HEX_LENGTH: usize = 6;
+const FLIGHT_CALLSIGN_LENGTH: usize = 8;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct EnrichmentNeeds {
@@ -179,11 +181,11 @@ fn rebase_access_serials(entries: &mut HashMap<String, CacheEntry>) -> u64 {
     highest
 }
 
-fn normalized_aircraft_key(aircraft: &Aircraft) -> crate::model::AircraftKey {
+pub(crate) fn normalized_aircraft_key(aircraft: &Aircraft) -> crate::model::AircraftKey {
     let key = aircraft.key();
     crate::model::AircraftKey {
-        hex: normalize_identifier(&key.hex),
-        callsign: normalize_identifier(&key.callsign),
+        hex: normalize_aircraft_hex(&key.hex),
+        callsign: normalize_flight_callsign(&key.callsign),
     }
 }
 
@@ -254,8 +256,8 @@ impl<C: HttpClient, K: Clock, S: Sleeper> FlightDataClient<C, K, S> {
     ) -> Result<FlightLookup, FlightDataError> {
         validate_provider_base(&self.provider_base)?;
 
-        let hex = normalize_identifier(&aircraft.hex);
-        let callsign = normalize_identifier(&aircraft.flight_callsign);
+        let hex = normalize_aircraft_hex(&aircraft.hex);
+        let callsign = normalize_flight_callsign(&aircraft.flight_callsign);
         let mut lookup = FlightLookup {
             route: if needs.route {
                 LookupValue::Missing
@@ -378,11 +380,21 @@ fn validate_provider_base(provider_base: &str) -> Result<(), FlightDataError> {
     Ok(())
 }
 
-fn normalize_identifier(identifier: &str) -> String {
+pub(crate) fn normalize_aircraft_hex(identifier: &str) -> String {
+    identifier
+        .chars()
+        .filter(char::is_ascii_hexdigit)
+        .map(|character| character.to_ascii_uppercase())
+        .take(MODE_S_HEX_LENGTH)
+        .collect()
+}
+
+pub(crate) fn normalize_flight_callsign(identifier: &str) -> String {
     identifier
         .chars()
         .filter(char::is_ascii_alphanumeric)
         .map(|character| character.to_ascii_uppercase())
+        .take(FLIGHT_CALLSIGN_LENGTH)
         .collect()
 }
 

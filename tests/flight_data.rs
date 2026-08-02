@@ -489,6 +489,29 @@ fn endpoint_selection_normalizes_identifiers_and_sends_only_required_data() {
 }
 
 #[test]
+fn oversized_noisy_identifiers_are_bounded_before_url_construction() {
+    let (mut client, http, _) =
+        client([ok(include_bytes!("fixtures/adsbdb/combined.json"))]);
+
+    client
+        .lookup(
+            &aircraft("ab-c123def456☃", "aa-l 12345✈xyz"),
+            both(),
+        )
+        .expect("bounded combined lookup");
+
+    let request = &http.requests()[0].1;
+    assert_eq!(
+        request.url,
+        "https://api.adsbdb.test/v0/aircraft/ABC123"
+    );
+    assert_eq!(
+        request.query,
+        vec![("callsign".to_owned(), "AAL12345".to_owned())]
+    );
+}
+
+#[test]
 fn missing_identifiers_issue_only_requests_that_can_satisfy_a_field() {
     let model_response = serde_json::json!({
         "response": {"aircraft": {"type": "Boeing 737-800", "icao_type": "B738"}}
@@ -649,6 +672,27 @@ fn cache_keys_routes_by_callsign_and_models_by_hex() {
     );
     assert!(same_hex_new_callsign.pending.route);
     assert!(!same_hex_new_callsign.pending.model);
+}
+
+#[test]
+fn oversized_noisy_identifiers_are_bounded_before_cache_identity() {
+    let mut cache = EnrichmentCache::new(256);
+    cache.record(
+        &aircraft("ab-c123-first-tail☃", "aa-l 12345-first-tail✈"),
+        both(),
+        &found("JFK→LAX", "737-800"),
+        Duration::ZERO,
+    );
+
+    let resolution = cache.resolve(
+        &aircraft("ABC123-second-tail", "AAL12345-second-tail"),
+        both(),
+        Duration::from_secs(1),
+    );
+
+    assert_eq!(resolution.enrichment.route, Some("JFK→LAX".to_owned()));
+    assert_eq!(resolution.enrichment.model, Some("737-800".to_owned()));
+    assert_eq!(resolution.pending, EnrichmentNeeds::default());
 }
 
 #[test]

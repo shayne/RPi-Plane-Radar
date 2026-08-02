@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use crate::flight_data::{
     AircraftEnrichment, EnrichmentCache, EnrichmentNeeds, FlightDataError, FlightDataService,
+    normalize_aircraft_hex, normalize_flight_callsign,
 };
 use crate::geometry::offset_km;
 use crate::http::HttpError;
@@ -216,21 +217,13 @@ fn error_category(error: &FlightDataError) -> &'static str {
 }
 
 fn normalized_identity(aircraft: &Aircraft) -> String {
-    let hex = normalize_identifier(&aircraft.hex);
-    let callsign = normalize_identifier(&aircraft.flight_callsign);
+    let hex = normalize_aircraft_hex(&aircraft.hex);
+    let callsign = normalize_flight_callsign(&aircraft.flight_callsign);
     format!(
         "{}/{}",
         if hex.is_empty() { "-" } else { &hex },
         if callsign.is_empty() { "-" } else { &callsign },
     )
-}
-
-fn normalize_identifier(identifier: &str) -> String {
-    identifier
-        .chars()
-        .filter(char::is_ascii_alphanumeric)
-        .map(|character| character.to_ascii_uppercase())
-        .collect()
 }
 
 #[cfg(test)]
@@ -258,12 +251,16 @@ mod tests {
         let mut window = FailureLogWindow::default();
         let error = FlightDataError::Http(HttpError::Timeout);
 
+        let mut noisy_aircraft = aircraft();
+        noisy_aircraft.hex = "ab-c123def456☃".to_owned();
+        noisy_aircraft.flight_callsign = "aa-l 12345✈xyz".to_owned();
+
         let first = window
-            .record(&error, &aircraft(), Duration::ZERO)
+            .record(&error, &noisy_aircraft, Duration::ZERO)
             .expect("first failure log");
         assert_eq!(first.provider, "ADSBDB");
         assert_eq!(first.category, "timeout");
-        assert_eq!(first.identity, "ABC/AA12");
+        assert_eq!(first.identity, "ABC123/AAL12345");
         assert!(!first.identity.contains("40.7128"));
         assert!(!first.identity.contains("-74.006"));
 
