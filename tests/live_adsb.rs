@@ -1,6 +1,6 @@
 use std::time::Instant;
 
-use planeradar::adsb::AdsbClient;
+use planeradar::adsb::{AdsbClient, AltitudeFilter};
 use planeradar::http::UreqHttpClient;
 use planeradar::model::Location;
 
@@ -23,7 +23,14 @@ fn live_tls_verified_adsb_request() {
     let client = AdsbClient::new(UreqHttpClient);
     let started = Instant::now();
     let aircraft = client
-        .fetch(&location, 13.3333)
+        .fetch(
+            &location,
+            13.3333,
+            AltitudeFilter {
+                minimum_feet: None,
+                maximum_feet: None,
+            },
+        )
         .expect("TLS-verified ADS-B request");
 
     println!(

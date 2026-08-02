@@ -503,6 +503,8 @@ pub fn fixture_empty() -> Result<Frame, RenderError> {
 pub fn fixture_traffic() -> Result<Frame, RenderError> {
     let aircraft = vec![
         Aircraft {
+            hex: "a00001".to_owned(),
+            flight_callsign: "RADAR7".to_owned(),
             latitude: fixture_point(5.0, -3.0).latitude,
             longitude: fixture_point(5.0, -3.0).longitude,
             nose_degrees: 45.0,
@@ -510,9 +512,12 @@ pub fn fixture_traffic() -> Result<Frame, RenderError> {
             ground_speed_knots: 280.0,
             callsign: "RADAR7".to_owned(),
             aircraft_type: "A320".to_owned(),
+            altitude_feet: Some(12_000),
             altitude: "12000".to_owned(),
         },
         Aircraft {
+            hex: "a00002".to_owned(),
+            flight_callsign: "RIM".to_owned(),
             latitude: fixture_point(15.0, 15.0).latitude,
             longitude: fixture_point(15.0, 15.0).longitude,
             nose_degrees: 270.0,
@@ -520,6 +525,7 @@ pub fn fixture_traffic() -> Result<Frame, RenderError> {
             ground_speed_knots: 400.0,
             callsign: "RIM".to_owned(),
             aircraft_type: String::new(),
+            altitude_feet: None,
             altitude: String::new(),
         },
     ];

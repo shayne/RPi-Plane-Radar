@@ -77,6 +77,8 @@ fn configured() -> RadarSettings {
 
 fn aircraft() -> Aircraft {
     Aircraft {
+        hex: "a00001".to_owned(),
+        flight_callsign: "TEST".to_owned(),
         latitude: 40.8,
         longitude: -74.1,
         nose_degrees: 90.0,
@@ -84,6 +86,7 @@ fn aircraft() -> Aircraft {
         ground_speed_knots: 300.0,
         callsign: "TEST".to_owned(),
         aircraft_type: String::new(),
+        altitude_feet: Some(12_000),
         altitude: "12000".to_owned(),
     }
 }

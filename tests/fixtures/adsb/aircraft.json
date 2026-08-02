@@ -1,9 +1,9 @@
 {
   "now": 1784995200,
-  "total": 68,
+  "total": 69,
   "ac": [
     {
-      "hex": "a1b2c3",
+      "hex": "a835af",
       "flight": "UAL123  ",
       "lat": 40.7501,
       "lon": -73.9901,
@@ -17,6 +17,15 @@
       "t": "B38M",
       "alt_baro": 33000,
       "alt_geom": 33125
+    },
+    {
+      "hex": "unknown",
+      "flight": "UNKNOWN ",
+      "lat": 40.75015,
+      "lon": -73.99015,
+      "track": 95,
+      "gs": 200,
+      "t": "A320"
     },
     {
       "hex": "a00002",
@@ -83,7 +92,7 @@
       "alt_baro": 12008
     },
     {
-      "hex": "abc009",
+      "hex": " ABC009 ",
       "lat": 40.7509,
       "lon": -73.9909,
       "track": 161,

@@ -4,7 +4,7 @@ use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use planeradar::adsb::AdsbClient;
+use planeradar::adsb::{AdsbClient, AltitudeFilter};
 use planeradar::http::{HttpClient, HttpError, HttpRequest, HttpResponse};
 use planeradar::model::{Aircraft, AppState, Location, RadarSettings, Units};
 use planeradar::runtime::{
@@ -28,6 +28,8 @@ fn configured() -> RadarSettings {
 
 fn aircraft() -> Aircraft {
     Aircraft {
+        hex: String::new(),
+        flight_callsign: String::new(),
         latitude: 40.8,
         longitude: -74.1,
         nose_degrees: 0.0,
@@ -35,7 +37,21 @@ fn aircraft() -> Aircraft {
         ground_speed_knots: 0.0,
         callsign: String::new(),
         aircraft_type: String::new(),
+        altitude_feet: None,
         altitude: String::new(),
+    }
+}
+
+fn aircraft_at(hex: &str, altitude_feet: Option<i32>) -> Aircraft {
+    Aircraft {
+        hex: hex.to_owned(),
+        flight_callsign: hex.to_owned(),
+        callsign: hex.to_owned(),
+        altitude: altitude_feet
+            .map(|altitude| format!("{altitude} ft"))
+            .unwrap_or_default(),
+        altitude_feet,
+        ..aircraft()
     }
 }
 
@@ -162,6 +178,47 @@ fn non_location_settings_change_preserves_successful_fetch_state() {
 }
 
 #[test]
+fn enabling_or_tightening_altitude_bounds_immediately_removes_disallowed_aircraft() {
+    let model = RuntimeModel::new(configured(), "http://planeradar.local".to_owned());
+    model.record_aircraft(
+        vec![
+            aircraft_at("low", Some(5_000)),
+            aircraft_at("mid", Some(15_000)),
+            aircraft_at("high", Some(35_000)),
+            aircraft_at("unknown", None),
+        ],
+        Duration::from_secs(10),
+    );
+
+    let mut bounded = configured();
+    bounded.minimum_altitude_feet = Some(10_000);
+    model.replace_settings(bounded.clone());
+    let enabled = model.snapshot();
+    assert_eq!(
+        enabled
+            .aircraft
+            .iter()
+            .map(|aircraft| aircraft.hex.as_str())
+            .collect::<Vec<_>>(),
+        ["mid", "high"]
+    );
+    assert_eq!(enabled.fetched_at, Some(Duration::from_secs(10)));
+
+    bounded.maximum_altitude_feet = Some(20_000);
+    model.replace_settings(bounded);
+    let tightened = model.snapshot();
+    assert_eq!(
+        tightened
+            .aircraft
+            .iter()
+            .map(|aircraft| aircraft.hex.as_str())
+            .collect::<Vec<_>>(),
+        ["mid"]
+    );
+    assert_eq!(tightened.fetched_at, Some(Duration::from_secs(10)));
+}
+
+#[test]
 fn accepted_conditional_publication_records_success_for_the_current_location() {
     let settings = configured();
     let location = settings.location.clone().expect("location");
@@ -171,6 +228,7 @@ fn accepted_conditional_publication_records_success_for_the_current_location() {
             .record_aircraft_if_query(
                 &location,
                 settings.range_index,
+                AltitudeFilter::from(&settings),
                 vec![aircraft()],
                 Duration::from_secs(10),
             )
@@ -202,6 +260,7 @@ fn location_change_resets_success_and_stale_publication_cannot_restore_it() {
         model.record_aircraft_if_query(
             &original_location,
             1,
+            AltitudeFilter::from(&configured()),
             vec![aircraft()],
             Duration::from_secs(12),
         ),
@@ -226,13 +285,19 @@ fn conditional_publication_rejects_a_superseded_query_under_the_model_lock() {
         model.record_aircraft_if_query(
             &original_location,
             1,
+            AltitudeFilter::from(&configured()),
             vec![aircraft()],
             Duration::from_secs(10),
         ),
         None
     );
     assert_eq!(
-        model.record_adsb_error_if_query(&original_location, 1, Duration::from_secs(11)),
+        model.record_adsb_error_if_query(
+            &original_location,
+            1,
+            AltitudeFilter::from(&configured()),
+            Duration::from_secs(11),
+        ),
         None
     );
     let snapshot = model.snapshot();
@@ -241,6 +306,36 @@ fn conditional_publication_rejects_a_superseded_query_under_the_model_lock() {
     assert_eq!(snapshot.last_error_at, None);
     let health = RuntimeHealthSource::new(model, Arc::new(|| Duration::from_secs(12)));
     assert_eq!(health.health().state, AppState::WaitingForNetwork);
+}
+
+#[test]
+fn conditional_publication_rejects_results_and_errors_after_filter_changes() {
+    let original = configured();
+    let location = original.location.clone().expect("location");
+    let expected_filter = AltitudeFilter::from(&original);
+    let model = RuntimeModel::new(original.clone(), "http://planeradar.local".to_owned());
+    let mut filtered = original;
+    filtered.minimum_altitude_feet = Some(10_000);
+    model.replace_settings(filtered);
+
+    assert_eq!(
+        model.record_aircraft_if_query(
+            &location,
+            1,
+            expected_filter,
+            vec![aircraft_at("stale", Some(5_000))],
+            Duration::from_secs(10),
+        ),
+        None
+    );
+    assert_eq!(
+        model.record_adsb_error_if_query(&location, 1, expected_filter, Duration::from_secs(11)),
+        None
+    );
+    let snapshot = model.snapshot();
+    assert!(snapshot.aircraft.is_empty());
+    assert_eq!(snapshot.fetched_at, None);
+    assert_eq!(snapshot.last_error_at, None);
 }
 
 #[derive(Clone, Default)]

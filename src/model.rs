@@ -139,6 +139,8 @@ pub struct GeoPoint {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Aircraft {
+    pub hex: String,
+    pub flight_callsign: String,
     pub latitude: f64,
     pub longitude: f64,
     pub nose_degrees: f64,
@@ -146,7 +148,23 @@ pub struct Aircraft {
     pub ground_speed_knots: f64,
     pub callsign: String,
     pub aircraft_type: String,
+    pub altitude_feet: Option<i32>,
     pub altitude: String,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct AircraftKey {
+    pub hex: String,
+    pub callsign: String,
+}
+
+impl Aircraft {
+    pub fn key(&self) -> AircraftKey {
+        AircraftKey {
+            hex: self.hex.clone(),
+            callsign: self.flight_callsign.clone(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -211,10 +229,20 @@ impl RuntimeModel {
         let location_changed = snapshot.settings.location != settings.location;
         let query_changed =
             location_changed || snapshot.settings.range_index != settings.range_index;
+        let old_filter = crate::adsb::AltitudeFilter::from(&snapshot.settings);
+        let new_filter = crate::adsb::AltitudeFilter::from(&settings);
         snapshot.settings = settings;
         if query_changed {
             snapshot.aircraft = Arc::from([]);
             snapshot.fetched_at = None;
+        } else if old_filter != new_filter {
+            snapshot.aircraft = snapshot
+                .aircraft
+                .iter()
+                .filter(|aircraft| new_filter.allows(aircraft.altitude_feet))
+                .cloned()
+                .collect::<Vec<_>>()
+                .into();
         }
         if location_changed {
             snapshot.has_successful_fetch_for_current_location = false;
@@ -234,12 +262,14 @@ impl RuntimeModel {
         &self,
         expected_location: &Location,
         expected_range_index: u8,
+        expected_filter: crate::adsb::AltitudeFilter,
         aircraft: Vec<Aircraft>,
         fetched_at: Duration,
     ) -> Option<u64> {
         let mut snapshot = self.snapshot.write().expect("runtime model lock");
         if snapshot.settings.location.as_ref() != Some(expected_location)
             || snapshot.settings.range_index != expected_range_index
+            || crate::adsb::AltitudeFilter::from(&snapshot.settings) != expected_filter
         {
             return None;
         }
@@ -259,11 +289,13 @@ impl RuntimeModel {
         &self,
         expected_location: &Location,
         expected_range_index: u8,
+        expected_filter: crate::adsb::AltitudeFilter,
         at: Duration,
     ) -> Option<u64> {
         let mut snapshot = self.snapshot.write().expect("runtime model lock");
         if snapshot.settings.location.as_ref() != Some(expected_location)
             || snapshot.settings.range_index != expected_range_index
+            || crate::adsb::AltitudeFilter::from(&snapshot.settings) != expected_filter
         {
             return None;
         }

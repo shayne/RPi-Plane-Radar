@@ -12,7 +12,7 @@ use signal_hook::consts::signal::{SIGINT, SIGTERM};
 use thiserror::Error;
 use url::Url;
 
-use crate::adsb::AdsbClient;
+use crate::adsb::{AdsbClient, AltitudeFilter};
 use crate::geocode::{GeocodeService, Geocoder};
 use crate::http::{HttpClient, UreqHttpClient};
 use crate::model::{AppState, RadarSettings};
@@ -133,11 +133,12 @@ impl<C: HttpClient, K: Clock, W: Waiter> AdsbWorker<C, K, W> {
                 continue;
             };
             let range_index = snapshot.settings.range_index;
+            let filter = AltitudeFilter::from(&snapshot.settings);
             let Ok(range) = range_preset(range_index) else {
                 return;
             };
             let started_at = self.clock.monotonic();
-            let result = self.client.fetch(&location, range.outer_km);
+            let result = self.client.fetch(&location, range.outer_km, filter);
 
             let command_drain = drain_commands(&commands, &stop);
             if stop.load(Ordering::Acquire) || matches!(command_drain, CommandDrain::Stop) {
@@ -150,6 +151,7 @@ impl<C: HttpClient, K: Clock, W: Waiter> AdsbWorker<C, K, W> {
                         .record_aircraft_if_query(
                             &location,
                             range_index,
+                            filter,
                             aircraft,
                             self.clock.monotonic(),
                         )
@@ -162,7 +164,12 @@ impl<C: HttpClient, K: Clock, W: Waiter> AdsbWorker<C, K, W> {
                 Err(_) => {
                     if self
                         .model
-                        .record_adsb_error_if_query(&location, range_index, self.clock.monotonic())
+                        .record_adsb_error_if_query(
+                            &location,
+                            range_index,
+                            filter,
+                            self.clock.monotonic(),
+                        )
                         .is_none()
                     {
                         continue;

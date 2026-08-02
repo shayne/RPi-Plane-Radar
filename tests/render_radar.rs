@@ -145,6 +145,8 @@ fn east_longitude(kilometres: f64) -> f64 {
 
 fn aircraft(east_km: f64, speed: f64) -> Aircraft {
     Aircraft {
+        hex: "a00001".to_owned(),
+        flight_callsign: "EAST123".to_owned(),
         latitude: ORIGIN_LATITUDE,
         longitude: east_longitude(east_km),
         nose_degrees: 90.0,
@@ -152,6 +154,7 @@ fn aircraft(east_km: f64, speed: f64) -> Aircraft {
         ground_speed_knots: speed,
         callsign: "EAST123".to_owned(),
         aircraft_type: "A320".to_owned(),
+        altitude_feet: Some(12_000),
         altitude: "12000".to_owned(),
     }
 }
