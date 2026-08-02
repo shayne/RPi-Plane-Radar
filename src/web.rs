@@ -13,7 +13,10 @@ use tiny_http::{Header, Method, Request, Response, Server};
 use url::Url;
 
 use crate::geocode::{GeocodeResult, GeocodeService};
-use crate::model::{AppState, Location, RadarSettings, SETTINGS_SCHEMA_VERSION, Units};
+use crate::model::{
+    AppState, ClockFormat, Location, RadarSettings, SETTINGS_SCHEMA_VERSION, TemperatureUnit,
+    TimeZone, Units,
+};
 use crate::range::{format_range_label, range_preset};
 use crate::settings::validate_settings;
 
@@ -260,13 +263,13 @@ impl ServerState {
         let current = self.settings.current();
         let candidate = match candidate_from_form(&current, &form) {
             Ok(candidate) => candidate,
-            Err(()) => {
+            Err(error) => {
                 let body = render_page(
                     &current,
                     &self.local_url,
                     csrf_token,
                     SearchState::Idle,
-                    Some(PageNotice::InvalidSettings),
+                    Some(PageNotice::InvalidSettings(error)),
                 );
                 return Ok(Outgoing::html(400, body).with_header("Cache-Control", "no-store"));
             }
@@ -280,7 +283,7 @@ impl ServerState {
                     &self.local_url,
                     csrf_token,
                     SearchState::Idle,
-                    Some(PageNotice::InvalidSettings),
+                    Some(PageNotice::InvalidSettings(FormError::generic(None))),
                 );
                 return Ok(Outgoing::html(400, body).with_header("Cache-Control", "no-store"));
             }
@@ -531,48 +534,296 @@ impl Form {
     }
 }
 
-fn candidate_from_form(current: &RadarSettings, form: &Form) -> Result<RadarSettings, ()> {
-    let latitude = form
-        .single("latitude")?
-        .ok_or(())?
+const INVALID_SETTINGS_MESSAGE: &str =
+    "Those settings could not be applied. Check the coordinates and try again.";
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum SettingsSection {
+    Aircraft,
+    Footer,
+    Traffic,
+}
+
+#[derive(Clone, Copy)]
+struct FormError {
+    section: Option<SettingsSection>,
+    message: &'static str,
+}
+
+impl FormError {
+    fn generic(section: Option<SettingsSection>) -> Self {
+        Self {
+            section,
+            message: INVALID_SETTINGS_MESSAGE,
+        }
+    }
+
+    fn in_section(mut self, section: SettingsSection) -> Self {
+        self.section = Some(section);
+        self
+    }
+}
+
+fn checkbox(form: &Form, name: &str, current: bool) -> Result<bool, FormError> {
+    let submitted = form.single(name).map_err(|()| FormError::generic(None))?;
+    if !matches!(submitted, None | Some("true" | "on")) {
+        return Err(FormError::generic(None));
+    }
+    let sentinel_name = format!("{name}_present");
+    let sentinel = form
+        .single(&sentinel_name)
+        .map_err(|()| FormError::generic(None))?;
+    let Some(sentinel) = sentinel else {
+        return Ok(current);
+    };
+    if sentinel != "true" {
+        return Err(FormError::generic(None));
+    }
+    match submitted {
+        Some("true" | "on") => Ok(true),
+        None => Ok(false),
+        Some(_) => unreachable!("unexpected checkbox values were rejected above"),
+    }
+}
+
+fn optional_i32(form: &Form, name: &str) -> Result<Option<i32>, FormError> {
+    let value = form.single(name).map_err(|()| FormError::generic(None))?;
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    value
         .parse()
-        .map_err(|_| ())?;
-    let longitude = form
-        .single("longitude")?
-        .ok_or(())?
-        .parse()
-        .map_err(|_| ())?;
-    let label = form.single("label")?.unwrap_or("").to_owned();
+        .map(Some)
+        .map_err(|_| FormError::generic(None))
+}
+
+fn parse_temperature_unit(value: &str) -> Result<TemperatureUnit, FormError> {
+    match value {
+        "celsius" => Ok(TemperatureUnit::Celsius),
+        "fahrenheit" => Ok(TemperatureUnit::Fahrenheit),
+        _ => Err(FormError::generic(None)),
+    }
+}
+
+fn parse_time_zone(value: &str) -> Result<TimeZone, FormError> {
+    match value {
+        "radar_local" => Ok(TimeZone::RadarLocal),
+        "zulu" => Ok(TimeZone::Zulu),
+        _ => Err(FormError::generic(None)),
+    }
+}
+
+fn parse_clock_format(value: &str) -> Result<ClockFormat, FormError> {
+    match value {
+        "twelve" => Ok(ClockFormat::Twelve),
+        "twenty_four" => Ok(ClockFormat::TwentyFour),
+        _ => Err(FormError::generic(None)),
+    }
+}
+
+fn candidate_from_form(current: &RadarSettings, form: &Form) -> Result<RadarSettings, FormError> {
+    const KNOWN_FIELDS: &[&str] = &[
+        "csrf_token",
+        "latitude",
+        "longitude",
+        "label",
+        "units",
+        "range_index",
+        "show_runways_present",
+        "show_runways",
+        "show_callsign_present",
+        "show_callsign",
+        "show_route_present",
+        "show_route",
+        "show_expanded_model_present",
+        "show_expanded_model",
+        "radar_text_scale_percent",
+        "footer_show_condition_present",
+        "footer_show_condition",
+        "footer_show_temperature_present",
+        "footer_show_temperature",
+        "footer_show_humidity_present",
+        "footer_show_humidity",
+        "footer_show_time_present",
+        "footer_show_time",
+        "footer_show_date_present",
+        "footer_show_date",
+        "temperature_unit",
+        "time_zone",
+        "clock_format",
+        "minimum_altitude_feet",
+        "maximum_altitude_feet",
+    ];
     let mut candidate = current.clone();
     candidate.schema_version = SETTINGS_SCHEMA_VERSION;
+
+    if form
+        .fields
+        .iter()
+        .any(|(name, _)| !KNOWN_FIELDS.contains(&name.as_str()))
+    {
+        return Err(FormError::generic(None));
+    }
+
+    let latitude = form
+        .single("latitude")
+        .map_err(|()| FormError::generic(None))?
+        .ok_or_else(|| FormError::generic(None))?
+        .parse()
+        .map_err(|_| FormError::generic(None))?;
+    let longitude = form
+        .single("longitude")
+        .map_err(|()| FormError::generic(None))?
+        .ok_or_else(|| FormError::generic(None))?
+        .parse()
+        .map_err(|_| FormError::generic(None))?;
+    let label = form
+        .single("label")
+        .map_err(|()| FormError::generic(None))?
+        .unwrap_or("")
+        .to_owned();
     candidate.location = Some(Location {
         latitude,
         longitude,
         label,
     });
 
-    if let Some(units) = form.single("units")? {
+    if let Some(units) = form
+        .single("units")
+        .map_err(|()| FormError::generic(None))?
+    {
         candidate.units = match units {
             "km" => Units::Kilometres,
             "mi" => Units::Miles,
-            _ => return Err(()),
+            _ => return Err(FormError::generic(None)),
         };
     }
-    if let Some(range_index) = form.single("range_index")? {
-        candidate.range_index = range_index.parse().map_err(|_| ())?;
+    if let Some(range_index) = form
+        .single("range_index")
+        .map_err(|()| FormError::generic(None))?
+    {
+        candidate.range_index = range_index.parse().map_err(|_| FormError::generic(None))?;
     }
-    if form.single("show_runways_present")?.is_some() {
-        candidate.show_runways = match form.single("show_runways")? {
+    candidate.show_runways = if form
+        .fields
+        .iter()
+        .any(|(name, _)| name == "show_runways_present")
+    {
+        checkbox(form, "show_runways", candidate.show_runways)?
+    } else {
+        match form
+            .single("show_runways")
+            .map_err(|()| FormError::generic(None))?
+        {
             Some("true" | "on") => true,
-            None | Some("false") => false,
-            Some(_) => return Err(()),
-        };
-    } else if let Some(show_runways) = form.single("show_runways")? {
-        candidate.show_runways = match show_runways {
-            "true" | "on" => true,
-            "false" => false,
-            _ => return Err(()),
-        };
+            Some("false") => false,
+            None => candidate.show_runways,
+            Some(_) => return Err(FormError::generic(None)),
+        }
+    };
+    candidate.show_callsign = checkbox(form, "show_callsign", candidate.show_callsign)
+        .map_err(|error| error.in_section(SettingsSection::Aircraft))?;
+    candidate.show_route = checkbox(form, "show_route", candidate.show_route)
+        .map_err(|error| error.in_section(SettingsSection::Aircraft))?;
+    candidate.show_expanded_model =
+        checkbox(form, "show_expanded_model", candidate.show_expanded_model)
+            .map_err(|error| error.in_section(SettingsSection::Aircraft))?;
+
+    if let Some(scale) = form
+        .single("radar_text_scale_percent")
+        .map_err(|()| FormError::generic(None))?
+    {
+        candidate.radar_text_scale_percent = scale.parse().map_err(|_| FormError::generic(None))?;
+        if !matches!(
+            candidate.radar_text_scale_percent,
+            80 | 90 | 100 | 110 | 120 | 130
+        ) {
+            return Err(FormError::generic(None));
+        }
+    }
+
+    candidate.footer.show_condition = checkbox(
+        form,
+        "footer_show_condition",
+        candidate.footer.show_condition,
+    )
+    .map_err(|error| error.in_section(SettingsSection::Footer))?;
+    candidate.footer.show_temperature = checkbox(
+        form,
+        "footer_show_temperature",
+        candidate.footer.show_temperature,
+    )
+    .map_err(|error| error.in_section(SettingsSection::Footer))?;
+    candidate.footer.show_humidity =
+        checkbox(form, "footer_show_humidity", candidate.footer.show_humidity)
+            .map_err(|error| error.in_section(SettingsSection::Footer))?;
+    candidate.footer.show_time = checkbox(form, "footer_show_time", candidate.footer.show_time)
+        .map_err(|error| error.in_section(SettingsSection::Footer))?;
+    candidate.footer.show_date = checkbox(form, "footer_show_date", candidate.footer.show_date)
+        .map_err(|error| error.in_section(SettingsSection::Footer))?;
+
+    if let Some(value) = form
+        .single("temperature_unit")
+        .map_err(|()| FormError::generic(Some(SettingsSection::Footer)))?
+    {
+        candidate.footer.temperature_unit = parse_temperature_unit(value)
+            .map_err(|error| error.in_section(SettingsSection::Footer))?;
+    }
+    if let Some(value) = form
+        .single("time_zone")
+        .map_err(|()| FormError::generic(Some(SettingsSection::Footer)))?
+    {
+        candidate.footer.time_zone =
+            parse_time_zone(value).map_err(|error| error.in_section(SettingsSection::Footer))?;
+    }
+    if let Some(value) = form
+        .single("clock_format")
+        .map_err(|()| FormError::generic(Some(SettingsSection::Footer)))?
+    {
+        candidate.footer.clock_format =
+            parse_clock_format(value).map_err(|error| error.in_section(SettingsSection::Footer))?;
+    }
+
+    if form
+        .fields
+        .iter()
+        .any(|(name, _)| name == "minimum_altitude_feet")
+    {
+        candidate.minimum_altitude_feet = optional_i32(form, "minimum_altitude_feet")
+            .map_err(|error| error.in_section(SettingsSection::Traffic))?;
+    }
+    if form
+        .fields
+        .iter()
+        .any(|(name, _)| name == "maximum_altitude_feet")
+    {
+        candidate.maximum_altitude_feet = optional_i32(form, "maximum_altitude_feet")
+            .map_err(|error| error.in_section(SettingsSection::Traffic))?;
+    }
+    if candidate
+        .minimum_altitude_feet
+        .is_some_and(|altitude| !(-2000..=100_000).contains(&altitude))
+        || candidate
+            .maximum_altitude_feet
+            .is_some_and(|altitude| !(-2000..=100_000).contains(&altitude))
+    {
+        return Err(FormError::generic(Some(SettingsSection::Traffic)));
+    }
+    if matches!(
+        (
+            candidate.minimum_altitude_feet,
+            candidate.maximum_altitude_feet
+        ),
+        (Some(minimum), Some(maximum)) if minimum > maximum
+    ) {
+        return Err(FormError {
+            section: Some(SettingsSection::Traffic),
+            message: "Minimum altitude cannot exceed maximum altitude.",
+        });
     }
     Ok(candidate)
 }
@@ -650,7 +901,7 @@ enum SearchState<'a> {
 #[derive(Clone, Copy)]
 enum PageNotice {
     Saved,
-    InvalidSettings,
+    InvalidSettings(FormError),
     SaveFailed,
 }
 
@@ -660,7 +911,10 @@ fn render_notice(notice: Option<PageNotice>) -> String {
             r#"<p class="notice notice--success" role="status">Radar settings applied</p>"#
                 .to_owned()
         }
-        Some(PageNotice::InvalidSettings) => r#"<p class="notice notice--error" role="alert">Those settings could not be applied. Check the coordinates and try again.</p>"#.to_owned(),
+        Some(PageNotice::InvalidSettings(error)) => format!(
+            r#"<p class="notice notice--error" role="alert">{}</p>"#,
+            error.message
+        ),
         Some(PageNotice::SaveFailed) => r#"<p class="notice notice--error" role="alert">Plane Radar could not save those settings. Try again.</p>"#.to_owned(),
         None => String::new(),
     }
@@ -805,6 +1059,63 @@ fn render_page(
     } else {
         ""
     };
+    let checked = |value| if value { " checked" } else { "" };
+    let selected = |value| if value { " selected" } else { "" };
+    let error_section = match notice {
+        Some(PageNotice::InvalidSettings(error)) => error.section,
+        _ => None,
+    };
+    let aircraft_open = if settings.show_callsign != RadarSettings::default().show_callsign
+        || settings.show_route
+        || settings.show_expanded_model
+        || error_section == Some(SettingsSection::Aircraft)
+    {
+        " open"
+    } else {
+        ""
+    };
+    let footer_open = if settings.footer != Default::default()
+        || error_section == Some(SettingsSection::Footer)
+    {
+        " open"
+    } else {
+        ""
+    };
+    let traffic_open =
+        if settings.altitude_filter_active() || error_section == Some(SettingsSection::Traffic) {
+            " open"
+        } else {
+            ""
+        };
+    let show_callsign_checked = checked(settings.show_callsign);
+    let show_route_checked = checked(settings.show_route);
+    let show_expanded_model_checked = checked(settings.show_expanded_model);
+    let footer_condition_checked = checked(settings.footer.show_condition);
+    let footer_temperature_checked = checked(settings.footer.show_temperature);
+    let footer_humidity_checked = checked(settings.footer.show_humidity);
+    let footer_time_checked = checked(settings.footer.show_time);
+    let footer_date_checked = checked(settings.footer.show_date);
+    let celsius_checked = checked(settings.footer.temperature_unit == TemperatureUnit::Celsius);
+    let fahrenheit_checked =
+        checked(settings.footer.temperature_unit == TemperatureUnit::Fahrenheit);
+    let radar_local_checked = checked(settings.footer.time_zone == TimeZone::RadarLocal);
+    let zulu_checked = checked(settings.footer.time_zone == TimeZone::Zulu);
+    let twelve_checked = checked(settings.footer.clock_format == ClockFormat::Twelve);
+    let twenty_four_checked = checked(settings.footer.clock_format == ClockFormat::TwentyFour);
+    let minimum_altitude = settings
+        .minimum_altitude_feet
+        .map(|value| value.to_string())
+        .unwrap_or_default();
+    let maximum_altitude = settings
+        .maximum_altitude_feet
+        .map(|value| value.to_string())
+        .unwrap_or_default();
+    let scale_80_selected = selected(settings.radar_text_scale_percent == 80);
+    let scale_90_selected = selected(settings.radar_text_scale_percent == 90);
+    let scale_100_selected = selected(settings.radar_text_scale_percent == 100);
+    let scale_110_selected = selected(settings.radar_text_scale_percent == 110);
+    let scale_120_selected = selected(settings.radar_text_scale_percent == 120);
+    let scale_130_selected = selected(settings.radar_text_scale_percent == 130);
     let manual_open = if settings.location.is_none() {
         " open"
     } else {
@@ -874,25 +1185,25 @@ body {{
   line-height: 1.55;
 }}
 
-button, input, summary {{
+button, input, select, summary {{
   font: inherit;
 }}
 
-button, input[type="search"], input[type="number"], input[type="text"],
+button, select, input[type="search"], input[type="number"], input[type="text"],
 input:not([type]) {{
   min-height: 44px;
 }}
 
-button, a, input, summary {{
+button, a, input, select, summary {{
   -webkit-tap-highlight-color: transparent;
 }}
 
-button, input, summary, a {{
+button, input, select, summary, a {{
   transition: color 160ms var(--ease-out), background-color 160ms var(--ease-out),
     border-color 160ms var(--ease-out), transform 160ms var(--ease-out);
 }}
 
-button:focus-visible, input:focus-visible, summary:focus-visible, a:focus-visible {{
+button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-visible, a:focus-visible {{
   outline: 3px solid var(--focus);
   outline-offset: 3px;
 }}
@@ -1099,7 +1410,7 @@ h3 {{ font-size: 1rem; font-weight: 700; line-height: 1.25; }}
 
 label, legend {{ color: var(--text); font-size: 0.875rem; font-weight: 700; }}
 
-input[type="search"], input[type="number"], input:not([type]) {{
+input[type="search"], input[type="number"], input:not([type]), select {{
   width: 100%;
   min-width: 0;
   border: 1px solid var(--border-strong);
@@ -1110,7 +1421,7 @@ input[type="search"], input[type="number"], input:not([type]) {{
 }}
 
 input::placeholder {{ color: var(--text-faint); opacity: 1; }}
-input:hover {{ border-color: var(--text-muted); }}
+input:hover, select:hover {{ border-color: var(--text-muted); }}
 
 .location > form button {{ margin-top: var(--space-xs); }}
 
@@ -1180,7 +1491,7 @@ input:hover {{ border-color: var(--text-muted); }}
 
 .field {{ display: grid; gap: var(--space-sm); min-width: 0; }}
 .field label span {{ color: var(--text-faint); font-weight: 500; }}
-.field input {{ font-variant-numeric: tabular-nums; }}
+.field input, .field select {{ font-variant-numeric: tabular-nums; }}
 
 .preferences {{
   grid-area: preferences;
@@ -1241,6 +1552,7 @@ fieldset > p {{ margin-top: calc(var(--space-sm) * -1); }}
 }}
 
 .switch {{
+  min-height: 44px;
   display: grid;
   grid-template-columns: auto minmax(0, 1fr);
   gap: var(--space-md);
@@ -1279,6 +1591,47 @@ fieldset > p {{ margin-top: calc(var(--space-sm) * -1); }}
 .switch-copy strong {{ font-size: 0.875rem; }}
 .switch-copy small {{ color: var(--text-muted); font-size: 0.8125rem; font-weight: 400; line-height: 1.45; }}
 
+.option-groups {{
+  display: grid;
+  gap: 0;
+  border-top: 1px solid var(--border);
+}}
+
+.option-group {{
+  min-width: 0;
+  border-bottom: 1px solid var(--border);
+}}
+
+.option-group summary {{
+  min-height: 44px;
+  padding: var(--space-md) 0;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 0.9375rem;
+  font-weight: 750;
+  overflow-wrap: anywhere;
+}}
+
+.option-group[open] summary {{ color: var(--text); }}
+
+.option-content {{
+  display: grid;
+  gap: var(--space-lg);
+  min-width: 0;
+  padding: var(--space-sm) 0 var(--space-xl);
+}}
+
+.disclosure-copy {{
+  color: var(--text-muted);
+  font-size: 0.8125rem;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}}
+
+.paired-fields {{ display: grid; gap: var(--space-lg); min-width: 0; }}
+.compact-fieldset {{ gap: var(--space-sm); }}
+.compact-fieldset legend {{ margin-bottom: var(--space-sm); }}
+
 .button-primary {{
   border-color: var(--accent);
   background: var(--accent);
@@ -1289,7 +1642,7 @@ fieldset > p {{ margin-top: calc(var(--space-sm) * -1); }}
   button:hover {{ border-color: var(--text-muted); background: var(--surface-active); }}
   .button-primary:hover {{ border-color: var(--accent-hover); background: var(--accent-hover); }}
   a:hover {{ color: var(--accent-hover); }}
-  .manual summary:hover {{ color: var(--accent); }}
+  .manual summary:hover, .option-group summary:hover {{ color: var(--accent); }}
 }}
 
 @media (min-width: 34rem) {{
@@ -1299,6 +1652,7 @@ fieldset > p {{ margin-top: calc(var(--space-sm) * -1); }}
   .search-result {{ grid-template-columns: minmax(0, 1fr) auto; align-items: center; }}
   .search-result button {{ width: auto; }}
   .manual-fields {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
+  .paired-fields {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
   .field--wide {{ grid-column: 1 / -1; }}
   .segmented--range {{ grid-template-columns: repeat(4, minmax(0, 1fr)); }}
 }}
@@ -1387,12 +1741,120 @@ fieldset > p {{ margin-top: calc(var(--space-sm) * -1); }}
 <p>Distance shown at the third radar ring.</p>
 <div class="segmented segmented--range">{range_options}</div>
 </fieldset>
+<label class="field" for="radar-text-size">
+Radar text size
+<select id="radar-text-size" name="radar_text_scale_percent">
+<option value="80"{scale_80_selected}>80% — Small</option>
+<option value="90"{scale_90_selected}>90%</option>
+<option value="100"{scale_100_selected}>100% — Current</option>
+<option value="110"{scale_110_selected}>110%</option>
+<option value="120"{scale_120_selected}>120%</option>
+<option value="130"{scale_130_selected}>130% — Large</option>
+</select>
+</label>
 <input type="hidden" name="show_runways_present" value="true">
 <label class="switch">
 <input type="checkbox" name="show_runways" value="true"{runways_checked}>
 <span class="switch-track" aria-hidden="true"></span>
 <span class="switch-copy"><strong>Show runways</strong><small>Include nearby airport runways on the radar.</small></span>
 </label>
+<div class="option-groups">
+<details class="option-group" data-section="aircraft"{aircraft_open}>
+<summary>Aircraft labels</summary>
+<div class="option-content">
+<p class="disclosure-copy">Route lookups send the flight callsign to ADSBDB. Expanded model lookups send the aircraft identifier. Enabling both may combine them in one request.</p>
+<input type="hidden" name="show_callsign_present" value="true">
+<label class="switch">
+<input type="checkbox" name="show_callsign" value="true"{show_callsign_checked}>
+<span class="switch-track" aria-hidden="true"></span>
+<span class="switch-copy"><strong>Show callsign</strong><small>Use the flight callsign when one is available.</small></span>
+</label>
+<input type="hidden" name="show_route_present" value="true">
+<label class="switch">
+<input type="checkbox" name="show_route" value="true"{show_route_checked}>
+<span class="switch-track" aria-hidden="true"></span>
+<span class="switch-copy"><strong>Show origin and destination</strong><small>Add the flight route below the callsign.</small></span>
+</label>
+<input type="hidden" name="show_expanded_model_present" value="true">
+<label class="switch">
+<input type="checkbox" name="show_expanded_model" value="true"{show_expanded_model_checked}>
+<span class="switch-track" aria-hidden="true"></span>
+<span class="switch-copy"><strong>Show expanded aircraft model</strong><small>Use a longer aircraft model name when available.</small></span>
+</label>
+</div>
+</details>
+<details class="option-group" data-section="footer"{footer_open}>
+<summary>Footer</summary>
+<div class="option-content">
+<p class="disclosure-copy">Weather fields and radar-local time send the configured radar coordinates to Open-Meteo. When only Zulu time or date is enabled, no weather request is made.</p>
+<input type="hidden" name="footer_show_condition_present" value="true">
+<label class="switch">
+<input type="checkbox" name="footer_show_condition" value="true"{footer_condition_checked}>
+<span class="switch-track" aria-hidden="true"></span>
+<span class="switch-copy"><strong>Weather condition</strong><small>Show the current conditions.</small></span>
+</label>
+<input type="hidden" name="footer_show_temperature_present" value="true">
+<label class="switch">
+<input type="checkbox" name="footer_show_temperature" value="true"{footer_temperature_checked}>
+<span class="switch-track" aria-hidden="true"></span>
+<span class="switch-copy"><strong>Temperature</strong><small>Show the current temperature.</small></span>
+</label>
+<input type="hidden" name="footer_show_humidity_present" value="true">
+<label class="switch">
+<input type="checkbox" name="footer_show_humidity" value="true"{footer_humidity_checked}>
+<span class="switch-track" aria-hidden="true"></span>
+<span class="switch-copy"><strong>Humidity</strong><small>Show the current relative humidity.</small></span>
+</label>
+<input type="hidden" name="footer_show_time_present" value="true">
+<label class="switch">
+<input type="checkbox" name="footer_show_time" value="true"{footer_time_checked}>
+<span class="switch-track" aria-hidden="true"></span>
+<span class="switch-copy"><strong>Time</strong><small>Show the time in the footer.</small></span>
+</label>
+<input type="hidden" name="footer_show_date_present" value="true">
+<label class="switch">
+<input type="checkbox" name="footer_show_date" value="true"{footer_date_checked}>
+<span class="switch-track" aria-hidden="true"></span>
+<span class="switch-copy"><strong>Date</strong><small>Show the date in the footer.</small></span>
+</label>
+<fieldset class="compact-fieldset">
+<legend>Temperature unit</legend>
+<div class="segmented segmented--units">
+<label class="segment"><input type="radio" name="temperature_unit" value="celsius"{celsius_checked}><span>Celsius</span></label>
+<label class="segment"><input type="radio" name="temperature_unit" value="fahrenheit"{fahrenheit_checked}><span>Fahrenheit</span></label>
+</div>
+</fieldset>
+<fieldset class="compact-fieldset">
+<legend>Time zone</legend>
+<div class="segmented segmented--units">
+<label class="segment"><input type="radio" name="time_zone" value="radar_local"{radar_local_checked}><span>Radar location</span></label>
+<label class="segment"><input type="radio" name="time_zone" value="zulu"{zulu_checked}><span>Zulu</span></label>
+</div>
+</fieldset>
+<fieldset class="compact-fieldset">
+<legend>Clock format</legend>
+<div class="segmented segmented--units">
+<label class="segment"><input type="radio" name="clock_format" value="twelve"{twelve_checked}><span>12-hour</span></label>
+<label class="segment"><input type="radio" name="clock_format" value="twenty_four"{twenty_four_checked}><span>24-hour</span></label>
+</div>
+</fieldset>
+</div>
+</details>
+<details class="option-group" data-section="traffic"{traffic_open}>
+<summary>Traffic filter</summary>
+<div class="option-content">
+<p class="disclosure-copy">Limit the radar to aircraft within an altitude range. Leave either value blank for no limit.</p>
+<div class="paired-fields">
+<label class="field" for="minimum-altitude">Minimum altitude <span>(feet)</span>
+<input id="minimum-altitude" name="minimum_altitude_feet" value="{minimum_altitude}" inputmode="numeric" type="number" min="-2000" max="100000" step="1">
+</label>
+<label class="field" for="maximum-altitude">Maximum altitude <span>(feet)</span>
+<input id="maximum-altitude" name="maximum_altitude_feet" value="{maximum_altitude}" inputmode="numeric" type="number" min="-2000" max="100000" step="1">
+</label>
+</div>
+</div>
+</details>
+</div>
 <button class="button-primary" type="submit">Apply settings</button>
 </section>
 </form>

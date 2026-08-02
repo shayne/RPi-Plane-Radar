@@ -7,7 +7,10 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use planeradar::geocode::{GeocodeError, GeocodeResult, GeocodeService};
-use planeradar::model::{AppState, Location, RadarSettings, Units};
+use planeradar::model::{
+    AppState, ClockFormat, FooterSettings, Location, RadarSettings, TemperatureUnit, TimeZone,
+    Units,
+};
 use planeradar::web::{HealthSnapshot, HealthSource, SettingsServer, SettingsService, WebError};
 
 const SESSION_COOKIE: &str = "planeradar_session";
@@ -428,6 +431,36 @@ fn configured_settings() -> RadarSettings {
     }
 }
 
+fn optional_settings_enabled() -> RadarSettings {
+    RadarSettings {
+        location: Some(Location {
+            latitude: 51.5072,
+            longitude: -0.1276,
+            label: "Old location".to_owned(),
+        }),
+        units: Units::Miles,
+        show_runways: true,
+        range_index: 3,
+        show_callsign: true,
+        show_route: true,
+        show_expanded_model: true,
+        radar_text_scale_percent: 130,
+        minimum_altitude_feet: Some(1_000),
+        maximum_altitude_feet: Some(45_000),
+        footer: FooterSettings {
+            show_condition: true,
+            show_temperature: true,
+            show_humidity: true,
+            show_time: true,
+            show_date: true,
+            temperature_unit: TemperatureUnit::Fahrenheit,
+            time_zone: TimeZone::Zulu,
+            clock_format: ClockFormat::Twelve,
+        },
+        ..RadarSettings::default()
+    }
+}
+
 fn geocode_result(display_name: &str) -> GeocodeResult {
     GeocodeResult {
         display_name: display_name.to_owned(),
@@ -521,6 +554,62 @@ fn unconfigured_page_prioritizes_setup_and_exposes_semantic_controls() {
         "Apply settings",
     ] {
         assert!(response.body.contains(expected), "missing {expected:?}");
+    }
+}
+
+#[test]
+fn optional_settings_page_exposes_semantic_progressive_disclosure_controls() {
+    let response = TestServer::new(RadarSettings::default(), Vec::new()).get("/");
+
+    assert_eq!(response.status, 200);
+    for expected in [
+        "Aircraft labels",
+        "Show callsign",
+        "Show origin and destination",
+        "Show expanded aircraft model",
+        "Footer",
+        "Weather condition",
+        "Temperature",
+        "Humidity",
+        "Time",
+        "Date",
+        "Radar location",
+        "Zulu",
+        "12-hour",
+        "24-hour",
+        "Traffic filter",
+        "Minimum altitude",
+        "Maximum altitude",
+        "ADSBDB",
+        "Open-Meteo",
+    ] {
+        assert!(response.body.contains(expected), "missing {expected:?}");
+    }
+    assert!(!response.body.contains("<script"));
+    assert!(response.body.contains(".switch {\n  min-height: 44px;"));
+    for section in ["aircraft", "footer", "traffic"] {
+        assert!(
+            response.body.contains(&format!(
+                "<details class=\"option-group\" data-section=\"{section}\""
+            )),
+            "missing {section:?} disclosure"
+        );
+        assert!(
+            !response
+                .body
+                .contains(&format!("data-section=\"{section}\" open")),
+            "default {section:?} disclosure should start collapsed"
+        );
+    }
+
+    let configured = TestServer::new(optional_settings_enabled(), Vec::new()).get("/");
+    for section in ["aircraft", "footer", "traffic"] {
+        assert!(
+            configured
+                .body
+                .contains(&format!("data-section=\"{section}\" open")),
+            "non-default {section:?} disclosure should start open"
+        );
     }
 }
 
@@ -1137,6 +1226,258 @@ fn settings_accept_a_selected_search_result_and_preserve_preferences() {
     assert_eq!(stored.show_runways, initial.show_runways);
     assert_eq!(stored.range_index, initial.range_index);
     assert_eq!(server.settings.replacement_count(), 1);
+}
+
+#[test]
+fn optional_settings_search_result_selection_preserves_every_preference() {
+    let initial = optional_settings_enabled();
+    let selected = geocode_result("New York & nearby");
+    let server = TestServer::new(initial.clone(), vec![selected.clone()]);
+    let session = server.session();
+    let search = server.post_form(
+        "/search",
+        &[("query", "New York")],
+        &session,
+        Some(&server.current_ip_origin()),
+        None,
+    );
+    assert_eq!(search.status, 200);
+    assert!(search.body.contains("New York &amp; nearby"));
+
+    let response = server.post_form(
+        "/settings",
+        &[
+            ("latitude", "40.7128"),
+            ("longitude", "-74.006"),
+            ("label", "New York & nearby"),
+        ],
+        &session,
+        Some(&server.current_ip_origin()),
+        None,
+    );
+
+    assert_eq!(response.status, 303);
+    let mut expected = initial;
+    expected.location = Some(selected.location);
+    assert_eq!(server.settings.current(), expected);
+    assert_eq!(server.settings.replacement_count(), 1);
+}
+
+#[test]
+fn optional_settings_fully_enabled_form_round_trips_every_field() {
+    let server = TestServer::new(RadarSettings::default(), Vec::new());
+    let session = server.session();
+
+    let response = server.post_form(
+        "/settings",
+        &[
+            ("latitude", "40.7128"),
+            ("longitude", "-74.006"),
+            ("label", "New York, NY"),
+            ("units", "mi"),
+            ("range_index", "3"),
+            ("show_runways_present", "true"),
+            ("show_runways", "true"),
+            ("show_callsign_present", "true"),
+            ("show_callsign", "true"),
+            ("show_route_present", "true"),
+            ("show_route", "true"),
+            ("show_expanded_model_present", "true"),
+            ("show_expanded_model", "true"),
+            ("radar_text_scale_percent", "130"),
+            ("footer_show_condition_present", "true"),
+            ("footer_show_condition", "true"),
+            ("footer_show_temperature_present", "true"),
+            ("footer_show_temperature", "true"),
+            ("footer_show_humidity_present", "true"),
+            ("footer_show_humidity", "true"),
+            ("footer_show_time_present", "true"),
+            ("footer_show_time", "true"),
+            ("footer_show_date_present", "true"),
+            ("footer_show_date", "true"),
+            ("temperature_unit", "fahrenheit"),
+            ("time_zone", "zulu"),
+            ("clock_format", "twelve"),
+            ("minimum_altitude_feet", "1000"),
+            ("maximum_altitude_feet", "45000"),
+        ],
+        &session,
+        Some(&server.current_ip_origin()),
+        None,
+    );
+
+    assert_eq!(response.status, 303);
+    assert_eq!(
+        server.settings.current(),
+        RadarSettings {
+            location: Some(Location {
+                latitude: 40.7128,
+                longitude: -74.006,
+                label: "New York, NY".to_owned(),
+            }),
+            ..optional_settings_enabled()
+        }
+    );
+    assert_eq!(server.settings.replacement_count(), 1);
+}
+
+#[test]
+fn optional_settings_presence_sentinels_save_every_unchecked_switch_as_false() {
+    let initial = optional_settings_enabled();
+    let server = TestServer::new(initial.clone(), Vec::new());
+    let session = server.session();
+
+    let response = server.post_form(
+        "/settings",
+        &[
+            ("latitude", "51.5072"),
+            ("longitude", "-0.1276"),
+            ("show_runways_present", "true"),
+            ("show_callsign_present", "true"),
+            ("show_route_present", "true"),
+            ("show_expanded_model_present", "true"),
+            ("footer_show_condition_present", "true"),
+            ("footer_show_temperature_present", "true"),
+            ("footer_show_humidity_present", "true"),
+            ("footer_show_time_present", "true"),
+            ("footer_show_date_present", "true"),
+        ],
+        &session,
+        Some(&server.current_ip_origin()),
+        None,
+    );
+
+    assert_eq!(response.status, 303);
+    let stored = server.settings.current();
+    assert!(!stored.show_runways);
+    assert!(!stored.show_callsign);
+    assert!(!stored.show_route);
+    assert!(!stored.show_expanded_model);
+    assert!(!stored.footer.show_condition);
+    assert!(!stored.footer.show_temperature);
+    assert!(!stored.footer.show_humidity);
+    assert!(!stored.footer.show_time);
+    assert!(!stored.footer.show_date);
+    assert_eq!(
+        stored.radar_text_scale_percent,
+        initial.radar_text_scale_percent
+    );
+    assert_eq!(stored.minimum_altitude_feet, initial.minimum_altitude_feet);
+    assert_eq!(stored.maximum_altitude_feet, initial.maximum_altitude_feet);
+    assert_eq!(server.settings.replacement_count(), 1);
+}
+
+#[test]
+fn optional_settings_invalid_duplicate_and_unknown_values_are_atomic() {
+    let cases: &[(&str, &[(&str, &str)], Option<&str>)] = &[
+        (
+            "duplicate checkbox",
+            &[
+                ("show_route_present", "true"),
+                ("show_route", "true"),
+                ("show_route", "on"),
+            ],
+            Some("aircraft"),
+        ),
+        (
+            "unknown checkbox value",
+            &[("show_route_present", "true"), ("show_route", "sometimes")],
+            Some("aircraft"),
+        ),
+        (
+            "unknown checkbox value without sentinel",
+            &[("show_route", "sometimes")],
+            Some("aircraft"),
+        ),
+        (
+            "invalid enum",
+            &[("temperature_unit", "kelvin")],
+            Some("footer"),
+        ),
+        (
+            "invalid scale",
+            &[("radar_text_scale_percent", "105")],
+            None,
+        ),
+        (
+            "out-of-range altitude",
+            &[("minimum_altitude_feet", "-2001")],
+            Some("traffic"),
+        ),
+        ("unknown field", &[("mystery_preference", "true")], None),
+    ];
+
+    for (name, extra, section) in cases {
+        let initial = configured_settings();
+        let server = TestServer::new(initial.clone(), Vec::new());
+        let session = server.session();
+        let mut fields = vec![("latitude", "40.7"), ("longitude", "-74.0")];
+        fields.extend_from_slice(extra);
+
+        let response = server.post_form(
+            "/settings",
+            &fields,
+            &session,
+            Some(&server.current_ip_origin()),
+            None,
+        );
+
+        assert_eq!(response.status, 400, "accepted {name}");
+        assert!(
+            response.body.contains(
+                "Those settings could not be applied. Check the coordinates and try again."
+            ),
+            "lost generic guidance for {name}"
+        );
+        if let Some(section) = section {
+            assert!(
+                response
+                    .body
+                    .contains(&format!("data-section=\"{section}\" open")),
+                "did not open {section} for {name}"
+            );
+        }
+        assert_eq!(
+            server.settings.current(),
+            initial,
+            "changed settings for {name}"
+        );
+        assert_eq!(
+            server.settings.replacement_count(),
+            0,
+            "replaced for {name}"
+        );
+    }
+}
+
+#[test]
+fn optional_settings_crossed_altitude_bounds_show_specific_traffic_error_atomically() {
+    let initial = configured_settings();
+    let server = TestServer::new(initial.clone(), Vec::new());
+    let session = server.session();
+
+    let response = server.post_form(
+        "/settings",
+        &[
+            ("latitude", "40.7"),
+            ("longitude", "-74.0"),
+            ("minimum_altitude_feet", "45001"),
+            ("maximum_altitude_feet", "45000"),
+        ],
+        &session,
+        Some(&server.current_ip_origin()),
+        None,
+    );
+
+    assert_eq!(response.status, 400);
+    assert!(
+        response
+            .body
+            .contains("Minimum altitude cannot exceed maximum altitude.")
+    );
+    assert!(response.body.contains("data-section=\"traffic\" open"));
+    assert_eq!(server.settings.current(), initial);
+    assert_eq!(server.settings.replacement_count(), 0);
 }
 
 #[test]
