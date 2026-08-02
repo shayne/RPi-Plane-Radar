@@ -18,6 +18,7 @@ const LOCAL_HOST: &str = "hangar-2.local";
 struct TestSettings {
     current: Arc<Mutex<RadarSettings>>,
     replacements: Arc<Mutex<Vec<RadarSettings>>>,
+    fail_replacements: bool,
 }
 
 impl TestSettings {
@@ -25,6 +26,15 @@ impl TestSettings {
         Self {
             current: Arc::new(Mutex::new(current)),
             replacements: Arc::new(Mutex::new(Vec::new())),
+            fail_replacements: false,
+        }
+    }
+
+    fn failing(current: RadarSettings) -> Self {
+        Self {
+            current: Arc::new(Mutex::new(current)),
+            replacements: Arc::new(Mutex::new(Vec::new())),
+            fail_replacements: true,
         }
     }
 
@@ -39,6 +49,9 @@ impl SettingsService for TestSettings {
     }
 
     fn replace(&self, candidate: RadarSettings) -> Result<(), WebError> {
+        if self.fail_replacements {
+            return Err(WebError::Settings);
+        }
         self.replacements.lock().unwrap().push(candidate.clone());
         *self.current.lock().unwrap() = candidate;
         Ok(())
@@ -120,24 +133,32 @@ impl TestServer {
             results,
             queries: queries.clone(),
         });
-        Self::start(initial, geocoder, queries)
+        Self::start(TestSettings::new(initial), geocoder, queries)
     }
 
     fn with_failing_geocoder(initial: RadarSettings) -> Self {
         Self::start(
-            initial,
+            TestSettings::new(initial),
             Box::new(FailingGeocoder),
             Arc::new(Mutex::new(Vec::new())),
         )
     }
 
+    fn with_failing_settings(initial: RadarSettings) -> Self {
+        let queries = Arc::new(Mutex::new(Vec::new()));
+        let geocoder: Box<dyn GeocodeService> = Box::new(TestGeocoder {
+            results: Vec::new(),
+            queries: queries.clone(),
+        });
+        Self::start(TestSettings::failing(initial), geocoder, queries)
+    }
+
     fn start(
-        initial: RadarSettings,
+        settings: TestSettings,
         geocoder: Box<dyn GeocodeService>,
         queries: Arc<Mutex<Vec<String>>>,
     ) -> Self {
         let address = reserve_address();
-        let settings = TestSettings::new(initial);
         let allowed_address = address;
         let allowed_hosts = Arc::new(move || {
             HashSet::from([
@@ -940,7 +961,7 @@ fn failed_search_keeps_the_manual_settings_page_without_sensitive_error_text() {
     assert!(
         response
             .body
-            .contains("Search unavailable; enter coordinates manually")
+            .contains("Search unavailable. Enter coordinates manually.")
     );
     assert!(response.body.contains("action=\"/settings\""));
     assert!(
@@ -950,6 +971,102 @@ fn failed_search_keeps_the_manual_settings_page_without_sensitive_error_text() {
     );
     assert!(!response.body.contains(query));
     assert!(!response.body.contains("geocode query"));
+}
+
+#[test]
+fn empty_search_has_a_distinct_manual_fallback_state() {
+    let server = TestServer::new(configured_settings(), Vec::new());
+    let session = server.session();
+
+    let response = server.post_form(
+        "/search",
+        &[("query", "no match")],
+        &session,
+        Some(&server.current_ip_origin()),
+        None,
+    );
+
+    assert_eq!(response.status, 200);
+    assert!(response.body.contains("No matching places found"));
+    assert!(response.body.contains("Enter coordinates manually"));
+    assert!(!response.body.contains("Search unavailable"));
+}
+
+#[test]
+fn invalid_settings_return_the_page_with_safe_guidance() {
+    let server = TestServer::new(configured_settings(), Vec::new());
+    let session = server.session();
+
+    let response = server.post_form(
+        "/settings",
+        &[("latitude", "91"), ("longitude", "-74.0")],
+        &session,
+        Some(&server.current_ip_origin()),
+        None,
+    );
+
+    assert_eq!(response.status, 400);
+    assert_eq!(
+        response.header("content-type"),
+        Some("text/html; charset=utf-8")
+    );
+    assert!(
+        response
+            .body
+            .contains("Those settings could not be applied")
+    );
+    assert!(response.body.contains("Old location"));
+    assert!(!response.body.contains("latitude must be between"));
+}
+
+#[test]
+fn failed_settings_write_returns_safe_page() {
+    let server = TestServer::with_failing_settings(configured_settings());
+    let session = server.session();
+
+    let response = server.post_form(
+        "/settings",
+        &[("latitude", "40.7"), ("longitude", "-74.0")],
+        &session,
+        Some(&server.current_ip_origin()),
+        None,
+    );
+
+    assert_eq!(response.status, 500);
+    assert_eq!(
+        response.header("content-type"),
+        Some("text/html; charset=utf-8")
+    );
+    assert!(
+        response
+            .body
+            .contains("Plane Radar could not save those settings")
+    );
+    assert!(response.body.contains("Old location"));
+    assert!(!response.body.contains("LAN settings service failed"));
+    assert_eq!(server.settings.replacement_count(), 0);
+}
+
+#[test]
+fn successful_settings_redirect_to_a_fixed_confirmation_page() {
+    let server = TestServer::new(RadarSettings::default(), Vec::new());
+    let session = server.session();
+
+    let response = server.post_form(
+        "/settings",
+        &[("latitude", "40.7"), ("longitude", "-74.0")],
+        &session,
+        Some(&server.current_ip_origin()),
+        None,
+    );
+
+    assert_eq!(response.status, 303);
+    assert_eq!(response.header("location"), Some("/?saved=1"));
+
+    let confirmed = server.get("/?saved=1");
+    assert_eq!(confirmed.status, 200);
+    assert!(confirmed.body.contains("Radar settings applied"));
+    assert!(confirmed.body.contains("role=\"status\""));
 }
 
 #[test]
@@ -998,7 +1115,7 @@ fn settings_accept_a_selected_search_result_and_preserve_preferences() {
     );
 
     assert_eq!(response.status, 303);
-    assert_eq!(response.header("location"), Some("/"));
+    assert_eq!(response.header("location"), Some("/?saved=1"));
     let stored = server.settings.current();
     assert_eq!(stored.location, Some(selected.location));
     assert_eq!(stored.units, initial.units);

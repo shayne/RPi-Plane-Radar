@@ -129,7 +129,8 @@ impl ServerState {
 
     fn route(&self, request: &mut Request) -> Result<Outgoing, WebError> {
         let route = match (request.method(), request.url()) {
-            (&Method::Get, "/") => Route::Page,
+            (&Method::Get, "/") => Route::Page { saved: false },
+            (&Method::Get, "/?saved=1") => Route::Page { saved: true },
             (&Method::Get, "/healthz") => Route::Health,
             (&Method::Post, "/search") => Route::Search,
             (&Method::Post, "/settings") => Route::Settings,
@@ -141,19 +142,20 @@ impl ServerState {
         };
 
         match route {
-            Route::Page => self.page(),
+            Route::Page { saved } => self.page(saved),
             Route::Health => self.health(),
             Route::Search | Route::Settings => self.mutation(request, request_host, route),
         }
     }
 
-    fn page(&self) -> Result<Outgoing, WebError> {
+    fn page(&self, saved: bool) -> Result<Outgoing, WebError> {
         let (session_id, csrf_token) = self.sessions.lock().map_err(|_| WebError::State)?.create();
         let body = render_page(
             &self.settings.current(),
             &self.local_url,
             &csrf_token,
             SearchState::Idle,
+            saved.then_some(PageNotice::Saved),
         );
         Ok(Outgoing::html(200, body)
             .with_header(
@@ -212,8 +214,8 @@ impl ServerState {
 
         match route {
             Route::Search => self.search(form, &submitted_csrf),
-            Route::Settings => self.replace_settings(form),
-            Route::Page | Route::Health => unreachable!("mutation routes are POST-only"),
+            Route::Settings => self.replace_settings(form, &submitted_csrf),
+            Route::Page { .. } | Route::Health => unreachable!("mutation routes are POST-only"),
         }
     }
 
@@ -234,34 +236,67 @@ impl ServerState {
                     &self.local_url,
                     csrf_token,
                     SearchState::Unavailable,
+                    None,
                 );
                 return Ok(Outgoing::html(200, body).with_header("Cache-Control", "no-store"));
             }
+        };
+        let search = if results.is_empty() {
+            SearchState::Empty
+        } else {
+            SearchState::Results(&results)
         };
         let body = render_page(
             &self.settings.current(),
             &self.local_url,
             csrf_token,
-            SearchState::Results(&results),
+            search,
+            None,
         );
         Ok(Outgoing::html(200, body).with_header("Cache-Control", "no-store"))
     }
 
-    fn replace_settings(&self, form: Form) -> Result<Outgoing, WebError> {
-        let candidate = match candidate_from_form(&self.settings.current(), &form) {
+    fn replace_settings(&self, form: Form, csrf_token: &str) -> Result<Outgoing, WebError> {
+        let current = self.settings.current();
+        let candidate = match candidate_from_form(&current, &form) {
             Ok(candidate) => candidate,
-            Err(()) => return Ok(Outgoing::text(400, "Invalid settings")),
+            Err(()) => {
+                let body = render_page(
+                    &current,
+                    &self.local_url,
+                    csrf_token,
+                    SearchState::Idle,
+                    Some(PageNotice::InvalidSettings),
+                );
+                return Ok(Outgoing::html(400, body).with_header("Cache-Control", "no-store"));
+            }
         };
         let value = serde_json::to_value(candidate)?;
         let validated = match validate_settings(value) {
             Ok(validated) => validated,
-            Err(_) => return Ok(Outgoing::text(400, "Invalid settings")),
+            Err(_) => {
+                let body = render_page(
+                    &current,
+                    &self.local_url,
+                    csrf_token,
+                    SearchState::Idle,
+                    Some(PageNotice::InvalidSettings),
+                );
+                return Ok(Outgoing::html(400, body).with_header("Cache-Control", "no-store"));
+            }
         };
 
         if self.settings.replace(validated).is_err() {
-            return Ok(Outgoing::text(500, "Internal server error"));
+            let body = render_page(
+                &current,
+                &self.local_url,
+                csrf_token,
+                SearchState::Idle,
+                Some(PageNotice::SaveFailed),
+            );
+            return Ok(Outgoing::html(500, body).with_header("Cache-Control", "no-store"));
         }
-        Ok(Outgoing::text(303, "").with_header("Location", "/"))
+        Ok(Outgoing::text(303, "").with_header("Location", "/?saved=1"))
     }
 
     fn valid_request_host(&self, request: &Request) -> Option<Authority> {
@@ -327,7 +362,7 @@ impl Drop for RequestSlot {
 
 #[derive(Clone, Copy)]
 enum Route {
-    Page,
+    Page { saved: bool },
     Health,
     Search,
     Settings,
@@ -608,7 +643,27 @@ fn header_values<'a>(request: &'a Request, name: &'static str) -> Vec<&'a str> {
 enum SearchState<'a> {
     Idle,
     Results(&'a [GeocodeResult]),
+    Empty,
     Unavailable,
+}
+
+#[derive(Clone, Copy)]
+enum PageNotice {
+    Saved,
+    InvalidSettings,
+    SaveFailed,
+}
+
+fn render_notice(notice: Option<PageNotice>) -> String {
+    match notice {
+        Some(PageNotice::Saved) => {
+            r#"<p class="notice notice--success" role="status">Radar settings applied</p>"#
+                .to_owned()
+        }
+        Some(PageNotice::InvalidSettings) => r#"<p class="notice notice--error" role="alert">Those settings could not be applied. Check the coordinates and try again.</p>"#.to_owned(),
+        Some(PageNotice::SaveFailed) => r#"<p class="notice notice--error" role="alert">Plane Radar could not save those settings. Try again.</p>"#.to_owned(),
+        None => String::new(),
+    }
 }
 
 fn render_status(settings: &RadarSettings) -> String {
@@ -636,9 +691,10 @@ fn render_search_results(settings: &RadarSettings, csrf: &str, search: SearchSta
     let SearchState::Results(results) = search else {
         return match search {
             SearchState::Unavailable => {
-                r#"<p class="notice notice--error" role="alert">Search unavailable; enter coordinates manually</p>"#
+                r#"<p class="notice notice--error" role="alert">Search unavailable. Enter coordinates manually.</p>"#
                     .to_owned()
             }
+            SearchState::Empty => r#"<div class="empty-results"><strong>No matching places found</strong><span>Enter coordinates manually instead.</span></div>"#.to_owned(),
             SearchState::Idle | SearchState::Results(_) => String::new(),
         };
     };
@@ -728,6 +784,7 @@ fn render_page(
     local_url: &str,
     csrf_token: &str,
     search: SearchState<'_>,
+    notice: Option<PageNotice>,
 ) -> String {
     let (latitude, longitude, label) = settings
         .location
@@ -754,6 +811,7 @@ fn render_page(
         ""
     };
     let status = render_status(settings);
+    let notice = render_notice(notice);
     let search_results = render_search_results(settings, &csrf, search);
     let units = render_units(settings);
     let range_options = render_range_options(settings);
@@ -790,6 +848,7 @@ p, button {{ overflow-wrap: anywhere; }}
 <a href="{local_url}">{local_url}</a>
 </header>
 {status}
+{notice}
 <div class="console-grid">
 <section class="location" aria-labelledby="location-title">
 <h2 id="location-title">Radar location</h2>
