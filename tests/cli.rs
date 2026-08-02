@@ -27,7 +27,7 @@ fn radar_demo_requires_a_bounded_seconds_argument() {
 }
 
 #[test]
-fn render_fixtures_writes_all_five_pngs_only_to_the_explicit_output() {
+fn render_fixtures_writes_all_eight_pngs_only_to_the_explicit_output() {
     let output_directory = tempfile::tempdir().expect("temporary directory");
     let output = Command::new(env!("CARGO_BIN_EXE_planeradar"))
         .args([
@@ -58,6 +58,9 @@ fn render_fixtures_writes_all_five_pngs_only_to_the_explicit_output() {
         names,
         [
             "radar-empty.png",
+            "radar-enriched.png",
+            "radar-footer-large-stale.png",
+            "radar-footer.png",
             "radar-stale.png",
             "radar-traffic.png",
             "settings.png",
@@ -65,18 +68,24 @@ fn render_fixtures_writes_all_five_pngs_only_to_the_explicit_output() {
         ]
     );
 
-    for radar_name in ["radar-empty.png", "radar-stale.png", "radar-traffic.png"] {
-        let generated = std::fs::read(output_directory.path().join(radar_name))
-            .expect("generated radar fixture");
+    for legacy_name in [
+        "radar-empty.png",
+        "radar-stale.png",
+        "radar-traffic.png",
+        "settings.png",
+        "setup-required.png",
+    ] {
+        let generated = std::fs::read(output_directory.path().join(legacy_name))
+            .expect("generated legacy fixture");
         let committed = std::fs::read(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("tests/goldens")
-                .join(radar_name),
+                .join(legacy_name),
         )
-        .expect("committed radar golden");
+        .expect("committed legacy golden");
         assert_eq!(
             generated, committed,
-            "extending render-fixtures must not alter {radar_name}"
+            "extending render-fixtures must not alter {legacy_name}"
         );
     }
 }
