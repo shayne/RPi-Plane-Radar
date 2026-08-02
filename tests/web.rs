@@ -466,6 +466,44 @@ fn page_exposes_local_settings_without_wifi_or_browser_geolocation() {
 }
 
 #[test]
+fn unconfigured_page_prioritizes_setup_and_exposes_semantic_controls() {
+    let server = TestServer::new(RadarSettings::default(), Vec::new());
+
+    let response = server.get("/");
+
+    assert_eq!(response.status, 200);
+    for expected in [
+        "Local control",
+        "Setup required",
+        "Choose the radar's home location",
+        "<main",
+        "<fieldset",
+        "<legend>Units</legend>",
+        "<legend>Range</legend>",
+        "<details",
+        "Manual coordinates",
+        "Apply settings",
+    ] {
+        assert!(response.body.contains(expected), "missing {expected:?}");
+    }
+}
+
+#[test]
+fn range_choices_use_display_values_in_the_selected_units() {
+    let kilometres = TestServer::new(RadarSettings::default(), Vec::new()).get("/");
+    for label in ["5 km", "10 km", "15 km", "25 km"] {
+        assert!(kilometres.body.contains(label), "missing {label:?}");
+    }
+
+    let miles = TestServer::new(configured_settings(), Vec::new()).get("/");
+    for label in ["3 mi", "6 mi", "9 mi", "16 mi"] {
+        assert!(miles.body.contains(label), "missing {label:?}");
+    }
+    assert!(miles.body.contains("Radar configured"));
+    assert!(miles.body.contains("Old location"));
+}
+
+#[test]
 fn healthz_is_json_and_does_not_disclose_location_or_search_data() {
     let server = TestServer::new(configured_settings(), Vec::new());
 

@@ -14,6 +14,7 @@ use url::Url;
 
 use crate::geocode::{GeocodeResult, GeocodeService};
 use crate::model::{AppState, Location, RadarSettings, Units};
+use crate::range::{format_range_label, range_preset};
 use crate::settings::validate_settings;
 
 const MAX_FORM_BODY_BYTES: usize = 16 * 1024;
@@ -152,8 +153,7 @@ impl ServerState {
             &self.settings.current(),
             &self.local_url,
             &csrf_token,
-            &[],
-            None,
+            SearchState::Idle,
         );
         Ok(Outgoing::html(200, body)
             .with_header(
@@ -233,8 +233,7 @@ impl ServerState {
                     &self.settings.current(),
                     &self.local_url,
                     csrf_token,
-                    &[],
-                    Some("Search unavailable; enter coordinates manually"),
+                    SearchState::Unavailable,
                 );
                 return Ok(Outgoing::html(200, body).with_header("Cache-Control", "no-store"));
             }
@@ -243,8 +242,7 @@ impl ServerState {
             &self.settings.current(),
             &self.local_url,
             csrf_token,
-            &results,
-            None,
+            SearchState::Results(&results),
         );
         Ok(Outgoing::html(200, body).with_header("Cache-Control", "no-store"))
     }
@@ -607,12 +605,129 @@ fn header_values<'a>(request: &'a Request, name: &'static str) -> Vec<&'a str> {
         .collect()
 }
 
+enum SearchState<'a> {
+    Idle,
+    Results(&'a [GeocodeResult]),
+    Unavailable,
+}
+
+fn render_status(settings: &RadarSettings) -> String {
+    let Some(location) = &settings.location else {
+        return r#"<div class="radar-status radar-status--setup" role="status">
+<span class="status-mark" aria-hidden="true"></span>
+<div><strong>Setup required</strong><span>Choose the radar's home location</span></div>
+</div>"#
+            .to_owned();
+    };
+    let location_name = if location.label.trim().is_empty() {
+        format!("{:.4}, {:.4}", location.latitude, location.longitude)
+    } else {
+        escape_html(&location.label)
+    };
+    format!(
+        r#"<div class="radar-status radar-status--ready" role="status">
+<span class="status-mark" aria-hidden="true"></span>
+<div><strong>Radar configured</strong><span>{location_name}</span></div>
+</div>"#
+    )
+}
+
+fn render_search_results(settings: &RadarSettings, csrf: &str, search: SearchState<'_>) -> String {
+    let SearchState::Results(results) = search else {
+        return match search {
+            SearchState::Unavailable => {
+                r#"<p class="notice notice--error" role="alert">Search unavailable; enter coordinates manually</p>"#
+                    .to_owned()
+            }
+            SearchState::Idle | SearchState::Results(_) => String::new(),
+        };
+    };
+    if results.is_empty() {
+        return String::new();
+    }
+
+    let units = match settings.units {
+        Units::Kilometres => "km",
+        Units::Miles => "mi",
+    };
+    let mut forms = String::new();
+    for result in results {
+        let display_name = escape_html(&result.display_name);
+        let result_label = escape_html(&result.location.label);
+        forms.push_str(&format!(
+            r#"<form class="search-result" action="/settings" method="post">
+<input type="hidden" name="csrf_token" value="{csrf}">
+<input type="hidden" name="latitude" value="{latitude}">
+<input type="hidden" name="longitude" value="{longitude}">
+<input type="hidden" name="label" value="{result_label}">
+<input type="hidden" name="units" value="{units}">
+<input type="hidden" name="show_runways" value="{show_runways}">
+<input type="hidden" name="range_index" value="{range_index}">
+<span>{display_name}</span>
+<button type="submit">Use location</button>
+</form>"#,
+            latitude = result.location.latitude,
+            longitude = result.location.longitude,
+            show_runways = settings.show_runways,
+            range_index = settings.range_index,
+        ));
+    }
+    let match_label = if results.len() == 1 {
+        "1 match".to_owned()
+    } else {
+        format!("{} matches", results.len())
+    };
+    format!(
+        r#"<section class="search-results" aria-labelledby="search-results-title">
+<div class="result-heading"><h3 id="search-results-title">Search results</h3><span>{match_label}</span></div>
+{forms}
+</section>"#
+    )
+}
+
+fn render_units(settings: &RadarSettings) -> String {
+    let kilometres_checked = if settings.units == Units::Kilometres {
+        " checked"
+    } else {
+        ""
+    };
+    let miles_checked = if settings.units == Units::Miles {
+        " checked"
+    } else {
+        ""
+    };
+    format!(
+        r#"<div class="segmented segmented--units">
+<label class="segment"><input type="radio" name="units" value="km"{kilometres_checked}><span>Kilometres</span></label>
+<label class="segment"><input type="radio" name="units" value="mi"{miles_checked}><span>Miles</span></label>
+</div>"#
+    )
+}
+
+fn render_range_options(settings: &RadarSettings) -> String {
+    (0_u8..=3)
+        .map(|index| {
+            let mut label = range_preset(index)
+                .map(|preset| format_range_label(preset, settings.units))
+                .expect("the web form only renders supported range indices");
+            label.insert(label.len() - 2, ' ');
+            let checked = if settings.range_index == index {
+                " checked"
+            } else {
+                ""
+            };
+            format!(
+                r#"<label class="segment"><input type="radio" name="range_index" value="{index}"{checked}><span>{label}</span></label>"#
+            )
+        })
+        .collect()
+}
+
 fn render_page(
     settings: &RadarSettings,
     local_url: &str,
     csrf_token: &str,
-    results: &[GeocodeResult],
-    message: Option<&str>,
+    search: SearchState<'_>,
 ) -> String {
     let (latitude, longitude, label) = settings
         .location
@@ -628,61 +743,20 @@ fn render_page(
     let csrf = escape_html(csrf_token);
     let local_url = escape_html(local_url);
     let label = escape_html(label);
-    let kilometres_selected = if settings.units == Units::Kilometres {
-        " selected"
-    } else {
-        ""
-    };
-    let miles_selected = if settings.units == Units::Miles {
-        " selected"
-    } else {
-        ""
-    };
     let runways_checked = if settings.show_runways {
         " checked"
     } else {
         ""
     };
-    let message = message
-        .map(|message| format!("<p role=\"alert\">{}</p>", escape_html(message)))
-        .unwrap_or_default();
-
-    let mut result_forms = String::new();
-    for result in results {
-        let display_name = escape_html(&result.display_name);
-        let result_label = escape_html(&result.location.label);
-        let units = match settings.units {
-            Units::Kilometres => "km",
-            Units::Miles => "mi",
-        };
-        result_forms.push_str(&format!(
-            r#"<form action="/settings" method="post">
-<input type="hidden" name="csrf_token" value="{csrf}">
-<input type="hidden" name="latitude" value="{latitude}">
-<input type="hidden" name="longitude" value="{longitude}">
-<input type="hidden" name="label" value="{result_label}">
-<input type="hidden" name="units" value="{units}">
-<input type="hidden" name="show_runways" value="{show_runways}">
-<input type="hidden" name="range_index" value="{range_index}">
-<button type="submit">Use {display_name}</button>
-</form>"#,
-            latitude = result.location.latitude,
-            longitude = result.location.longitude,
-            show_runways = settings.show_runways,
-            range_index = settings.range_index,
-        ));
-    }
-
-    let range_options = (0_u8..=3)
-        .map(|index| {
-            let selected = if settings.range_index == index {
-                " selected"
-            } else {
-                ""
-            };
-            format!(r#"<option value="{index}"{selected}>{index}</option>"#)
-        })
-        .collect::<String>();
+    let manual_open = if settings.location.is_none() {
+        " open"
+    } else {
+        ""
+    };
+    let status = render_status(settings);
+    let search_results = render_search_results(settings, &csrf, search);
+    let units = render_units(settings);
+    let range_options = render_range_options(settings);
 
     format!(
         r#"<!doctype html>
@@ -690,51 +764,76 @@ fn render_page(
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Plane Radar settings</title>
+<title>Plane Radar local control</title>
 <style>
 * {{ box-sizing: border-box; }}
 body {{ margin: 0; font-size: 16px; line-height: 1.5; }}
-main {{ width: min(100%, 42rem); margin: 0 auto; padding: 1rem; }}
+main {{ width: min(100%, 58rem); margin: 0 auto; padding: 1rem; }}
 section {{ margin-block: 1.5rem; }}
 form {{ display: grid; gap: 0.75rem; }}
 label {{ display: grid; gap: 0.25rem; min-width: 0; }}
 input, select, button {{ width: 100%; min-height: 2.75rem; font: inherit; }}
 p, button {{ overflow-wrap: anywhere; }}
+.radar-status div {{ display: grid; }}
+.segmented {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }}
+.segmented--range {{ grid-template-columns: repeat(4, minmax(0, 1fr)); }}
+.segment input {{ width: auto; min-height: auto; }}
+.search-result {{ grid-template-columns: minmax(0, 1fr) auto; align-items: center; }}
 @media (min-width: 40rem) {{ main {{ padding: 2rem; }} }}
 </style>
 </head>
 <body>
 <main>
-<h1>Plane Radar settings</h1>
-<p>Open this page at <a href="{local_url}">{local_url}</a>.</p>
-{message}
-<section>
-<h2>Search for a place</h2>
+<header>
+<p>Local control</p>
+<h1>Plane Radar</h1>
+<a href="{local_url}">{local_url}</a>
+</header>
+{status}
+<div class="console-grid">
+<section class="location" aria-labelledby="location-title">
+<h2 id="location-title">Radar location</h2>
+<p>Search for the place this radar should watch.</p>
 <form action="/search" method="post">
 <input type="hidden" name="csrf_token" value="{csrf}">
-<label>Search <input name="query" type="search" required></label>
+<label for="place-search">Place or address</label>
+<input id="place-search" name="query" type="search" autocomplete="street-address" required>
 <button type="submit">Search</button>
 </form>
 <p>Your submitted search text is sent to OpenStreetMap. Search data © OpenStreetMap contributors.</p>
-{result_forms}
+{search_results}
 </section>
-<section>
-<h2>Manual location and radar options</h2>
-<form action="/settings" method="post">
+<form class="settings-form" action="/settings" method="post">
 <input type="hidden" name="csrf_token" value="{csrf}">
-<label>Latitude <input name="latitude" value="{latitude}" inputmode="decimal" required></label>
-<label>Longitude <input name="longitude" value="{longitude}" inputmode="decimal" required></label>
-<label>Place name <input name="label" value="{label}"></label>
-<label>Units <select name="units">
-<option value="km"{kilometres_selected}>Kilometres</option>
-<option value="mi"{miles_selected}>Miles</option>
-</select></label>
+<details class="manual"{manual_open}>
+<summary>Manual coordinates</summary>
+<div class="manual-fields">
+<label for="latitude">Latitude</label>
+<input id="latitude" name="latitude" value="{latitude}" inputmode="decimal" type="number" min="-90" max="90" step="any" required>
+<label for="longitude">Longitude</label>
+<input id="longitude" name="longitude" value="{longitude}" inputmode="decimal" type="number" min="-180" max="180" step="any" required>
+<label for="place-name">Place name <span>(optional)</span></label>
+<input id="place-name" name="label" value="{label}" autocomplete="off">
+</div>
+</details>
+<section class="preferences" aria-labelledby="preferences-title">
+<h2 id="preferences-title">Radar display</h2>
+<fieldset>
+<legend>Units</legend>
+{units}
+</fieldset>
+<fieldset>
+<legend>Range</legend>
+<p>Distance shown at the third radar ring.</p>
+<div class="segmented segmented--range">{range_options}</div>
+</fieldset>
 <input type="hidden" name="show_runways_present" value="true">
-<label><input type="checkbox" name="show_runways" value="true"{runways_checked}> Show runways</label>
-<label>Range <select name="range_index">{range_options}</select></label>
-<button type="submit">Save settings</button>
-</form>
+<label class="switch"><input type="checkbox" name="show_runways" value="true"{runways_checked}><span>Show runways</span></label>
+<p>Include nearby airport runways on the radar.</p>
+<button type="submit">Apply settings</button>
 </section>
+</form>
+</div>
 </main>
 </body>
 </html>"#
