@@ -1,13 +1,14 @@
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 
-use planeradar::model::{Location, RadarSettings, Units};
+use planeradar::model::{
+    FooterSettings, Location, RadarSettings, SETTINGS_SCHEMA_VERSION, TimeZone, Units,
+};
 use planeradar::settings::{SettingsStore, validate_settings};
 use serde_json::{Value, json};
 
 fn configured_settings() -> RadarSettings {
     RadarSettings {
-        schema_version: 1,
         location: Some(Location {
             latitude: 40.7128,
             longitude: -74.0060,
@@ -16,12 +17,13 @@ fn configured_settings() -> RadarSettings {
         units: Units::Kilometres,
         show_runways: true,
         range_index: 1,
+        ..RadarSettings::default()
     }
 }
 
 fn valid_json() -> Value {
     json!({
-        "schema_version": 1,
+        "schema_version": 2,
         "location": {
             "latitude": 40.7128,
             "longitude": -74.0060,
@@ -29,15 +31,42 @@ fn valid_json() -> Value {
         },
         "units": "km",
         "show_runways": true,
-        "range_index": 1
+        "range_index": 1,
+        "show_callsign": true,
+        "show_route": false,
+        "show_expanded_model": false,
+        "radar_text_scale_percent": 100,
+        "minimum_altitude_feet": null,
+        "maximum_altitude_feet": null,
+        "footer": {
+            "show_condition": false,
+            "show_temperature": false,
+            "show_humidity": false,
+            "show_time": false,
+            "show_date": false,
+            "temperature_unit": "celsius",
+            "time_zone": "radar_local",
+            "clock_format": "twenty_four"
+        }
     })
+}
+
+fn assert_compatibility_defaults(settings: &RadarSettings) {
+    assert_eq!(settings.schema_version, SETTINGS_SCHEMA_VERSION);
+    assert!(settings.show_callsign);
+    assert!(!settings.show_route);
+    assert!(!settings.show_expanded_model);
+    assert_eq!(settings.radar_text_scale_percent, 100);
+    assert_eq!(settings.minimum_altitude_feet, None);
+    assert_eq!(settings.maximum_altitude_feet, None);
+    assert_eq!(settings.footer, FooterSettings::default());
 }
 
 #[test]
 fn defaults_require_location_setup() {
     let settings = RadarSettings::default();
 
-    assert_eq!(settings.schema_version, 1);
+    assert_compatibility_defaults(&settings);
     assert_eq!(settings.location, None);
     assert_eq!(settings.units, Units::Kilometres);
     assert!(settings.show_runways);
@@ -78,7 +107,7 @@ fn save_writes_deterministic_pretty_json() {
         fs::read_to_string(path).expect("saved JSON"),
         concat!(
             "{\n",
-            "  \"schema_version\": 1,\n",
+            "  \"schema_version\": 2,\n",
             "  \"location\": {\n",
             "    \"latitude\": 40.7128,\n",
             "    \"longitude\": -74.006,\n",
@@ -86,10 +115,94 @@ fn save_writes_deterministic_pretty_json() {
             "  },\n",
             "  \"units\": \"km\",\n",
             "  \"show_runways\": true,\n",
-            "  \"range_index\": 1\n",
+            "  \"range_index\": 1,\n",
+            "  \"show_callsign\": true,\n",
+            "  \"show_route\": false,\n",
+            "  \"show_expanded_model\": false,\n",
+            "  \"radar_text_scale_percent\": 100,\n",
+            "  \"minimum_altitude_feet\": null,\n",
+            "  \"maximum_altitude_feet\": null,\n",
+            "  \"footer\": {\n",
+            "    \"show_condition\": false,\n",
+            "    \"show_temperature\": false,\n",
+            "    \"show_humidity\": false,\n",
+            "    \"show_time\": false,\n",
+            "    \"show_date\": false,\n",
+            "    \"temperature_unit\": \"celsius\",\n",
+            "    \"time_zone\": \"radar_local\",\n",
+            "    \"clock_format\": \"twenty_four\"\n",
+            "  }\n",
             "}\n",
         )
     );
+}
+
+#[test]
+fn version_one_document_migrates_to_compatibility_defaults() {
+    let migrated =
+        validate_settings(serde_json::from_str(include_str!("fixtures/settings/v1.json")).unwrap())
+            .expect("v1 migration");
+
+    assert_eq!(migrated.units, Units::Miles);
+    assert!(!migrated.show_runways);
+    assert_eq!(migrated.range_index, 3);
+    assert_compatibility_defaults(&migrated);
+}
+
+#[test]
+fn loading_version_one_does_not_write_until_the_next_mutation() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let path = directory.path().join("settings.json");
+    let legacy = include_bytes!("fixtures/settings/v1.json");
+    fs::write(&path, legacy).expect("write v1 fixture");
+    let store = SettingsStore::new(path.clone());
+
+    let migrated = store.load().expect("load v1 settings");
+
+    assert_eq!(fs::read(&path).expect("unchanged v1 bytes"), legacy);
+    assert_compatibility_defaults(&migrated);
+
+    store.save(&migrated).expect("save migrated settings");
+    let persisted_value: Value =
+        serde_json::from_slice(&fs::read(&path).expect("persisted v2 bytes")).expect("v2 JSON");
+    assert_eq!(persisted_value["schema_version"], SETTINGS_SCHEMA_VERSION);
+    let persisted = validate_settings(persisted_value).expect("persisted v2 settings");
+    assert_compatibility_defaults(&persisted);
+}
+
+#[test]
+fn footer_visibility_reports_any_enabled_item() {
+    let mut footer = FooterSettings::default();
+    assert!(!footer.any_visible());
+
+    footer.show_time = true;
+    assert!(footer.any_visible());
+}
+
+#[test]
+fn footer_environment_need_honors_radar_local_and_zulu_time() {
+    let mut footer = FooterSettings::default();
+    assert!(!footer.needs_environment());
+
+    footer.show_time = true;
+    assert!(footer.needs_environment());
+
+    footer.time_zone = TimeZone::Zulu;
+    assert!(!footer.needs_environment());
+
+    footer.show_condition = true;
+    assert!(footer.needs_environment());
+}
+
+#[test]
+fn altitude_filter_is_active_when_either_bound_is_present() {
+    let mut settings = RadarSettings::default();
+    assert!(!settings.altitude_filter_active());
+    settings.minimum_altitude_feet = Some(0);
+    assert!(settings.altitude_filter_active());
+    settings.minimum_altitude_feet = None;
+    settings.maximum_altitude_feet = Some(10_000);
+    assert!(settings.altitude_filter_active());
 }
 
 #[test]
@@ -102,9 +215,6 @@ fn validation_rejects_each_invalid_document_shape() {
 
     let mut non_numeric_latitude = valid_json();
     non_numeric_latitude["location"]["latitude"] = json!("north");
-
-    let mut unsupported_schema = valid_json();
-    unsupported_schema["schema_version"] = json!(2);
 
     let mut unsupported_units = valid_json();
     unsupported_units["units"] = json!("meters");
@@ -125,12 +235,47 @@ fn validation_rejects_each_invalid_document_shape() {
         ("latitude outside ±90", out_of_range_latitude),
         ("longitude outside ±180", out_of_range_longitude),
         ("non-number coordinate", non_numeric_latitude),
-        ("unsupported schema", unsupported_schema),
         ("unsupported units", unsupported_units),
         ("range index outside 0-3", out_of_range_index),
         ("unknown top-level key", unknown_top_level_key),
         ("missing required field", missing_required_field),
     ] {
+        assert!(validate_settings(value).is_err(), "{name} must be rejected");
+    }
+}
+
+#[test]
+fn validation_rejects_invalid_v2_display_options_and_schema_versions() {
+    let mut cases = Vec::new();
+    for scale in [79, 81, 140] {
+        let mut value = valid_json();
+        value["radar_text_scale_percent"] = json!(scale);
+        cases.push((format!("text scale {scale}"), value));
+    }
+    for schema_version in [0, 3] {
+        let mut value = valid_json();
+        value["schema_version"] = json!(schema_version);
+        cases.push((format!("schema version {schema_version}"), value));
+    }
+
+    let mut minimum_too_low = valid_json();
+    minimum_too_low["minimum_altitude_feet"] = json!(-2001);
+    cases.push(("minimum below -2000".to_owned(), minimum_too_low));
+
+    let mut maximum_too_high = valid_json();
+    maximum_too_high["maximum_altitude_feet"] = json!(100001);
+    cases.push(("maximum above 100000".to_owned(), maximum_too_high));
+
+    let mut reversed_bounds = valid_json();
+    reversed_bounds["minimum_altitude_feet"] = json!(45_001);
+    reversed_bounds["maximum_altitude_feet"] = json!(45_000);
+    cases.push(("minimum above maximum".to_owned(), reversed_bounds));
+
+    let mut unknown_footer_field = valid_json();
+    unknown_footer_field["footer"]["unexpected"] = json!(true);
+    cases.push(("unknown footer field".to_owned(), unknown_footer_field));
+
+    for (name, value) in cases {
         assert!(validate_settings(value).is_err(), "{name} must be rejected");
     }
 }

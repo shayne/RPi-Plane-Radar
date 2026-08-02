@@ -15,6 +15,8 @@ use planeradar::install::{
     read_optional_installer_state_json, retire_application_artifacts, uninstall_owned_installation,
     write_installer_state_json, write_lifecycle_state_json,
 };
+use planeradar::model::{RadarSettings, SETTINGS_SCHEMA_VERSION};
+use planeradar::settings::validate_settings;
 use sha2::{Digest, Sha256};
 
 const ACCEPTED_CUSTOM_OVERLAY: &str = "planeradar-hyperpixel2r-eefaf3ae40fd";
@@ -397,6 +399,26 @@ fn installer_verifies_then_installs_once_and_is_idempotent() {
     assert!(!second.files_changed);
     assert!(!second.boot_config_changed);
     assert!(!second.reboot_required);
+}
+
+#[test]
+fn installer_seeds_version_two_settings() {
+    let fixture = Fixture::new("[all]\n");
+    let runner = RecordingRunner::for_root(&fixture.root);
+
+    Installer::new(&runner)
+        .install(&fixture.options(false))
+        .expect("install");
+
+    let seeded: serde_json::Value = serde_json::from_slice(
+        &fs::read(fixture.root.join("var/lib/planeradar/settings.json")).expect("seeded settings"),
+    )
+    .expect("seeded settings JSON");
+    assert_eq!(seeded["schema_version"], SETTINGS_SCHEMA_VERSION);
+    assert_eq!(
+        validate_settings(seeded).expect("valid seeded settings"),
+        RadarSettings::default()
+    );
 }
 
 #[test]

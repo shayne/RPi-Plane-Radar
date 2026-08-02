@@ -3,6 +3,74 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+pub const SETTINGS_SCHEMA_VERSION: u32 = 2;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TemperatureUnit {
+    Celsius,
+    Fahrenheit,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TimeZone {
+    RadarLocal,
+    Zulu,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClockFormat {
+    Twelve,
+    TwentyFour,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FooterSettings {
+    pub show_condition: bool,
+    pub show_temperature: bool,
+    pub show_humidity: bool,
+    pub show_time: bool,
+    pub show_date: bool,
+    pub temperature_unit: TemperatureUnit,
+    pub time_zone: TimeZone,
+    pub clock_format: ClockFormat,
+}
+
+impl Default for FooterSettings {
+    fn default() -> Self {
+        Self {
+            show_condition: false,
+            show_temperature: false,
+            show_humidity: false,
+            show_time: false,
+            show_date: false,
+            temperature_unit: TemperatureUnit::Celsius,
+            time_zone: TimeZone::RadarLocal,
+            clock_format: ClockFormat::TwentyFour,
+        }
+    }
+}
+
+impl FooterSettings {
+    pub fn any_visible(&self) -> bool {
+        self.show_condition
+            || self.show_temperature
+            || self.show_humidity
+            || self.show_time
+            || self.show_date
+    }
+
+    pub fn needs_environment(&self) -> bool {
+        self.show_condition
+            || self.show_temperature
+            || self.show_humidity
+            || ((self.show_time || self.show_date) && self.time_zone == TimeZone::RadarLocal)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RadarSettings {
@@ -11,17 +79,37 @@ pub struct RadarSettings {
     pub units: Units,
     pub show_runways: bool,
     pub range_index: u8,
+    pub show_callsign: bool,
+    pub show_route: bool,
+    pub show_expanded_model: bool,
+    pub radar_text_scale_percent: u8,
+    pub minimum_altitude_feet: Option<i32>,
+    pub maximum_altitude_feet: Option<i32>,
+    pub footer: FooterSettings,
 }
 
 impl Default for RadarSettings {
     fn default() -> Self {
         Self {
-            schema_version: 1,
+            schema_version: SETTINGS_SCHEMA_VERSION,
             location: None,
             units: Units::Kilometres,
             show_runways: true,
             range_index: 1,
+            show_callsign: true,
+            show_route: false,
+            show_expanded_model: false,
+            radar_text_scale_percent: 100,
+            minimum_altitude_feet: None,
+            maximum_altitude_feet: None,
+            footer: FooterSettings::default(),
         }
+    }
+}
+
+impl RadarSettings {
+    pub fn altitude_filter_active(&self) -> bool {
+        self.minimum_altitude_feet.is_some() || self.maximum_altitude_feet.is_some()
     }
 }
 

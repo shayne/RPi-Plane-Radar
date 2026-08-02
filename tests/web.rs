@@ -416,7 +416,6 @@ fn extract_attribute(body: &str, prefix: &str) -> String {
 
 fn configured_settings() -> RadarSettings {
     RadarSettings {
-        schema_version: 1,
         location: Some(Location {
             latitude: 51.5072,
             longitude: -0.1276,
@@ -425,6 +424,7 @@ fn configured_settings() -> RadarSettings {
         units: Units::Miles,
         show_runways: false,
         range_index: 3,
+        ..RadarSettings::default()
     }
 }
 
@@ -1163,7 +1163,6 @@ fn settings_accept_manual_coordinates_and_replace_exactly_once() {
     assert_eq!(
         server.settings.current(),
         RadarSettings {
-            schema_version: 1,
             location: Some(Location {
                 latitude: -33.8688,
                 longitude: 151.2093,
@@ -1172,6 +1171,7 @@ fn settings_accept_manual_coordinates_and_replace_exactly_once() {
             units: Units::Miles,
             show_runways: false,
             range_index: 2,
+            ..RadarSettings::default()
         }
     );
     assert_eq!(server.settings.replacement_count(), 1);

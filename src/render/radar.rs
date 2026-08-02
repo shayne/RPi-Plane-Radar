@@ -9,7 +9,8 @@ use tiny_skia::{FillRule, LineCap, Paint, PathBuilder, Pixmap, Stroke, Transform
 use crate::display::{DisplayConfig, DisplayHandler, DisplayUpdate, InputEvent, run_display};
 use crate::geometry::{offset_km, project_to_radar, rim_point};
 use crate::model::{
-    Aircraft, Airport, GeoPoint, Location, RadarSettings, RadarSnapshot, Runway, Units,
+    Aircraft, Airport, GeoPoint, Location, RadarSettings, RadarSnapshot, Runway,
+    SETTINGS_SCHEMA_VERSION, Units,
 };
 use crate::range::{format_range_label, range_preset};
 use crate::render::text::{HorizontalAnchor, TextRasterizer, TextStyle, VerticalAnchor};
@@ -575,7 +576,6 @@ fn fixture_renderer() -> Result<RadarRenderer, RenderError> {
 
 fn fixture_settings() -> RadarSettings {
     RadarSettings {
-        schema_version: 1,
         location: Some(Location {
             latitude: 40.0,
             longitude: -75.0,
@@ -584,6 +584,7 @@ fn fixture_settings() -> RadarSettings {
         units: Units::Kilometres,
         show_runways: true,
         range_index: 1,
+        ..RadarSettings::default()
     }
 }
 
@@ -618,7 +619,7 @@ fn fixture_airport() -> Airport {
 }
 
 fn validate_settings(settings: &RadarSettings) -> Result<(), RenderError> {
-    if settings.schema_version != 1 {
+    if settings.schema_version != SETTINGS_SCHEMA_VERSION {
         return Err(RenderError::InvalidSettings("unsupported schema version"));
     }
     let location = settings

@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "location": {
+    "latitude": 40.7128,
+    "longitude": -74.006,
+    "label": "New York, NY"
+  },
+  "units": "mi",
+  "show_runways": false,
+  "range_index": 3
+}

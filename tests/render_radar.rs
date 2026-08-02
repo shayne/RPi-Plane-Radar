@@ -117,7 +117,6 @@ fn mask_within_one_pixel(mask: &Frame, x: u32, y: u32) -> bool {
 
 fn configured_settings() -> RadarSettings {
     RadarSettings {
-        schema_version: 1,
         location: Some(Location {
             latitude: ORIGIN_LATITUDE,
             longitude: ORIGIN_LONGITUDE,
@@ -126,6 +125,7 @@ fn configured_settings() -> RadarSettings {
         units: Units::Kilometres,
         show_runways: true,
         range_index: 1,
+        ..RadarSettings::default()
     }
 }
 
@@ -518,7 +518,7 @@ fn invalid_or_unconfigured_settings_return_errors_without_rendering() {
     let snapshot = empty_snapshot(None);
     let mut cases = vec![RadarSettings::default()];
     let mut bad_schema = configured_settings();
-    bad_schema.schema_version = 2;
+    bad_schema.schema_version = 3;
     cases.push(bad_schema);
     let mut bad_range = configured_settings();
     bad_range.range_index = u8::MAX;

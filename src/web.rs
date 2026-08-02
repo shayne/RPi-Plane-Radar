@@ -13,7 +13,7 @@ use tiny_http::{Header, Method, Request, Response, Server};
 use url::Url;
 
 use crate::geocode::{GeocodeResult, GeocodeService};
-use crate::model::{AppState, Location, RadarSettings, Units};
+use crate::model::{AppState, Location, RadarSettings, SETTINGS_SCHEMA_VERSION, Units};
 use crate::range::{format_range_label, range_preset};
 use crate::settings::validate_settings;
 
@@ -544,7 +544,7 @@ fn candidate_from_form(current: &RadarSettings, form: &Form) -> Result<RadarSett
         .map_err(|_| ())?;
     let label = form.single("label")?.unwrap_or("").to_owned();
     let mut candidate = current.clone();
-    candidate.schema_version = 1;
+    candidate.schema_version = SETTINGS_SCHEMA_VERSION;
     candidate.location = Some(Location {
         latitude,
         longitude,

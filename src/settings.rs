@@ -3,10 +3,33 @@ use std::io::{self, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
+use serde::Deserialize;
 use serde_json::Value;
 use thiserror::Error;
 
-use crate::model::{Location, RadarSettings};
+use crate::model::{Location, RadarSettings, SETTINGS_SCHEMA_VERSION, Units};
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyRadarSettingsV1 {
+    schema_version: u32,
+    location: Option<Location>,
+    units: Units,
+    show_runways: bool,
+    range_index: u8,
+}
+
+impl From<LegacyRadarSettingsV1> for RadarSettings {
+    fn from(legacy: LegacyRadarSettingsV1) -> Self {
+        RadarSettings {
+            location: legacy.location,
+            units: legacy.units,
+            show_runways: legacy.show_runways,
+            range_index: legacy.range_index,
+            ..RadarSettings::default()
+        }
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum SettingsError {
@@ -21,7 +44,24 @@ pub enum SettingsError {
 }
 
 pub fn validate_settings(value: Value) -> Result<RadarSettings, SettingsError> {
-    let settings = serde_json::from_value(value)?;
+    let schema_version =
+        value
+            .get("schema_version")
+            .and_then(Value::as_u64)
+            .ok_or(SettingsError::Invalid(
+                "schema version must be an unsigned integer",
+            ))?;
+    let settings = match schema_version {
+        1 => {
+            let legacy: LegacyRadarSettingsV1 = serde_json::from_value(value)?;
+            if legacy.schema_version != 1 {
+                return Err(SettingsError::Invalid("unsupported schema version"));
+            }
+            legacy.into()
+        }
+        version if version == u64::from(SETTINGS_SCHEMA_VERSION) => serde_json::from_value(value)?,
+        _ => return Err(SettingsError::Invalid("unsupported schema version")),
+    };
     validate_radar_settings(&settings)?;
     Ok(settings)
 }
@@ -64,7 +104,7 @@ impl SettingsStore {
 }
 
 fn validate_radar_settings(settings: &RadarSettings) -> Result<(), SettingsError> {
-    if settings.schema_version != 1 {
+    if settings.schema_version != SETTINGS_SCHEMA_VERSION {
         return Err(SettingsError::Invalid("unsupported schema version"));
     }
     if settings.range_index > 3 {
@@ -74,6 +114,36 @@ fn validate_radar_settings(settings: &RadarSettings) -> Result<(), SettingsError
     }
     if let Some(location) = &settings.location {
         validate_location(location)?;
+    }
+    if !matches!(
+        settings.radar_text_scale_percent,
+        80 | 90 | 100 | 110 | 120 | 130
+    ) {
+        return Err(SettingsError::Invalid(
+            "radar text scale must be 80, 90, 100, 110, 120, or 130 percent",
+        ));
+    }
+    if settings
+        .minimum_altitude_feet
+        .is_some_and(|altitude| !(-2000..=100_000).contains(&altitude))
+        || settings
+            .maximum_altitude_feet
+            .is_some_and(|altitude| !(-2000..=100_000).contains(&altitude))
+    {
+        return Err(SettingsError::Invalid(
+            "altitude bounds must be between -2000 and 100000 feet",
+        ));
+    }
+    if matches!(
+        (
+            settings.minimum_altitude_feet,
+            settings.maximum_altitude_feet
+        ),
+        (Some(minimum), Some(maximum)) if minimum > maximum
+    ) {
+        return Err(SettingsError::Invalid(
+            "minimum altitude must not exceed maximum altitude",
+        ));
     }
     Ok(())
 }
