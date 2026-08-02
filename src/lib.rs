@@ -6,6 +6,7 @@ pub mod app;
 pub mod capture;
 pub mod cli;
 pub mod display;
+pub mod flight_data;
 pub mod geocode;
 pub mod geometry;
 pub mod http;

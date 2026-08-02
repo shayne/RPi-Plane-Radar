@@ -1,0 +1,8 @@
+{
+  "response": {
+    "flightroute": {
+      "origin": { "iata_code": "JFK", "icao_code": "KJFK" },
+      "destination": { "iata_code": "LAX", "icao_code": "KLAX" }
+    }
+  }
+}
