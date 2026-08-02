@@ -59,7 +59,30 @@ local release directory.
 
 The first boot shows a QR code plus `http://planeradar.local` and the Pi's
 numeric `http://` URL. Open either URL from the same LAN, search for an address
-or enter coordinates, then choose units, runway visibility, and range.
+or enter coordinates, then choose units, runway visibility, and range. That is
+the complete default path; upgrades keep the same display and make no new
+provider requests until you enable an optional feature.
+
+Radar text size scales radar typography from 80% through 130%. The remaining
+optional controls are organized in three expandable groups:
+
+- **Aircraft labels:** **Show callsign** stays on by default. **Show origin and
+  destination** and **Show expanded aircraft model** are off by default.
+- **Footer:** independently show **Weather condition**, temperature, humidity,
+  time, and date. Choose Celsius or Fahrenheit, Radar location or Zulu time,
+  and a 12-hour or 24-hour clock.
+- **Traffic filter:** set an optional Minimum altitude and Maximum altitude in
+  feet. Altitude is always interpreted in feet, even when distance uses
+  nautical miles or kilometers. Blank bounds are open. Unknown-altitude
+  aircraft remain visible with no bound; while either bound is active,
+  unknown-altitude aircraft are hidden.
+
+Provider-backed enrichment and environment data are off by default; all new
+provider features are optional. For the exact privacy boundary, routes send the
+aircraft callsign to ADSBDB and models send the aircraft identifier; enabling
+both means those values may share one request. Weather and radar-local time
+send the configured coordinates to Open-Meteo. Zulu-only time and date send
+nothing to Open-Meteo.
 
 The location is stored only on the Pi. Plane Radar does not request browser
 geolocation, and it does not configure the network. A short tap advances the

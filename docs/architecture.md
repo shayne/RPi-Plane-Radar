@@ -78,35 +78,70 @@ flowchart LR
     browser["LAN browser"] <--> web["Bounded web workers"]
     web --> settings["Serialized settings transaction"]
     settings --> file["Atomic settings.json"]
-    settings --> model["Immutable RuntimeSnapshot"]
-    settings --> wake["ADS-B command channel"]
-    adsb["ADS-B worker"] --> model
-    wake --> adsb
+    settings --> model["One immutable RuntimeSnapshot"]
+    settings --> adsb_wake["ADS-B settings wake"]
+    settings --> enrichment_wake["Enrichment settings wake"]
+    settings --> environment_wake["Environment settings wake"]
+    adsb_wake --> adsb["ADS-B worker"]
+    enrichment_wake --> enrichment["ADSBDB enrichment worker"]
+    environment_wake --> environment["Open-Meteo environment worker"]
+    adsb --> base["Base aircraft"]
+    enrichment --> optional_aircraft["Routes and models"]
+    environment --> optional_environment["Weather and location time"]
+    base --> model
+    optional_aircraft --> model
+    optional_environment --> model
     model --> main
     model --> web
 ```
 
 The main thread owns SDL, rendering, gesture recognition, and visible
 application state. SDL objects never cross a thread boundary. A web accept
-thread serves settings and health, while one ADS-B worker fetches traffic.
-Web requests are bounded to 16 workers. Nominatim access is serialized because
-its rate clock and cache have one owner.
+thread serves settings and health. The runtime uses three independent workers
+to fetch primary traffic, optional aircraft data, and optional environment
+data: the ADS-B worker, ADSBDB enrichment worker, and Open-Meteo environment
+worker. Their three settings wake channels let each worker react immediately
+without sharing network deadlines. This failure isolation means a blocked or
+failed optional provider cannot delay the three-second primary ADS-B
+publication cadence. Web requests are bounded to 16 workers. Nominatim access
+is serialized because its rate clock and cache have one owner.
 
 `RuntimeModel` publishes a complete immutable snapshot behind an
-`Arc<RwLock<_>>`. Each snapshot contains settings, aircraft, timestamps, URLs,
-and a generation number. A renderer sees one point in time instead of half of
-one update and half of the next.
+`Arc<RwLock<_>>`. Each snapshot contains settings, base aircraft, immutable
+enrichment and environment fields, timestamps, URLs, service status, and a
+generation number. A renderer sees one point in time instead of half of one
+update and half of the next. Late enrichment is joined only to a still-current
+aircraft identity, while environment results are accepted only for the current
+location and enabled settings.
+
+Settings schema version 1 migrates in memory to schema version 2. Existing
+location, units, runway visibility, and range are preserved; optional display
+and provider features receive compatibility defaults. Loading does not write
+the migrated value at startup. The next successful settings change uses the
+normal atomic version-2 write.
 
 All browser and touch settings changes use one transaction:
 
 1. derive a candidate from the current snapshot;
 2. validate and atomically write it;
 3. publish the new snapshot; and
-4. wake the ADS-B worker.
+4. notify all three settings wake channels.
 
 Old aircraft replies are discarded when their location or range no longer
-matches. Network errors keep the last good frame; after 30 seconds it gains a
-`DATA STALE` label.
+matches. The enrichment cache keeps successes for six hours and definite
+misses for ten minutes, with bounded least-recently-used eviction. The
+environment worker refreshes required weather or radar-local time data no more
+than once every 15 minutes after success. Zulu-only time and date need no
+Open-Meteo request.
+
+Primary position age alone controls `DATA STALE`; service errors do not set
+`DATA STALE`. When the primary feed stops, the last good frame remains visible
+and gains that label after 30 seconds. Enrichment silently falls back to the
+primary feed's callsign and short aircraft type. Before an environment result,
+selected weather renders `WX --`; after last-known environment data passes its
+45-minute stale boundary, it remains visible with `WX STALE`. Time and date add
+minute-based clock redraws so they continue advancing during a primary feed
+outage without redrawing each second.
 
 ## Display and touch
 
@@ -118,7 +153,10 @@ does not toggle panel GPIO or open raw I2C.
 SDL uses `kmsdrm` with the `opengles2` renderer and uploads a native 480×480
 RGBA frame. Static radar geometry is cached. Aircraft and text are drawn from
 bounded inputs, with transparent glyph backgrounds and a one-pixel outline on
-the range label. Integer pixel metrics keep the round display sharp.
+the range label. Integer pixel metrics keep the round display sharp. The
+`tests/goldens/settings.png` fixture is the physical QR settings screen and
+must remain unchanged. The browser settings UX is verified through HTML
+contracts and viewport inspection rather than that device golden.
 
 A tap advances range. Motion beyond 18 pixels cancels the tap. A continuous
 three-second hold opens settings, and its release is consumed so the range

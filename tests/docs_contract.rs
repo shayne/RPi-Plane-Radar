@@ -281,6 +281,88 @@ fn development_guide_distinguishes_every_release_verification_path() {
 }
 
 #[test]
+fn owner_guides_describe_optional_radar_controls_and_provider_privacy() {
+    let root = repository_root();
+    for (name, document) in [
+        ("README", read(root.join("README.md"))),
+        ("installation guide", read(root.join("docs/install.md"))),
+    ] {
+        let normalized = document.split_whitespace().collect::<Vec<_>>().join(" ");
+        for required in [
+            "Aircraft labels",
+            "Show callsign",
+            "Show origin and destination",
+            "Show expanded aircraft model",
+            "Footer",
+            "Weather condition",
+            "Celsius",
+            "Fahrenheit",
+            "Radar location",
+            "Zulu",
+            "12-hour",
+            "24-hour",
+            "Radar text size",
+            "Traffic filter",
+            "Minimum altitude",
+            "Maximum altitude",
+            "feet",
+            "Blank bounds are open",
+            "unknown-altitude aircraft",
+            "ADSBDB",
+            "Open-Meteo",
+            "aircraft callsign",
+            "aircraft identifier",
+            "configured coordinates",
+            "all new provider features are optional",
+            "off by default",
+            "may share one request",
+            "Zulu-only time and date send nothing to Open-Meteo",
+        ] {
+            assert!(
+                normalized.contains(required),
+                "{name} is missing optional-radar guidance {required:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn architecture_describes_independent_optional_workers_and_snapshot_flow() {
+    let architecture = read(repository_root().join("docs/architecture.md"));
+    let normalized = architecture
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    for required in [
+        "three independent workers",
+        "ADS-B worker",
+        "ADSBDB enrichment worker",
+        "Open-Meteo environment worker",
+        "three settings wake channels",
+        "failure isolation",
+        "six hours",
+        "ten minutes",
+        "15 minutes",
+        "schema version 1",
+        "immutable enrichment and environment fields",
+        "minute-based clock redraws",
+        "service errors do not set `DATA STALE`",
+        "`WX --`",
+        "`WX STALE`",
+        "silently falls back",
+        "`tests/goldens/settings.png`",
+        "physical QR settings screen",
+        "must remain unchanged",
+        "HTML contracts and viewport inspection",
+    ] {
+        assert!(
+            normalized.contains(required),
+            "architecture guide is missing optional-runtime fact {required:?}"
+        );
+    }
+}
+
+#[test]
 fn readme_does_not_teach_a_manual_ssh_install() {
     let readme = read(repository_root().join("README.md"));
     for block in fenced_shell_blocks(&readme) {

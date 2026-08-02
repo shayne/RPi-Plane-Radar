@@ -152,7 +152,28 @@ Open one URL from the same LAN. Search for a place through Nominatim or enter
 latitude and longitude manually, then save units, runway visibility, and
 range. Browser geolocation is not requested. Search text is cached only within
 the private Pi state, and the selected location is never part of health output
-or normal logs.
+or normal logs. Location, range, and runway visibility remain the complete
+default setup path; existing installations keep their current display until an
+owner enables an optional feature.
+
+Radar text size changes radar typography from 80% through 130%. Three native
+expandable groups hold the opt-in controls:
+
+- **Aircraft labels:** **Show callsign** defaults on. **Show origin and
+  destination** and **Show expanded aircraft model** default off.
+- **Footer:** separately select **Weather condition**, temperature, humidity,
+  time, and date. Temperature can use Celsius or Fahrenheit. Time and date can
+  use Radar location or Zulu, and time can use a 12-hour or 24-hour clock.
+- **Traffic filter:** Minimum altitude and Maximum altitude are optional and
+  always use feet, independent of the distance unit. Blank bounds are open.
+  With a minimum or maximum bound active, unknown-altitude aircraft are hidden.
+
+Provider-backed enrichment and environment data are off by default; all new
+provider features are optional. Routes send the aircraft callsign to ADSBDB;
+expanded models send the aircraft identifier. When both are selected, those
+values may share one request. Weather and radar-local time send the configured
+coordinates to Open-Meteo. Zulu-only time and date send nothing to Open-Meteo.
+The settings page explains these boundaries beside the affected controls.
 
 ## Verified release bootstrap
 
