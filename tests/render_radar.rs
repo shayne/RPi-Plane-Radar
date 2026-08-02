@@ -9,20 +9,25 @@ use fontdue::{Font, FontSettings};
 use planeradar::flight_data::AircraftEnrichment;
 use planeradar::geometry::offset_km;
 use planeradar::model::{
-    Aircraft, Airport, GeoPoint, Location, RadarSettings, RadarSnapshot, Runway, Units,
+    Aircraft, Airport, EnvironmentReading, GeoPoint, Location, RadarSettings, RadarSnapshot,
+    Runway, Units,
 };
 use planeradar::range::{format_range_label, range_preset};
+use planeradar::render::footer::{FooterLayout, draw_footer, layout_footer};
 use planeradar::render::radar::{BackgroundKey, RadarRenderer};
 use planeradar::render::text::{HorizontalAnchor, TextRasterizer, TextStyle, VerticalAnchor};
 use planeradar::render::theme::{
     AIRCRAFT, AIRCRAFT_LABEL_GAP, AIRCRAFT_NOSE_LENGTH, AIRCRAFT_SAFE_RADIUS,
     AIRCRAFT_TAG_CAP_HEIGHT, AIRCRAFT_TAIL_HALF_WIDTH, AIRCRAFT_TAIL_LENGTH, BACKGROUND,
-    CARDINAL_CAP_HEIGHT, CENTER, CENTER_DOT_RADIUS, GRID, GRID_OUTER_RADIUS, GRID_STROKE_WIDTH,
-    LABEL, RIM_DOT_RADIUS, RIM_RADIUS, RUNWAY, RUNWAY_LABEL_CAP_HEIGHT, RUNWAY_LABEL_GAP,
-    RUNWAY_STROKE_WIDTH, SCALE_CAP_HEIGHT, SIZE, STALE, STALE_CAP_HEIGHT, TAG_ALTITUDE, TAG_TYPE,
-    TRACK, TRACK_MIN_LENGTH, TRACK_STROKE_WIDTH,
+    CARDINAL_CAP_HEIGHT, CENTER, CENTER_DOT_RADIUS, FOOTER_BACKGROUND, FOOTER_BORDER,
+    FOOTER_BORDER_WIDTH, FOOTER_BOTTOM_Y, FOOTER_CAP_HEIGHT, FOOTER_CHORD_INSET,
+    FOOTER_CORNER_RADIUS, FOOTER_PADDING_X, FOOTER_PADDING_Y, FOOTER_ROW_GAP, GRID,
+    GRID_OUTER_RADIUS, GRID_STROKE_WIDTH, LABEL, RIM_DOT_RADIUS, RIM_RADIUS, RUNWAY,
+    RUNWAY_LABEL_CAP_HEIGHT, RUNWAY_LABEL_GAP, RUNWAY_STROKE_WIDTH, SCALE_CAP_HEIGHT, SIZE, STALE,
+    STALE_CAP_HEIGHT, TAG_ALTITUDE, TAG_TYPE, TRACK, TRACK_MIN_LENGTH, TRACK_STROKE_WIDTH,
 };
 use planeradar::render::{FontAsset, Frame, RenderError};
+use planeradar::weather::{FooterContent, FooterItem, FooterTone};
 use support::FrameAssertions;
 use tiny_skia::{IntSize, Pixmap};
 
@@ -70,10 +75,337 @@ fn visual_metrics_use_whole_pixels_without_moving_the_radar() {
         assert_eq!(actual, expected);
         assert_eq!(actual.fract(), 0.0);
     }
+
+    assert_eq!(FOOTER_CAP_HEIGHT, 18.0);
+    assert_eq!(FOOTER_BOTTOM_Y, 420.0);
+    assert_eq!(FOOTER_PADDING_X, 12.0);
+    assert_eq!(FOOTER_PADDING_Y, 8.0);
+    assert_eq!(FOOTER_ROW_GAP, 4.0);
+    assert_eq!(FOOTER_CORNER_RADIUS, 12.0);
+    assert_eq!(FOOTER_BORDER_WIDTH, 1.0);
+    assert_eq!(FOOTER_CHORD_INSET, 16.0);
+    assert_eq!(FOOTER_BACKGROUND, [3, 16, 32, 255]);
+    assert_eq!(FOOTER_BORDER, GRID);
+}
+
+#[test]
+fn footer_with_no_selected_items_has_no_layout_bounds_or_pixels() {
+    let font = test_font();
+    let settings = configured_settings();
+    let mut pixmap = Pixmap::new(SIZE, SIZE).expect("footer pixmap");
+    let before = pixmap.data().to_vec();
+
+    assert!(layout_footer(&font, &settings, &FooterContent::default()).is_none());
+    assert_eq!(
+        draw_footer(&mut pixmap, &font, &settings, None, Duration::ZERO, 0,),
+        None
+    );
+    assert_eq!(pixmap.data(), before);
+}
+
+#[test]
+fn footer_with_one_short_semantic_group_uses_one_centered_row() {
+    let content = FooterContent {
+        environment: vec![
+            footer_item("SCT", FooterTone::Condition),
+            footer_item("22°C", FooterTone::Temperature),
+            footer_item("RH54%", FooterTone::Humidity),
+        ],
+        temporal: Vec::new(),
+    };
+
+    let layout = layout_footer(&test_font(), &configured_settings(), &content)
+        .expect("one-row footer layout");
+
+    assert_eq!(layout.rows.len(), 1);
+    assert_eq!(
+        flattened_footer(&layout),
+        vec![
+            ("SCT", FooterTone::Condition),
+            ("22°C", FooterTone::Temperature),
+            ("RH54%", FooterTone::Humidity),
+        ]
+    );
+    assert!((layout.bounds.left + layout.bounds.right - 2.0 * CENTER.0).abs() < 0.01);
+}
+
+#[test]
+fn footer_with_all_five_items_uses_two_rows_in_fixed_semantic_order() {
+    let layout = layout_footer(&test_font(), &configured_settings(), &full_footer_content())
+        .expect("two-row footer layout");
+
+    assert_eq!(layout.rows.len(), 2);
+    assert_eq!(layout.rows[0].items.len(), 3);
+    assert_eq!(layout.rows[1].items.len(), 2);
+    assert_eq!(
+        flattened_footer(&layout),
+        vec![
+            ("SCT", FooterTone::Condition),
+            ("22°C", FooterTone::Temperature),
+            ("RH54%", FooterTone::Humidity),
+            ("11:11Z", FooterTone::Time),
+            ("11 JUL", FooterTone::Date),
+        ]
+    );
+}
+
+#[test]
+fn footer_preserves_zulu_suffix_and_date_when_it_splits() {
+    let layout = layout_footer(&test_font(), &configured_settings(), &full_footer_content())
+        .expect("footer layout");
+    let items = flattened_footer(&layout);
+
+    assert!(items.contains(&("11:11Z", FooterTone::Time)));
+    assert!(items.contains(&("11 JUL", FooterTone::Date)));
+}
+
+#[test]
+fn footer_at_supported_text_scales_stays_inside_the_safe_round_chord() {
+    let maximum_width = {
+        let dy = FOOTER_BOTTOM_Y - CENTER.1;
+        let radius = RIM_RADIUS as f32;
+        2.0 * (radius.powi(2) - dy.powi(2)).max(0.0).sqrt() - FOOTER_CHORD_INSET
+    };
+
+    for scale in [80, 130] {
+        let mut settings = configured_settings();
+        settings.radar_text_scale_percent = scale;
+        let layout = layout_footer(&test_font(), &settings, &full_footer_content())
+            .expect("scaled footer layout");
+
+        assert!(layout.bounds.right - layout.bounds.left <= maximum_width + 0.01);
+        assert!(layout.bounds.left >= CENTER.0 - maximum_width / 2.0 - 0.01);
+        assert!(layout.bounds.right <= CENTER.0 + maximum_width / 2.0 + 0.01);
+        assert!(
+            layout
+                .rows
+                .iter()
+                .all(|row| row.width + 2.0 * FOOTER_PADDING_X <= maximum_width + 0.01),
+            "text scale {scale}% overflowed the safe chord"
+        );
+    }
+}
+
+#[test]
+fn all_five_footer_items_at_130_percent_use_three_rows_without_losing_values() {
+    let mut settings = configured_settings();
+    settings.radar_text_scale_percent = 130;
+    let layout = layout_footer(&test_font(), &settings, &full_footer_content())
+        .expect("three-row footer layout");
+    let maximum_width = {
+        let dy = FOOTER_BOTTOM_Y - CENTER.1;
+        let radius = RIM_RADIUS as f32;
+        2.0 * (radius.powi(2) - dy.powi(2)).max(0.0).sqrt() - FOOTER_CHORD_INSET
+    };
+
+    assert_eq!(layout.rows.len(), 3);
+    assert_eq!(
+        flattened_footer(&layout),
+        vec![
+            ("SCT", FooterTone::Condition),
+            ("22°C", FooterTone::Temperature),
+            ("RH54%", FooterTone::Humidity),
+            ("11:11Z", FooterTone::Time),
+            ("11 JUL", FooterTone::Date),
+        ]
+    );
+    assert!(layout.bounds.right - layout.bounds.left <= maximum_width + 0.01);
+    assert_eq!(layout.bounds.bottom, FOOTER_BOTTOM_Y);
+    assert!(layout.bounds.bottom < 440.0);
+}
+
+#[test]
+fn footer_ellipsizes_condition_before_selected_numeric_or_temporal_values() {
+    let content = FooterContent {
+        environment: vec![
+            footer_item(&"CONDITION".repeat(128), FooterTone::Condition),
+            footer_item("-18°F", FooterTone::Temperature),
+            footer_item("RH100%", FooterTone::Humidity),
+        ],
+        temporal: vec![
+            footer_item("11:59PMZ", FooterTone::Time),
+            footer_item("31 DEC", FooterTone::Date),
+        ],
+    };
+    let mut settings = configured_settings();
+    settings.radar_text_scale_percent = 130;
+
+    let layout = layout_footer(&test_font(), &settings, &content).expect("fitted footer layout");
+    let items = flattened_footer(&layout);
+
+    assert_eq!(layout.rows.len(), 4);
+    assert!(
+        items
+            .iter()
+            .find(|(_, tone)| *tone == FooterTone::Condition)
+            .expect("condition item")
+            .0
+            .ends_with('…')
+    );
+    for expected in [
+        ("-18°F", FooterTone::Temperature),
+        ("RH100%", FooterTone::Humidity),
+        ("11:59PMZ", FooterTone::Time),
+        ("31 DEC", FooterTone::Date),
+    ] {
+        assert!(
+            items.contains(&expected),
+            "selected value {expected:?} was changed or dropped"
+        );
+    }
+}
+
+#[test]
+fn footer_bounds_stop_above_the_south_cardinal_label() {
+    let layout = layout_footer(&test_font(), &configured_settings(), &full_footer_content())
+        .expect("footer layout");
+
+    assert_eq!(layout.bounds.bottom, FOOTER_BOTTOM_Y);
+    assert!(layout.bounds.bottom < 440.0);
+}
+
+#[test]
+fn footer_rail_paints_over_the_static_grid_but_keeps_the_south_label_clear() {
+    let settings = footer_settings();
+    let snapshot = snapshot_with_footer(
+        Vec::new(),
+        footer_reading(Duration::ZERO),
+        Some(Duration::ZERO),
+    );
+    let disabled = test_renderer()
+        .render(
+            &empty_snapshot(Some(Duration::ZERO)),
+            &configured_settings(),
+            &[],
+            Duration::ZERO,
+            0,
+        )
+        .expect("disabled footer render");
+    let enabled = test_renderer()
+        .render(&snapshot, &settings, &[], Duration::ZERO, 0)
+        .expect("enabled footer render");
+
+    assert_eq!(disabled.pixel(CENTER.0 as u32, 417), GRID);
+    assert_eq!(enabled.pixel(CENTER.0 as u32, 417), FOOTER_BACKGROUND);
+    assert!(enabled.region_is_white(220, 440, 40, 40), "south label");
+}
+
+#[test]
+fn aircraft_symbol_drawn_after_footer_can_overwrite_the_rail() {
+    let settings = footer_settings();
+    let snapshot = snapshot_with_footer(
+        vec![aircraft_at(0.0, -10.0, 0.0)],
+        footer_reading(Duration::ZERO),
+        Some(Duration::ZERO),
+    );
+    let frame = test_renderer()
+        .render(&snapshot, &settings, &[], Duration::ZERO, 0)
+        .expect("aircraft over footer render");
+
+    assert!(
+        frame.color_count(AIRCRAFT, 220, 380, 40, 40) > 0,
+        "aircraft symbol inside the rail must remain traffic red"
+    );
+}
+
+#[test]
+fn aircraft_tag_moves_above_footer_when_the_natural_block_intersects() {
+    let mut settings = configured_settings();
+    settings.footer.show_time = true;
+    settings.footer.show_date = true;
+    settings.footer.time_zone = planeradar::model::TimeZone::Zulu;
+    let plane = aircraft_at(4.0, -9.0, 0.0);
+    let snapshot = snapshot_with_footer(
+        vec![plane.clone()],
+        footer_reading(Duration::ZERO),
+        Some(Duration::ZERO),
+    );
+    let mut footer_pixmap = Pixmap::new(SIZE, SIZE).expect("footer pixmap");
+    let footer_bounds = draw_footer(
+        &mut footer_pixmap,
+        &test_font(),
+        &settings,
+        snapshot.environment.as_ref(),
+        Duration::ZERO,
+        0,
+    )
+    .expect("footer bounds");
+
+    let natural = render_tag(&configured_settings(), plane, AircraftEnrichment::default());
+    let avoided = test_renderer()
+        .render(&snapshot, &settings, &[], Duration::ZERO, 0)
+        .expect("footer avoidance render");
+    let (_, natural_top, _, natural_height) = color_bounds(&natural, TAG_TYPE);
+    let (_, avoided_top, _, avoided_height) = color_bounds(&avoided, TAG_TYPE);
+
+    assert!(natural_top as f32 + natural_height as f32 > footer_bounds.top);
+    assert!((natural_top as f32) < footer_bounds.bottom);
+    assert!(
+        avoided_top as f32 + avoided_height as f32 <= footer_bounds.top + 1.0,
+        "tag type glyphs must move above the footer when that placement fits"
+    );
 }
 
 fn test_renderer() -> RadarRenderer {
     RadarRenderer::new(FontAsset::embedded().expect("embedded DejaVu font"))
+}
+
+fn test_font() -> Font {
+    Font::from_bytes(
+        include_bytes!("../src/assets/DejaVuSans-Bold.ttf") as &[u8],
+        FontSettings::default(),
+    )
+    .expect("embedded DejaVu font")
+}
+
+fn footer_item(text: &str, tone: FooterTone) -> FooterItem {
+    FooterItem {
+        text: text.to_owned(),
+        tone,
+    }
+}
+
+fn full_footer_content() -> FooterContent {
+    FooterContent {
+        environment: vec![
+            footer_item("22°C", FooterTone::Temperature),
+            footer_item("SCT", FooterTone::Condition),
+            footer_item("RH54%", FooterTone::Humidity),
+        ],
+        temporal: vec![
+            footer_item("11 JUL", FooterTone::Date),
+            footer_item("11:11Z", FooterTone::Time),
+        ],
+    }
+}
+
+fn flattened_footer(layout: &FooterLayout) -> Vec<(&str, FooterTone)> {
+    layout
+        .rows
+        .iter()
+        .flat_map(|row| row.items.iter().map(|item| (item.text.as_str(), item.tone)))
+        .collect()
+}
+
+fn footer_settings() -> RadarSettings {
+    let mut settings = configured_settings();
+    settings.footer.show_condition = true;
+    settings.footer.show_temperature = true;
+    settings.footer.show_humidity = true;
+    settings.footer.show_time = true;
+    settings.footer.show_date = true;
+    settings.footer.time_zone = planeradar::model::TimeZone::Zulu;
+    settings
+}
+
+fn footer_reading(fetched_at: Duration) -> EnvironmentReading {
+    EnvironmentReading {
+        temperature_celsius: 22.0,
+        humidity_percent: 54,
+        weather_code: 2,
+        utc_offset_seconds: -4 * 60 * 60,
+        fetched_at,
+    }
 }
 
 fn range_glyph_mask(settings: &RadarSettings) -> Frame {
@@ -163,6 +495,26 @@ fn aircraft(east_km: f64, speed: f64) -> Aircraft {
     }
 }
 
+fn aircraft_at(east_km: f64, north_km: f64, speed: f64) -> Aircraft {
+    let mut plane = aircraft(east_km, speed);
+    plane.latitude = ORIGIN_LATITUDE + north_km / EARTH_RADIUS_KM * 180.0 / std::f64::consts::PI;
+    plane
+}
+
+fn snapshot_with_footer(
+    aircraft: Vec<Aircraft>,
+    reading: EnvironmentReading,
+    fetched_at: Option<Duration>,
+) -> RadarSnapshot {
+    RadarSnapshot {
+        aircraft: Arc::from(aircraft),
+        enrichment: Arc::new(HashMap::new()),
+        environment: Some(reading),
+        fetched_at,
+        last_error_at: None,
+    }
+}
+
 fn runway_airport() -> Airport {
     Airport {
         ident: "KFIX".to_owned(),
@@ -201,6 +553,7 @@ fn render_tag(settings: &RadarSettings, plane: Aircraft, enrichment: AircraftEnr
             settings,
             &[],
             Duration::ZERO,
+            0,
         )
         .expect("tag render")
 }
@@ -311,6 +664,7 @@ fn empty_radar_has_exact_size_palette_rings_and_center() {
             &configured_settings(),
             &[],
             Duration::ZERO,
+            0,
         )
         .expect("render");
 
@@ -336,6 +690,7 @@ fn cardinal_labels_fit_the_north_south_east_west_bounds() {
             &configured_settings(),
             &[],
             Duration::ZERO,
+            0,
         )
         .expect("render");
 
@@ -357,7 +712,7 @@ fn east_aircraft_uses_unrounded_projection_and_draws_tag_and_heading() {
     };
     let mut renderer = test_renderer();
     let frame = renderer
-        .render(&snapshot, &configured_settings(), &[], Duration::ZERO)
+        .render(&snapshot, &configured_settings(), &[], Duration::ZERO, 0)
         .expect("render");
 
     assert!(
@@ -560,6 +915,7 @@ fn text_scale_changes_all_existing_radar_text_without_scaling_geometry() {
                     &settings,
                     std::slice::from_ref(&airport),
                     Duration::from_secs(30),
+                    0,
                 )
                 .expect("scaled static render"),
         );
@@ -634,10 +990,11 @@ fn transparent_aircraft_tag_preserves_static_pixels_and_draws_text_last() {
             &settings,
             &[],
             Duration::ZERO,
+            0,
         )
         .expect("empty render");
     let traffic = renderer
-        .render(&snapshot, &settings, &[], Duration::ZERO)
+        .render(&snapshot, &settings, &[], Duration::ZERO, 0)
         .expect("traffic render");
 
     let location = settings.location.as_ref().expect("configured location");
@@ -698,6 +1055,7 @@ fn range_label_has_a_one_pixel_shape_only_outline() {
             &settings,
             &[],
             Duration::ZERO,
+            0,
         )
         .expect("render");
     let mask = range_glyph_mask(&settings);
@@ -768,6 +1126,7 @@ fn whitespace_runway_label_does_not_mask_radar_geometry() {
             &settings,
             std::slice::from_ref(&empty_ident),
             Duration::ZERO,
+            0,
         )
         .expect("empty-label render");
     let whitespace_frame = test_renderer()
@@ -776,6 +1135,7 @@ fn whitespace_runway_label_does_not_mask_radar_geometry() {
             &settings,
             std::slice::from_ref(&whitespace_ident),
             Duration::ZERO,
+            0,
         )
         .expect("whitespace-label render");
 
@@ -797,7 +1157,7 @@ fn traffic_outside_the_aircraft_safe_ring_is_a_red_dot_on_the_238_pixel_rim() {
     };
     let mut renderer = test_renderer();
     let frame = renderer
-        .render(&snapshot, &configured_settings(), &[], Duration::ZERO)
+        .render(&snapshot, &configured_settings(), &[], Duration::ZERO, 0)
         .expect("render");
 
     assert!(frame.color_count(AIRCRAFT, 468, 230, 12, 20) > 0);
@@ -818,6 +1178,7 @@ fn runway_toggle_removes_lines_and_labels_from_the_cached_background() {
             &configured_settings(),
             std::slice::from_ref(&airport),
             Duration::ZERO,
+            0,
         )
         .expect("render with runways");
     let mut disabled_settings = configured_settings();
@@ -828,6 +1189,7 @@ fn runway_toggle_removes_lines_and_labels_from_the_cached_background() {
             &disabled_settings,
             &[airport],
             Duration::ZERO,
+            0,
         )
         .expect("render without runways");
 
@@ -847,7 +1209,7 @@ fn speed_vector_is_clipped_to_the_214_pixel_grid_ring() {
     };
     let mut renderer = test_renderer();
     let frame = renderer
-        .render(&snapshot, &configured_settings(), &[], Duration::ZERO)
+        .render(&snapshot, &configured_settings(), &[], Duration::ZERO, 0)
         .expect("render");
 
     assert!(frame.color_count(TRACK, 440, 236, 16, 9) > 0);
@@ -868,6 +1230,7 @@ fn stale_notice_appears_at_thirty_seconds_but_not_before_or_on_clock_underflow()
             &settings,
             &[],
             Duration::from_secs(34),
+            0,
         )
         .expect("fresh render");
     let threshold = renderer
@@ -876,6 +1239,7 @@ fn stale_notice_appears_at_thirty_seconds_but_not_before_or_on_clock_underflow()
             &settings,
             &[],
             Duration::from_secs(35),
+            0,
         )
         .expect("stale render");
     let underflow = renderer
@@ -884,6 +1248,7 @@ fn stale_notice_appears_at_thirty_seconds_but_not_before_or_on_clock_underflow()
             &settings,
             &[],
             Duration::from_secs(5),
+            0,
         )
         .expect("clock underflow render");
 
@@ -910,7 +1275,7 @@ fn invalid_or_unconfigured_settings_return_errors_without_rendering() {
     for settings in cases {
         assert!(
             renderer
-                .render(&snapshot, &settings, &[], Duration::ZERO)
+                .render(&snapshot, &settings, &[], Duration::ZERO, 0)
                 .is_err()
         );
     }
@@ -931,7 +1296,7 @@ fn empty_and_unrenderable_tag_strings_do_not_panic() {
     };
 
     test_renderer()
-        .render(&snapshot, &configured_settings(), &[], Duration::ZERO)
+        .render(&snapshot, &configured_settings(), &[], Duration::ZERO, 0)
         .expect("malformed display strings are safely clipped");
 }
 
@@ -1070,4 +1435,17 @@ fn stale_fixture_matches_golden() {
 fn enriched_fixture_matches_golden() {
     let fixture = planeradar::render::radar::fixture_enriched().expect("enriched fixture");
     fixture.assert_matches_golden("radar-enriched");
+}
+
+#[test]
+fn footer_fixture_matches_golden() {
+    let fixture = planeradar::render::radar::fixture_footer().expect("footer fixture");
+    fixture.assert_matches_golden("radar-footer");
+}
+
+#[test]
+fn large_stale_footer_fixture_matches_golden() {
+    let fixture = planeradar::render::radar::fixture_footer_large_stale()
+        .expect("large stale footer fixture");
+    fixture.assert_matches_golden("radar-footer-large-stale");
 }

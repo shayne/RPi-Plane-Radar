@@ -4,6 +4,7 @@ use std::path::Path;
 use fontdue::{Font, FontSettings};
 use thiserror::Error;
 
+pub mod footer;
 pub mod radar;
 pub mod setup;
 pub mod text;

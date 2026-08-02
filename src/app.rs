@@ -15,6 +15,7 @@ use crate::render::setup::SetupRenderer;
 use crate::render::{Frame, RenderError};
 use crate::runtime::{RuntimeError, RuntimeHandle, RuntimeSnapshot};
 use crate::touch::{Gesture, GestureRecognizer};
+use crate::weather;
 
 const STALE_AFTER: Duration = Duration::from_secs(30);
 const MAX_NEARBY_AIRPORTS: usize = 64;
@@ -75,6 +76,8 @@ struct RenderKey {
     generation: u64,
     state: AppState,
     stale: bool,
+    minute: Option<u64>,
+    environment_stale: bool,
 }
 
 pub struct PlaneRadarApp {
@@ -194,15 +197,29 @@ impl PlaneRadarApp {
         Ok(())
     }
 
-    fn render_key(&self, now: Duration) -> RenderKey {
+    fn render_key(&self, monotonic_now: Duration, unix_seconds: u64) -> RenderKey {
+        let state = self.state();
+        let minute = (state == AppState::Radar
+            && (self.snapshot.settings.footer.show_time
+                || self.snapshot.settings.footer.show_date))
+            .then_some(unix_seconds / 60);
+        let environment_stale = state == AppState::Radar
+            && self.snapshot.settings.footer.needs_environment()
+            && weather::environment_is_stale(self.snapshot.environment.as_ref(), monotonic_now);
         RenderKey {
             generation: self.snapshot.generation,
-            state: self.state(),
-            stale: is_stale(&self.snapshot, now),
+            state,
+            stale: is_stale(&self.snapshot, monotonic_now),
+            minute,
+            environment_stale,
         }
     }
 
-    fn render_frame(&mut self, now: Duration) -> Result<Frame, AppError> {
+    fn render_frame(
+        &mut self,
+        monotonic_now: Duration,
+        unix_seconds: u64,
+    ) -> Result<Frame, AppError> {
         match self.state() {
             AppState::SetupRequired => Ok(self.setup.render(
                 &self.snapshot.local_url,
@@ -235,7 +252,8 @@ impl PlaneRadarApp {
                     &radar_snapshot,
                     &self.snapshot.settings,
                     &self.visible_airports,
-                    now,
+                    monotonic_now,
+                    unix_seconds,
                 )?)
             }
         }
@@ -284,13 +302,15 @@ impl PlaneRadarApp {
 
 impl DisplayHandler for PlaneRadarApp {
     fn step(&mut self, events: &[InputEvent], _now: Instant) -> DisplayUpdate {
-        let now = self
+        let (monotonic_now, unix_seconds) = self
             .runtime
             .as_deref()
-            .map_or(Duration::ZERO, AppRuntime::monotonic);
+            .map_or((Duration::ZERO, 0), |runtime| {
+                (runtime.monotonic(), runtime.unix_seconds())
+            });
         let mut exit = self.stop_requested();
 
-        for gesture in self.gesture.tick(now) {
+        for gesture in self.gesture.tick(monotonic_now) {
             if self.handle_gesture(gesture).is_err() {
                 log::error!("display gesture update failed");
             }
@@ -300,7 +320,7 @@ impl DisplayHandler for PlaneRadarApp {
                 exit = true;
                 continue;
             }
-            for gesture in self.gesture.handle(event, now) {
+            for gesture in self.gesture.handle(event, monotonic_now) {
                 if self.handle_gesture(gesture).is_err() {
                     log::error!("display gesture update failed");
                 }
@@ -314,9 +334,9 @@ impl DisplayHandler for PlaneRadarApp {
 
         let mut frame = None;
         if !exit {
-            let key = self.render_key(now);
+            let key = self.render_key(monotonic_now, unix_seconds);
             if self.last_render_key != Some(key) {
-                match self.render_frame(now) {
+                match self.render_frame(monotonic_now, unix_seconds) {
                     Ok(rendered) => {
                         frame = Some(rendered.pixels().to_vec());
                         self.current_frame = Some(rendered);

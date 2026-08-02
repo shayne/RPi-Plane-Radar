@@ -14,6 +14,7 @@ use crate::model::{
     SETTINGS_SCHEMA_VERSION, Units,
 };
 use crate::range::{format_range_label, range_preset};
+use crate::render::footer::{FooterBounds, draw_footer};
 use crate::render::text::{HorizontalAnchor, TextRasterizer, TextStyle, VerticalAnchor};
 use crate::render::theme;
 use crate::render::{FontAsset, Frame, RenderError};
@@ -78,7 +79,8 @@ impl RadarRenderer {
         snapshot: &RadarSnapshot,
         settings: &RadarSettings,
         airports: &[Airport],
-        now: Duration,
+        monotonic_now: Duration,
+        unix_seconds: u64,
     ) -> Result<Frame, RenderError> {
         let key = BackgroundKey::from_settings(settings)?;
         if self
@@ -98,10 +100,18 @@ impl RadarRenderer {
             Pixmap::new(theme::SIZE, theme::SIZE).ok_or(RenderError::DimensionsOverflow)?;
         pixmap.data_mut().copy_from_slice(background);
 
-        self.draw_aircraft(&mut pixmap, snapshot, settings)?;
+        let footer_bounds = draw_footer(
+            &mut pixmap,
+            self.font.font(),
+            settings,
+            snapshot.environment.as_ref(),
+            monotonic_now,
+            unix_seconds,
+        );
+        self.draw_aircraft(&mut pixmap, snapshot, settings, footer_bounds)?;
         if snapshot
             .fetched_at
-            .and_then(|fetched_at| now.checked_sub(fetched_at))
+            .and_then(|fetched_at| monotonic_now.checked_sub(fetched_at))
             .is_some_and(|age| age >= STALE_AFTER)
         {
             TextRasterizer::new(self.font.font()).draw(
@@ -341,6 +351,7 @@ impl RadarRenderer {
         pixmap: &mut Pixmap,
         snapshot: &RadarSnapshot,
         settings: &RadarSettings,
+        footer_bounds: Option<FooterBounds>,
     ) -> Result<(), RenderError> {
         let location = settings
             .location
@@ -393,7 +404,7 @@ impl RadarRenderer {
             draw_heading_triangle(pixmap, aircraft.nose_degrees, *x, *y);
         }
         for (aircraft, x, y, _) in inside {
-            self.draw_aircraft_tag(pixmap, snapshot, settings, aircraft, x, y);
+            self.draw_aircraft_tag(pixmap, snapshot, settings, aircraft, (x, y), footer_bounds);
         }
         Ok(())
     }
@@ -445,9 +456,10 @@ impl RadarRenderer {
         snapshot: &RadarSnapshot,
         settings: &RadarSettings,
         aircraft: &Aircraft,
-        x: f32,
-        y: f32,
+        position: (f32, f32),
+        footer_bounds: Option<FooterBounds>,
     ) {
+        let (x, y) = position;
         let text = TextRasterizer::new(self.font.font());
         let enrichment = snapshot.enrichment.get(&aircraft.key());
         let mut requested_lines = Vec::with_capacity(4);
@@ -513,7 +525,39 @@ impl RadarRenderer {
         } else {
             preferred_anchor_x.max(block_width + 1.0)
         };
-        let top = (y - block_height / 2.0).clamp(1.0, theme::SIZE as f32 - block_height - 1.0);
+        let maximum_top = theme::SIZE as f32 - block_height - 1.0;
+        let natural_top = (y - block_height / 2.0).clamp(1.0, maximum_top);
+        let block_left = if on_right {
+            anchor_x
+        } else {
+            anchor_x - block_width
+        };
+        let block_right = block_left + block_width;
+        let top = footer_bounds.map_or(natural_top, |footer| {
+            let natural = FooterBounds {
+                left: block_left,
+                top: natural_top,
+                right: block_right,
+                bottom: natural_top + block_height,
+            };
+            if !natural.intersects(footer) {
+                return natural_top;
+            }
+            for candidate in [footer.top - block_height, footer.bottom]
+                .map(|candidate| candidate.clamp(1.0, maximum_top))
+            {
+                let alternative = FooterBounds {
+                    left: block_left,
+                    top: candidate,
+                    right: block_right,
+                    bottom: candidate + block_height,
+                };
+                if !alternative.intersects(footer) {
+                    return candidate;
+                }
+            }
+            natural_top
+        });
         for (index, (line, color)) in lines.into_iter().enumerate() {
             text.draw(
                 pixmap,
@@ -538,6 +582,11 @@ pub fn write_fixtures(output: &Path) -> Result<(), RenderError> {
         ("radar-traffic.png", fixture_traffic()?),
         ("radar-stale.png", fixture_stale()?),
         ("radar-enriched.png", fixture_enriched()?),
+        ("radar-footer.png", fixture_footer()?),
+        (
+            "radar-footer-large-stale.png",
+            fixture_footer_large_stale()?,
+        ),
     ] {
         frame.save_png(&output.join(name))?;
     }
@@ -550,6 +599,7 @@ pub fn fixture_empty() -> Result<Frame, RenderError> {
         &fixture_settings(),
         &[],
         Duration::ZERO,
+        0,
     )
 }
 
@@ -587,6 +637,7 @@ pub fn fixture_traffic() -> Result<Frame, RenderError> {
         &fixture_settings(),
         &[fixture_airport()],
         Duration::from_secs(5),
+        0,
     )
 }
 
@@ -596,6 +647,7 @@ pub fn fixture_stale() -> Result<Frame, RenderError> {
         &fixture_settings(),
         &[],
         Duration::from_secs(30),
+        0,
     )
 }
 
@@ -638,6 +690,42 @@ pub fn fixture_enriched() -> Result<Frame, RenderError> {
         &settings,
         &[fixture_airport()],
         Duration::from_secs(5),
+        0,
+    )
+}
+
+pub fn fixture_footer() -> Result<Frame, RenderError> {
+    let mut settings = fixture_settings();
+    settings.footer.show_condition = true;
+    settings.footer.show_temperature = true;
+    settings.footer.show_humidity = true;
+    settings.footer.show_time = true;
+    settings.footer.show_date = true;
+    settings.footer.time_zone = crate::model::TimeZone::Zulu;
+    fixture_renderer()?.render(
+        &fixture_footer_snapshot(Duration::ZERO),
+        &settings,
+        &[],
+        Duration::from_secs(5),
+        1_783_768_260,
+    )
+}
+
+pub fn fixture_footer_large_stale() -> Result<Frame, RenderError> {
+    let mut settings = fixture_settings();
+    settings.radar_text_scale_percent = 130;
+    settings.footer.show_condition = true;
+    settings.footer.show_temperature = true;
+    settings.footer.show_humidity = true;
+    settings.footer.show_time = true;
+    settings.footer.show_date = true;
+    settings.footer.time_zone = crate::model::TimeZone::Zulu;
+    fixture_renderer()?.render(
+        &fixture_footer_snapshot(Duration::ZERO),
+        &settings,
+        &[],
+        crate::weather::ENVIRONMENT_STALE_AFTER,
+        1_783_768_260,
     )
 }
 
@@ -695,6 +783,22 @@ fn fixture_snapshot(aircraft: Vec<Aircraft>, fetched_at: Option<Duration>) -> Ra
         enrichment: Arc::new(HashMap::new()),
         environment: None,
         fetched_at,
+        last_error_at: None,
+    }
+}
+
+fn fixture_footer_snapshot(fetched_at: Duration) -> RadarSnapshot {
+    RadarSnapshot {
+        aircraft: Arc::from([]),
+        enrichment: Arc::new(HashMap::new()),
+        environment: Some(crate::model::EnvironmentReading {
+            temperature_celsius: 22.0,
+            humidity_percent: 54,
+            weather_code: 2,
+            utc_offset_seconds: -4 * 60 * 60,
+            fetched_at,
+        }),
+        fetched_at: Some(Duration::ZERO),
         last_error_at: None,
     }
 }

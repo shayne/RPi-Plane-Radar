@@ -12,7 +12,9 @@ use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 use planeradar::app::{AppRuntime, PlaneRadarApp};
 use planeradar::display::{DisplayHandler, InputEvent};
-use planeradar::model::{Aircraft, AppState, Location, RadarSettings};
+use planeradar::model::{
+    Aircraft, AppState, EnvironmentReading, Location, RadarSettings, TimeZone,
+};
 use planeradar::range::next_range_index;
 use planeradar::render::FontAsset;
 use planeradar::render::radar::RadarRenderer;
@@ -376,6 +378,90 @@ fn stale_boundary_draws_at_thirty_seconds_and_fresh_data_clears_it() {
         .frame
         .expect("recovered frame");
     assert_eq!(recovered, fresh);
+}
+
+#[test]
+fn visible_time_and_date_redraw_exactly_when_the_sampled_unix_minute_changes() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let mut settings = configured();
+    settings.footer.show_time = true;
+    settings.footer.show_date = true;
+    settings.footer.time_zone = TimeZone::Zulu;
+    let (mut app, control, _) = app_fixture(
+        settings,
+        Some(Duration::ZERO),
+        directory.path().join("debug.png"),
+    );
+
+    control.unix_seconds.store(6_059, Ordering::Release);
+    assert!(app.step(&[], Instant::now()).frame.is_some());
+    assert!(app.step(&[], Instant::now()).frame.is_none());
+    control.unix_seconds.store(6_060, Ordering::Release);
+    assert!(app.step(&[], Instant::now()).frame.is_some());
+    control.unix_seconds.store(6_119, Ordering::Release);
+    assert!(app.step(&[], Instant::now()).frame.is_none());
+    control.unix_seconds.store(6_120, Ordering::Release);
+    assert!(app.step(&[], Instant::now()).frame.is_some());
+}
+
+#[test]
+fn disabled_footer_ignores_wall_minutes_and_keeps_generation_and_adsb_stale_invalidation() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let (mut app, control, _) = app_fixture(
+        configured(),
+        Some(Duration::ZERO),
+        directory.path().join("debug.png"),
+    );
+
+    control.unix_seconds.store(6_059, Ordering::Release);
+    assert!(app.step(&[], Instant::now()).frame.is_some());
+    control.unix_seconds.store(6_120, Ordering::Release);
+    assert!(app.step(&[], Instant::now()).frame.is_none());
+    control.now_ms.store(29_999, Ordering::Release);
+    assert!(app.step(&[], Instant::now()).frame.is_none());
+    control.now_ms.store(30_000, Ordering::Release);
+    assert!(app.step(&[], Instant::now()).frame.is_some());
+    control.model.record_adsb_error(Duration::from_secs(31));
+    assert!(app.step(&[], Instant::now()).frame.is_some());
+}
+
+#[test]
+fn selected_weather_redraws_at_the_monotonic_forty_five_minute_boundary() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let mut settings = configured();
+    settings.footer.show_temperature = true;
+    let (mut app, control, _) = app_fixture(
+        settings,
+        Some(Duration::ZERO),
+        directory.path().join("debug.png"),
+    );
+    let location = control
+        .model
+        .snapshot()
+        .settings
+        .location
+        .expect("configured location");
+    control
+        .model
+        .record_environment_if_location(
+            &location,
+            EnvironmentReading {
+                temperature_celsius: 22.0,
+                humidity_percent: 54,
+                weather_code: 2,
+                utc_offset_seconds: -4 * 60 * 60,
+                fetched_at: Duration::ZERO,
+            },
+        )
+        .expect("current environment update");
+
+    control.now_ms.store(2_699_000, Ordering::Release);
+    assert!(app.step(&[], Instant::now()).frame.is_some());
+    control.now_ms.store(2_699_999, Ordering::Release);
+    assert!(app.step(&[], Instant::now()).frame.is_none());
+    control.now_ms.store(2_700_000, Ordering::Release);
+    assert!(app.step(&[], Instant::now()).frame.is_some());
+    assert!(app.step(&[], Instant::now()).frame.is_none());
 }
 
 #[test]
