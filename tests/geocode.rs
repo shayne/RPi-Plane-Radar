@@ -284,6 +284,7 @@ fn request_uses_original_query_exact_parameters_user_agent_and_default_provider(
         request.headers,
         [("User-Agent".to_owned(), USER_AGENT.to_owned())]
     );
+    assert_eq!(request.max_response_bytes, 256 * 1024);
     assert!(request.verify_tls);
 }
 

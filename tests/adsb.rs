@@ -242,6 +242,7 @@ fn fetch_builds_exact_tls_verified_bounded_request() {
     assert!(request.headers.is_empty());
     assert_eq!(request.connect_timeout, Duration::from_millis(3050));
     assert_eq!(request.read_timeout, Duration::from_secs(10));
+    assert_eq!(request.max_response_bytes, 2 * 1024 * 1024);
     assert!(request.verify_tls);
 }
 
@@ -299,6 +300,7 @@ fn production_http_client_rejects_disabled_tls_before_network_io() {
             headers: Vec::new(),
             connect_timeout: Duration::from_millis(1),
             read_timeout: Duration::from_millis(1),
+            max_response_bytes: 1,
             verify_tls: false,
         })
         .expect_err("disabled TLS must be rejected");

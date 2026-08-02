@@ -14,6 +14,7 @@ pub struct HttpRequest {
     pub headers: Vec<(String, String)>,
     pub connect_timeout: Duration,
     pub read_timeout: Duration,
+    pub max_response_bytes: usize,
     pub verify_tls: bool,
 }
 
@@ -27,12 +28,16 @@ pub struct HttpResponse {
 pub enum HttpError {
     #[error("HTTP timeout values exceed the supported duration")]
     InvalidTimeout,
+    #[error("HTTP response body limit must be greater than zero")]
+    InvalidBodyLimit,
     #[error("HTTP request timed out")]
     Timeout,
     #[error("HTTP transport failed")]
     Transport,
     #[error("HTTP response body failed")]
     Body,
+    #[error("HTTP response body exceeded its limit")]
+    BodyTooLarge,
     #[error("TLS certificate verification is required")]
     TlsVerificationRequired,
 }
@@ -57,13 +62,16 @@ impl HttpClient for UreqHttpClient {
 
         let mut response = call.call().map_err(map_request_error)?;
         let status = response.status().as_u16();
-        let body = response.body_mut().read_to_vec().map_err(map_body_error)?;
+        let body = read_response_body(response.body_mut(), request.max_response_bytes)?;
 
         Ok(HttpResponse { status, body })
     }
 }
 
 fn build_agent(request: &HttpRequest) -> Result<ureq::Agent, HttpError> {
+    if request.max_response_bytes == 0 {
+        return Err(HttpError::InvalidBodyLimit);
+    }
     let global_timeout = request
         .connect_timeout
         .checked_add(request.read_timeout)
@@ -86,6 +94,16 @@ fn build_agent(request: &HttpRequest) -> Result<ureq::Agent, HttpError> {
         .new_agent())
 }
 
+fn read_response_body(
+    body: &mut ureq::Body,
+    max_response_bytes: usize,
+) -> Result<Vec<u8>, HttpError> {
+    body.with_config()
+        .limit(max_response_bytes as u64)
+        .read_to_vec()
+        .map_err(map_body_error)
+}
+
 fn map_request_error(error: ureq::Error) -> HttpError {
     match error {
         ureq::Error::Timeout(_) => HttpError::Timeout,
@@ -96,6 +114,7 @@ fn map_request_error(error: ureq::Error) -> HttpError {
 fn map_body_error(error: ureq::Error) -> HttpError {
     match error {
         ureq::Error::Timeout(_) => HttpError::Timeout,
+        ureq::Error::BodyExceedsLimit(_) => HttpError::BodyTooLarge,
         _ => HttpError::Body,
     }
 }
@@ -111,6 +130,7 @@ mod tests {
             headers: Vec::new(),
             connect_timeout: Duration::from_millis(3050),
             read_timeout: Duration::from_secs(10),
+            max_response_bytes: 256 * 1024,
             verify_tls: true,
         }
     }
@@ -136,6 +156,25 @@ mod tests {
             build_agent(&request),
             Err(HttpError::InvalidTimeout)
         ));
+    }
+
+    #[test]
+    fn body_limits_are_explicit_and_bounded() {
+        let mut request = request();
+        request.max_response_bytes = 0;
+        assert!(matches!(
+            build_agent(&request),
+            Err(HttpError::InvalidBodyLimit)
+        ));
+
+        assert_eq!(
+            map_body_error(ureq::Error::BodyExceedsLimit(64)),
+            HttpError::BodyTooLarge
+        );
+        assert_eq!(
+            map_body_error(ureq::Error::RequireHttpsOnly("not a body limit".to_owned())),
+            HttpError::Body
+        );
     }
 
     #[test]

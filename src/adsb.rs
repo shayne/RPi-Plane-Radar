@@ -11,6 +11,7 @@ const KM_PER_NAUTICAL_MILE: f64 = 1.852;
 const MAX_AIRCRAFT: usize = 64;
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(3050);
 const READ_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 
 #[derive(Debug, Error)]
 pub enum AdsbError {
@@ -44,6 +45,7 @@ impl<C: HttpClient> AdsbClient<C> {
             headers: Vec::new(),
             connect_timeout: CONNECT_TIMEOUT,
             read_timeout: READ_TIMEOUT,
+            max_response_bytes: MAX_RESPONSE_BYTES,
             verify_tls: true,
         };
         let response = self.http.execute(request)?;

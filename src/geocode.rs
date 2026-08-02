@@ -17,6 +17,7 @@ const DEFAULT_PROVIDER_BASE: &str = "https://nominatim.openstreetmap.org/search"
 const USER_AGENT: &str = "RPi-Plane-Radar/0.1 (+https://github.com/shayne/RPi-Plane-Radar)";
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(3050);
 const READ_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_RESPONSE_BYTES: usize = 256 * 1024;
 const MINIMUM_REQUEST_INTERVAL: Duration = Duration::from_millis(1050);
 const CACHE_TTL_SECONDS: u64 = 7 * 24 * 60 * 60;
 const CACHE_SCHEMA_VERSION: u32 = 1;
@@ -125,6 +126,7 @@ impl<C: HttpClient, K: Clock, S: Sleeper> Geocoder<C, K, S> {
             headers: vec![("User-Agent".to_owned(), USER_AGENT.to_owned())],
             connect_timeout: CONNECT_TIMEOUT,
             read_timeout: READ_TIMEOUT,
+            max_response_bytes: MAX_RESPONSE_BYTES,
             verify_tls: true,
         };
         let response = self.http.execute(request)?;
