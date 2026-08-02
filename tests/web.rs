@@ -453,16 +453,31 @@ fn page_exposes_local_settings_without_wifi_or_browser_geolocation() {
     assert!(
         response
             .body
-            .contains("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">")
+            .contains("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1, viewport-fit=cover\">")
     );
     for expected in [
-        "box-sizing: border-box",
-        "min-height: 2.75rem",
-        "overflow-wrap: anywhere",
+        "--surface: oklch(",
+        "min-height: 44px",
+        ":focus-visible",
+        "@media (min-width: 52rem)",
+        "grid-template-areas:",
+        "align-content: start",
+        "prefers-reduced-motion: reduce",
     ] {
         assert!(
             response.body.contains(expected),
-            "page omitted mobile CSS {expected:?}"
+            "page omitted CSS contract {expected:?}"
+        );
+    }
+    for forbidden in [
+        "<script",
+        "https://fonts.",
+        "backdrop-filter",
+        "background-clip: text",
+    ] {
+        assert!(
+            !response.body.contains(forbidden),
+            "page included {forbidden:?}"
         );
     }
     let page = response.body.to_lowercase();

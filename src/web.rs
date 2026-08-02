@@ -821,31 +821,526 @@ fn render_page(
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Plane Radar local control</title>
 <style>
+:root {{
+  color-scheme: dark;
+  --canvas: oklch(14% 0.012 155);
+  --surface: oklch(18% 0.014 155);
+  --surface-raised: oklch(22% 0.016 155);
+  --surface-active: oklch(28% 0.025 155);
+  --text: oklch(94% 0.012 100);
+  --text-muted: oklch(72% 0.022 165);
+  --text-faint: oklch(60% 0.018 165);
+  --border: oklch(35% 0.022 155);
+  --border-strong: oklch(48% 0.04 150);
+  --accent: oklch(78% 0.14 145);
+  --accent-hover: oklch(84% 0.15 145);
+  --accent-ink: oklch(18% 0.035 145);
+  --warning: oklch(80% 0.13 80);
+  --warning-surface: oklch(23% 0.035 80);
+  --danger: oklch(74% 0.17 28);
+  --danger-surface: oklch(22% 0.045 28);
+  --success-surface: oklch(23% 0.04 145);
+  --radar-line: oklch(31% 0.045 150);
+  --focus: oklch(88% 0.14 145);
+  --space-xs: 0.25rem;
+  --space-sm: 0.5rem;
+  --space-md: 0.75rem;
+  --space-lg: 1.5rem;
+  --space-xl: 2rem;
+  --space-2xl: 3rem;
+  --radius-sm: 0.5rem;
+  --radius-md: 0.75rem;
+  --ease-out: cubic-bezier(0.25, 1, 0.5, 1);
+}}
+
 * {{ box-sizing: border-box; }}
-body {{ margin: 0; font-size: 16px; line-height: 1.5; }}
-main {{ width: min(100%, 58rem); margin: 0 auto; padding: 1rem; }}
-section {{ margin-block: 1.5rem; }}
-form {{ display: grid; gap: 0.75rem; }}
-label {{ display: grid; gap: 0.25rem; min-width: 0; }}
-input, select, button {{ width: 100%; min-height: 2.75rem; font: inherit; }}
-p, button {{ overflow-wrap: anywhere; }}
-.radar-status div {{ display: grid; }}
-.segmented {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }}
-.segmented--range {{ grid-template-columns: repeat(4, minmax(0, 1fr)); }}
-.segment input {{ width: auto; min-height: auto; }}
-.search-result {{ grid-template-columns: minmax(0, 1fr) auto; align-items: center; }}
-@media (min-width: 40rem) {{ main {{ padding: 2rem; }} }}
+
+html {{ background: var(--canvas); }}
+
+body {{
+  min-width: 20rem;
+  min-height: 100svh;
+  margin: 0;
+  background: var(--canvas);
+  color: var(--text);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  font-size: 1rem;
+  font-weight: 400;
+  font-kerning: normal;
+  letter-spacing: 0.01em;
+  line-height: 1.55;
+}}
+
+button, input, summary {{
+  font: inherit;
+}}
+
+button, input[type="search"], input[type="number"], input[type="text"],
+input:not([type]) {{
+  min-height: 44px;
+}}
+
+button, a, input, summary {{
+  -webkit-tap-highlight-color: transparent;
+}}
+
+button, input, summary, a {{
+  transition: color 160ms var(--ease-out), background-color 160ms var(--ease-out),
+    border-color 160ms var(--ease-out), transform 160ms var(--ease-out);
+}}
+
+button:focus-visible, input:focus-visible, summary:focus-visible, a:focus-visible {{
+  outline: 3px solid var(--focus);
+  outline-offset: 3px;
+}}
+
+button {{
+  width: 100%;
+  min-height: 44px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--surface-raised);
+  color: var(--text);
+  cursor: pointer;
+  font-weight: 700;
+  line-height: 1.2;
+  padding: 0.75rem 1rem;
+}}
+
+button:active {{ transform: translateY(1px); }}
+button:disabled {{ cursor: not-allowed; opacity: 0.5; }}
+
+a {{ color: var(--accent); text-underline-offset: 0.22em; }}
+
+h1, h2, h3, p {{ margin: 0; }}
+h1, h2, h3 {{ text-wrap: balance; }}
+p {{ max-width: 68ch; text-wrap: pretty; }}
+
+.shell {{
+  width: min(100%, 74rem);
+  margin: 0 auto;
+  padding: max(var(--space-lg), env(safe-area-inset-top))
+    max(var(--space-lg), env(safe-area-inset-right))
+    max(var(--space-2xl), env(safe-area-inset-bottom))
+    max(var(--space-lg), env(safe-area-inset-left));
+}}
+
+.masthead {{
+  position: relative;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: var(--space-lg);
+  align-items: center;
+  overflow: hidden;
+  padding: var(--space-sm) 0 var(--space-xl);
+  border-bottom: 1px solid var(--border);
+}}
+
+.brand-lockup {{ display: grid; gap: 0.125rem; min-width: 0; }}
+
+.eyebrow {{
+  color: var(--accent);
+  font-size: 0.75rem;
+  font-weight: 800;
+  letter-spacing: 0.12em;
+  line-height: 1.2;
+  text-transform: uppercase;
+}}
+
+h1 {{
+  margin-left: -0.04em;
+  color: var(--text);
+  font-size: 2rem;
+  font-weight: 750;
+  letter-spacing: -0.035em;
+  line-height: 1.05;
+}}
+
+h2 {{
+  color: var(--text);
+  font-size: 1.25rem;
+  font-weight: 750;
+  letter-spacing: -0.015em;
+  line-height: 1.2;
+}}
+
+h3 {{ font-size: 1rem; font-weight: 700; line-height: 1.25; }}
+
+.radar-mark {{
+  position: relative;
+  display: block;
+  width: 4rem;
+  height: 4rem;
+  border: 1px solid var(--border-strong);
+  border-radius: 50%;
+}}
+
+.radar-mark::before {{
+  position: absolute;
+  inset: 0.85rem;
+  border: 1px solid var(--radar-line);
+  border-radius: 50%;
+  content: "";
+}}
+
+.radar-mark::after {{
+  position: absolute;
+  inset: calc(50% - 0.2rem);
+  border-radius: 50%;
+  background: var(--accent);
+  content: "";
+}}
+
+.radar-mark i::before, .radar-mark i::after {{
+  position: absolute;
+  background: var(--radar-line);
+  content: "";
+}}
+
+.radar-mark i::before {{ top: 0; bottom: 0; left: calc(50% - 0.5px); width: 1px; }}
+.radar-mark i::after {{ right: 0; left: 0; top: calc(50% - 0.5px); height: 1px; }}
+
+.device-url {{
+  grid-column: 1 / -1;
+  display: grid;
+  gap: 0.125rem;
+  width: fit-content;
+  max-width: 100%;
+  color: var(--text-muted);
+  font-size: 0.875rem;
+  overflow-wrap: anywhere;
+  text-decoration-color: var(--border-strong);
+}}
+
+.device-url span {{
+  color: var(--text-faint);
+  font-size: 0.6875rem;
+  font-weight: 800;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}}
+
+.radar-status {{
+  display: flex;
+  gap: var(--space-md);
+  align-items: center;
+  padding: var(--space-lg) 0;
+  border-bottom: 1px solid var(--border);
+}}
+
+.radar-status div {{ display: grid; gap: 0.125rem; min-width: 0; }}
+.radar-status strong {{ font-size: 0.875rem; }}
+.radar-status span:not(.status-mark) {{
+  color: var(--text-muted);
+  font-size: 0.875rem;
+  overflow-wrap: anywhere;
+}}
+
+.status-mark {{
+  flex: 0 0 auto;
+  width: 0.75rem;
+  height: 0.75rem;
+  border: 2px solid currentColor;
+  border-radius: 50%;
+  box-shadow: inset 0 0 0 2px var(--canvas);
+}}
+
+.radar-status--setup .status-mark {{ color: var(--warning); background: var(--warning); }}
+.radar-status--ready .status-mark {{ color: var(--accent); background: var(--accent); }}
+
+.notice {{
+  display: flex;
+  gap: var(--space-md);
+  align-items: flex-start;
+  max-width: none;
+  margin-top: var(--space-lg);
+  padding: var(--space-md) var(--space-lg);
+  border: 1px solid currentColor;
+  border-radius: var(--radius-sm);
+  font-size: 0.9375rem;
+  font-weight: 650;
+}}
+
+.notice::before {{
+  flex: 0 0 auto;
+  font-weight: 900;
+}}
+
+.notice--error {{ color: var(--danger); background: var(--danger-surface); }}
+.notice--error::before {{ content: "!"; }}
+.notice--success {{ color: var(--accent); background: var(--success-surface); }}
+.notice--success::before {{ content: "✓"; }}
+
+.console-grid {{
+  display: grid;
+  grid-template-areas:
+    "location"
+    "manual"
+    "preferences";
+}}
+
+.location {{
+  grid-area: location;
+  display: grid;
+  gap: var(--space-lg);
+  margin: 0;
+  padding: var(--space-xl) 0;
+}}
+
+.location > p, .preferences > p, fieldset > p {{
+  color: var(--text-muted);
+  font-size: 0.9375rem;
+}}
+
+.location > form {{ display: grid; gap: var(--space-md); }}
+
+label, legend {{ color: var(--text); font-size: 0.875rem; font-weight: 700; }}
+
+input[type="search"], input[type="number"], input:not([type]) {{
+  width: 100%;
+  min-width: 0;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--text);
+  padding: 0.65rem 0.75rem;
+}}
+
+input::placeholder {{ color: var(--text-faint); opacity: 1; }}
+input:hover {{ border-color: var(--text-muted); }}
+
+.location > form button {{ margin-top: var(--space-xs); }}
+
+.location > form + p {{
+  max-width: 62ch;
+  color: var(--text-faint);
+  font-size: 0.75rem;
+  line-height: 1.5;
+}}
+
+.search-results {{
+  display: grid;
+  gap: 0;
+  margin: var(--space-sm) 0 0;
+  border-bottom: 1px solid var(--border);
+}}
+
+.result-heading {{
+  display: flex;
+  gap: var(--space-md);
+  align-items: baseline;
+  justify-content: space-between;
+  padding-bottom: var(--space-md);
+}}
+
+.result-heading span {{ color: var(--text-faint); font-size: 0.75rem; }}
+
+.search-result {{
+  display: grid;
+  gap: var(--space-md);
+  padding: var(--space-md) 0;
+  border-top: 1px solid var(--border);
+}}
+
+.search-result > span {{ min-width: 0; color: var(--text-muted); overflow-wrap: anywhere; }}
+
+.empty-results {{
+  display: grid;
+  gap: var(--space-xs);
+  padding: var(--space-lg) 0;
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+}}
+
+.empty-results span {{ color: var(--text-muted); font-size: 0.875rem; }}
+
+.settings-form {{ display: contents; }}
+
+.manual {{
+  grid-area: manual;
+  align-self: start;
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+}}
+
+.manual summary {{
+  min-height: 44px;
+  padding: var(--space-md) 2rem var(--space-md) 0;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 0.875rem;
+  font-weight: 700;
+}}
+
+.manual[open] summary {{ color: var(--text); }}
+.manual-fields {{ display: grid; gap: var(--space-lg); padding: var(--space-md) 0 var(--space-xl); }}
+
+.field {{ display: grid; gap: var(--space-sm); min-width: 0; }}
+.field label span {{ color: var(--text-faint); font-weight: 500; }}
+.field input {{ font-variant-numeric: tabular-nums; }}
+
+.preferences {{
+  grid-area: preferences;
+  display: grid;
+  gap: var(--space-xl);
+  align-content: start;
+  margin: 0;
+  padding: var(--space-xl) 0 0;
+}}
+
+fieldset {{ display: grid; gap: var(--space-md); min-width: 0; margin: 0; padding: 0; border: 0; }}
+legend {{ margin-bottom: var(--space-md); padding: 0; }}
+fieldset > p {{ margin-top: calc(var(--space-sm) * -1); }}
+
+.segmented {{
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1px;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--border);
+}}
+
+.segmented--range {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
+
+.segment {{ position: relative; display: flex; min-width: 0; cursor: pointer; }}
+
+.segment input {{
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+}}
+
+.segment span {{
+  display: flex;
+  flex: 1;
+  min-height: 44px;
+  align-items: center;
+  justify-content: center;
+  background: var(--surface);
+  color: var(--text-muted);
+  font-size: 0.875rem;
+  font-variant-numeric: tabular-nums;
+  font-weight: 700;
+  padding: var(--space-sm);
+  text-align: center;
+}}
+
+.segment input:checked + span {{ background: var(--accent); color: var(--accent-ink); }}
+
+.segment input:focus-visible + span {{
+  position: relative;
+  z-index: 1;
+  outline: 3px solid var(--focus);
+  outline-offset: -3px;
+}}
+
+.switch {{
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: var(--space-md);
+  align-items: center;
+  cursor: pointer;
+}}
+
+.switch > input {{ position: absolute; width: 1px; height: 1px; opacity: 0; }}
+
+.switch-track {{
+  position: relative;
+  width: 3rem;
+  height: 1.75rem;
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+  background: var(--surface-raised);
+}}
+
+.switch-track::after {{
+  position: absolute;
+  top: 0.25rem;
+  left: 0.25rem;
+  width: 1.125rem;
+  height: 1.125rem;
+  border-radius: 50%;
+  background: var(--text-muted);
+  content: "";
+  transition: background-color 160ms var(--ease-out), transform 160ms var(--ease-out);
+}}
+
+.switch input:checked + .switch-track {{ border-color: var(--accent); background: var(--accent); }}
+.switch input:checked + .switch-track::after {{ background: var(--accent-ink); transform: translateX(1.2rem); }}
+.switch input:focus-visible + .switch-track {{ outline: 3px solid var(--focus); outline-offset: 3px; }}
+
+.switch-copy {{ display: grid; gap: 0.125rem; }}
+.switch-copy strong {{ font-size: 0.875rem; }}
+.switch-copy small {{ color: var(--text-muted); font-size: 0.8125rem; font-weight: 400; line-height: 1.45; }}
+
+.button-primary {{
+  border-color: var(--accent);
+  background: var(--accent);
+  color: var(--accent-ink);
+}}
+
+@media (hover: hover) {{
+  button:hover {{ border-color: var(--text-muted); background: var(--surface-active); }}
+  .button-primary:hover {{ border-color: var(--accent-hover); background: var(--accent-hover); }}
+  a:hover {{ color: var(--accent-hover); }}
+  .manual summary:hover {{ color: var(--accent); }}
+}}
+
+@media (min-width: 34rem) {{
+  .location > form {{ grid-template-columns: minmax(0, 1fr) auto; align-items: end; }}
+  .location > form label {{ grid-column: 1 / -1; }}
+  .location > form button {{ width: auto; min-width: 8rem; margin-top: 0; }}
+  .search-result {{ grid-template-columns: minmax(0, 1fr) auto; align-items: center; }}
+  .search-result button {{ width: auto; }}
+  .manual-fields {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
+  .field--wide {{ grid-column: 1 / -1; }}
+  .segmented--range {{ grid-template-columns: repeat(4, minmax(0, 1fr)); }}
+}}
+
+@media (min-width: 52rem) {{
+  .shell {{ padding-top: var(--space-xl); }}
+  .masthead {{ grid-template-columns: auto minmax(0, 1fr) auto; }}
+  .device-url {{ grid-column: auto; justify-items: end; text-align: right; }}
+  .console-grid {{
+    grid-template-columns: minmax(0, 1.35fr) minmax(18rem, 0.85fr);
+    grid-template-areas:
+      "location preferences"
+      "manual preferences";
+    column-gap: var(--space-2xl);
+    align-items: start;
+  }}
+  .location {{ padding-top: var(--space-2xl); }}
+  .manual {{ margin-bottom: var(--space-2xl); }}
+  .preferences {{
+    min-height: 100%;
+    padding: var(--space-2xl) 0 var(--space-2xl) var(--space-2xl);
+    border-left: 1px solid var(--border);
+  }}
+}}
+
+@media (prefers-reduced-motion: reduce) {{
+  *, *::before, *::after {{
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
+  }}
+}}
 </style>
 </head>
 <body>
-<main>
-<header>
-<p>Local control</p>
+<main class="shell">
+<header class="masthead">
+<span class="radar-mark" aria-hidden="true"><i></i></span>
+<div class="brand-lockup">
+<p class="eyebrow">Local control</p>
 <h1>Plane Radar</h1>
-<a href="{local_url}">{local_url}</a>
+</div>
+<a class="device-url" href="{local_url}"><span>Device</span>{local_url}</a>
 </header>
 {status}
 {notice}
@@ -857,7 +1352,7 @@ p, button {{ overflow-wrap: anywhere; }}
 <input type="hidden" name="csrf_token" value="{csrf}">
 <label for="place-search">Place or address</label>
 <input id="place-search" name="query" type="search" autocomplete="street-address" required>
-<button type="submit">Search</button>
+<button type="submit">Search places</button>
 </form>
 <p>Your submitted search text is sent to OpenStreetMap. Search data © OpenStreetMap contributors.</p>
 {search_results}
@@ -867,12 +1362,18 @@ p, button {{ overflow-wrap: anywhere; }}
 <details class="manual"{manual_open}>
 <summary>Manual coordinates</summary>
 <div class="manual-fields">
+<div class="field">
 <label for="latitude">Latitude</label>
 <input id="latitude" name="latitude" value="{latitude}" inputmode="decimal" type="number" min="-90" max="90" step="any" required>
+</div>
+<div class="field">
 <label for="longitude">Longitude</label>
 <input id="longitude" name="longitude" value="{longitude}" inputmode="decimal" type="number" min="-180" max="180" step="any" required>
+</div>
+<div class="field field--wide">
 <label for="place-name">Place name <span>(optional)</span></label>
 <input id="place-name" name="label" value="{label}" autocomplete="off">
+</div>
 </div>
 </details>
 <section class="preferences" aria-labelledby="preferences-title">
@@ -887,9 +1388,12 @@ p, button {{ overflow-wrap: anywhere; }}
 <div class="segmented segmented--range">{range_options}</div>
 </fieldset>
 <input type="hidden" name="show_runways_present" value="true">
-<label class="switch"><input type="checkbox" name="show_runways" value="true"{runways_checked}><span>Show runways</span></label>
-<p>Include nearby airport runways on the radar.</p>
-<button type="submit">Apply settings</button>
+<label class="switch">
+<input type="checkbox" name="show_runways" value="true"{runways_checked}>
+<span class="switch-track" aria-hidden="true"></span>
+<span class="switch-copy"><strong>Show runways</strong><small>Include nearby airport runways on the radar.</small></span>
+</label>
+<button class="button-primary" type="submit">Apply settings</button>
 </section>
 </form>
 </div>
