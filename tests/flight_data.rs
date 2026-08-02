@@ -377,6 +377,54 @@ fn non_https_provider_base_is_rejected_before_http_execution() {
 }
 
 #[test]
+fn provider_base_preserves_path_and_rejects_query_or_fragment_before_http() {
+    let model_response = serde_json::json!({
+        "response": {"aircraft": {"type": "Boeing 737-800", "icao_type": "B738"}}
+    });
+    let clock = FakeClock::default();
+    let path_http = FakeHttpClient::responding(clock.clone(), [json_response(model_response)]);
+    let path_probe = path_http.clone();
+    let sleeper = FakeSleeper::new(clock.clone());
+    let mut path_client = FlightDataClient::with_provider_base(
+        path_http,
+        clock,
+        sleeper,
+        "https://api.adsbdb.test/custom/v0///".to_owned(),
+    );
+    path_client
+        .lookup(
+            &aircraft("abc123", "unused"),
+            EnrichmentNeeds {
+                route: false,
+                model: true,
+            },
+        )
+        .expect("base-path lookup");
+    assert_eq!(
+        path_probe.requests()[0].1.url,
+        "https://api.adsbdb.test/custom/v0/aircraft/ABC123"
+    );
+
+    for invalid_base in [
+        "https://api.adsbdb.test/v0?tenant=one",
+        "https://api.adsbdb.test/v0#provider",
+    ] {
+        let clock = FakeClock::default();
+        let http = FakeHttpClient::responding(clock.clone(), []);
+        let probe = http.clone();
+        let sleeper = FakeSleeper::new(clock.clone());
+        let mut client =
+            FlightDataClient::with_provider_base(http, clock, sleeper, invalid_base.to_owned());
+
+        assert!(matches!(
+            client.lookup(&aircraft("abc123", "aal1"), both()),
+            Err(FlightDataError::Schema(_))
+        ));
+        assert_eq!(probe.request_count(), 0, "base: {invalid_base}");
+    }
+}
+
+#[test]
 fn endpoint_selection_normalizes_identifiers_and_sends_only_required_data() {
     let (mut route_client, route_http, _) =
         client([ok(include_bytes!("fixtures/adsbdb/callsign.json"))]);
@@ -543,6 +591,19 @@ fn combined_unknown_aircraft_still_uses_callsign_fallback_for_route() {
     assert_eq!(lookup.route, LookupValue::Found("JFK→LAX".to_owned()));
     assert_eq!(lookup.model, LookupValue::Missing);
     assert_eq!(http.request_count(), 2);
+}
+
+#[test]
+fn combined_404_is_a_terminal_miss_without_callsign_fallback() {
+    let (mut client, http, _) = client([status(404, b"not found")]);
+
+    let lookup = client
+        .lookup(&aircraft("abc123", "aal1"), both())
+        .expect("combined 404");
+
+    assert_eq!(lookup.route, LookupValue::Missing);
+    assert_eq!(lookup.model, LookupValue::Missing);
+    assert_eq!(http.request_count(), 1);
 }
 
 fn found(route: &str, model: &str) -> FlightLookup {

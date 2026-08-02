@@ -268,7 +268,9 @@ impl<C: HttpClient, K: Clock, S: Sleeper> FlightDataClient<C, K, S> {
                 let payload = self.request_aircraft(&hex, Some(&callsign))?;
                 lookup.model = model_lookup(&payload);
                 lookup.route = route_lookup(&payload);
-                if matches!(lookup.route, LookupValue::Missing) {
+                if matches!(lookup.route, LookupValue::Missing)
+                    && !matches!(payload, ProviderPayload::NotFound)
+                {
                     let fallback = self.request_callsign(&callsign)?;
                     lookup.route = route_lookup(&fallback);
                 }
@@ -313,7 +315,7 @@ impl<C: HttpClient, K: Clock, S: Sleeper> FlightDataClient<C, K, S> {
         })?;
         match response.status {
             200 => parse_response(&response.body),
-            404 => Ok(ProviderPayload::Missing),
+            404 => Ok(ProviderPayload::NotFound),
             status => Err(FlightDataError::Status(status)),
         }
     }
@@ -344,7 +346,11 @@ impl<C: HttpClient, K: Clock, S: Sleeper> FlightDataService for FlightDataClient
 fn validate_provider_base(provider_base: &str) -> Result<(), FlightDataError> {
     let url = Url::parse(provider_base)
         .map_err(|_| FlightDataError::Schema("provider base must be a valid HTTPS URL"))?;
-    if url.scheme() != "https" || !url.has_host() {
+    if url.scheme() != "https"
+        || !url.has_host()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
         return Err(FlightDataError::Schema(
             "provider base must be a valid HTTPS URL",
         ));
@@ -364,6 +370,7 @@ fn normalize_identifier(identifier: &str) -> String {
 enum ProviderPayload {
     Response(ResponseObject),
     Missing,
+    NotFound,
 }
 
 #[derive(Debug, Deserialize)]
@@ -433,7 +440,7 @@ fn route_lookup(payload: &ProviderPayload) -> LookupValue<String> {
             .and_then(parse_route)
             .map(LookupValue::Found)
             .unwrap_or(LookupValue::Missing),
-        ProviderPayload::Missing => LookupValue::Missing,
+        ProviderPayload::Missing | ProviderPayload::NotFound => LookupValue::Missing,
     }
 }
 
@@ -445,7 +452,7 @@ fn model_lookup(payload: &ProviderPayload) -> LookupValue<String> {
             .and_then(compact_aircraft_model)
             .map(LookupValue::Found)
             .unwrap_or(LookupValue::Missing),
-        ProviderPayload::Missing => LookupValue::Missing,
+        ProviderPayload::Missing | ProviderPayload::NotFound => LookupValue::Missing,
     }
 }
 
