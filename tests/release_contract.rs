@@ -819,7 +819,7 @@ fn packager_rejects_a_dirty_release_source_before_building() {
     symlink("/usr/bin/git", bin.join("git")).expect("fixture git");
 
     let output = package_release_fixture_command()
-        .arg("0.1.0-rc.1")
+        .arg(package_release_fixture_version())
         .current_dir(temporary.path())
         .env("PATH", &bin)
         .env("PLANERADAR_PACKAGE_NO_BUILD", "1")
@@ -839,6 +839,10 @@ fn package_release_fixture_command() -> Command {
         .env_remove("PLANERADAR_WORKFLOW_REF")
         .env_remove("PLANERADAR_WORKFLOW_COMMIT");
     command
+}
+
+fn package_release_fixture_version() -> String {
+    format!("{}-rc.1", env!("CARGO_PKG_VERSION"))
 }
 
 #[test]
@@ -914,7 +918,7 @@ fn packager_fixture_clone_has_an_attached_head_when_its_source_is_detached() {
 fn packager_rejects_unreachable_source_version_mismatch_and_mislabeled_inputs() {
     let unreachable = clean_clone();
     let output = package_release_fixture_command()
-        .arg("0.1.0-rc.1")
+        .arg(package_release_fixture_version())
         .current_dir(unreachable.path())
         .env("PLANERADAR_SOURCE_REF", "f".repeat(40))
         .env("PLANERADAR_PACKAGE_SKIP_BUILDS", "1")
@@ -946,7 +950,7 @@ fn packager_rejects_unreachable_source_version_mismatch_and_mislabeled_inputs() 
         std::env::var("PATH").unwrap_or_default()
     );
     let output = package_release_fixture_command()
-        .arg("0.1.0-rc.1")
+        .arg(package_release_fixture_version())
         .current_dir(mislabeled.path())
         .env("PATH", path)
         .env("PLANERADAR_PACKAGE_SKIP_BUILDS", "1")
@@ -963,7 +967,7 @@ fn packager_rejects_unreachable_source_version_mismatch_and_mislabeled_inputs() 
 fn packager_rejects_an_ancestor_that_is_not_the_checked_out_source() {
     let checked_out = clean_clone();
     let output = package_release_fixture_command()
-        .arg("0.1.0-rc.1")
+        .arg(package_release_fixture_version())
         .current_dir(checked_out.path())
         .env("PLANERADAR_SOURCE_REF", "HEAD^")
         .env("PLANERADAR_PACKAGE_SKIP_BUILDS", "1")
@@ -1125,7 +1129,7 @@ tar -cf - -C "$input" "$member" |
     );
     let mut command = package_release_fixture_command();
     command
-        .arg("0.1.0-rc.1")
+        .arg(package_release_fixture_version())
         .current_dir(directory)
         .env("PATH", path)
         .env("PLANERADAR_PACKAGE_SKIP_BUILDS", "1")
