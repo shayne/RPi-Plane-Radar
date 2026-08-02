@@ -298,6 +298,7 @@ await_control_completion() {
   local authenticated_completion_status=""
   local control_started=0 resume_attempt=0 completion_snapshot_attempt=0
   while :; do
+    [[ $control_cancel_status -eq 0 ]] || return 1
     completion_status=""
     completion="$(read_control_completion)" || completion=""
     if [[ "$completion" =~ ^complete\ ([0-9]|[1-9][0-9]|1[0-9][0-9]|2[0-4][0-9]|25[0-5])$ ]]; then

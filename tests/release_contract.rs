@@ -3758,7 +3758,9 @@ fn bootstrap_real_pty_terminal_interrupt_restores_foreground_after_control_group
     assert!(
         outcome
             .cancellation_latency
-            .is_some_and(|latency| latency < Duration::from_secs(5))
+            .is_some_and(|latency| latency < Duration::from_secs(5)),
+        "PTY terminal interrupt was not prompt: {:?}",
+        outcome.cancellation_latency
     );
     assert_pty_foreground_restored(&outcome);
 }
