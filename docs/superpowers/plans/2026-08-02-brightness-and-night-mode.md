@@ -1374,6 +1374,10 @@ sudo test ! -e /var/lib/hyperpixel2r-kms/rollback-state
 sudo test -f /var/lib/hyperpixel2r-kms/accepted-state
 sudo test ! -e /var/lib/hyperpixel2r-kms/accepted-transition
 sudo test ! -e /var/lib/hyperpixel2r-kms/accepted-transition-prior-config.txt
+sudo test ! -e /var/lib/hyperpixel2r-kms/accepted-uninstall
+sudo test ! -L /var/lib/hyperpixel2r-kms/accepted-uninstall
+sudo test ! -e /var/lib/hyperpixel2r-kms/accepted-uninstall-stock.txt
+sudo test ! -L /var/lib/hyperpixel2r-kms/accepted-uninstall-stock.txt
 "
 prior_receipt="$(ssh user@radar.local \
   sudo cat /var/lib/hyperpixel2r-kms/accepted-state)"
@@ -1591,6 +1595,10 @@ sudo test ! -e /var/lib/hyperpixel2r-kms/tryboot-state
 sudo test ! -e /var/lib/hyperpixel2r-kms/rollback-state
 sudo test ! -e /var/lib/hyperpixel2r-kms/accepted-transition
 sudo test ! -e /var/lib/hyperpixel2r-kms/accepted-transition-prior-config.txt
+sudo test ! -e /var/lib/hyperpixel2r-kms/accepted-uninstall
+sudo test ! -L /var/lib/hyperpixel2r-kms/accepted-uninstall
+sudo test ! -e /var/lib/hyperpixel2r-kms/accepted-uninstall-stock.txt
+sudo test ! -L /var/lib/hyperpixel2r-kms/accepted-uninstall-stock.txt
 sudo test ! -e \
   /usr/lib/hyperpixel2r-kms/$candidate_driver_version/$candidate_revision/$candidate_release
 "
@@ -1679,6 +1687,10 @@ sudo test ! -e /var/lib/hyperpixel2r-kms/tryboot-state
 sudo test ! -e /var/lib/hyperpixel2r-kms/rollback-state
 sudo test ! -e /var/lib/hyperpixel2r-kms/accepted-transition
 sudo test ! -e /var/lib/hyperpixel2r-kms/accepted-transition-prior-config.txt
+sudo test ! -e /var/lib/hyperpixel2r-kms/accepted-uninstall
+sudo test ! -L /var/lib/hyperpixel2r-kms/accepted-uninstall
+sudo test ! -e /var/lib/hyperpixel2r-kms/accepted-uninstall-stock.txt
+sudo test ! -L /var/lib/hyperpixel2r-kms/accepted-uninstall-stock.txt
 sudo test ! -e /boot/firmware/tryboot.txt
 "
 ```
