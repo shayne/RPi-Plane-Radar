@@ -5,6 +5,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::flight_data::{AircraftEnrichment, EnrichmentNeeds};
+use crate::solar::{SolarError, SolarErrorCategory, SolarSchedule};
 
 pub const SETTINGS_SCHEMA_VERSION: u32 = 3;
 
@@ -287,6 +288,20 @@ pub struct EnvironmentReading {
     pub fetched_at: Duration,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum BacklightAvailability {
+    #[default]
+    Unknown,
+    Available,
+    Unavailable,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SolarFailure {
+    pub category: SolarErrorCategory,
+    pub at: Duration,
+}
+
 #[derive(Clone, Debug)]
 pub struct RuntimeSnapshot {
     pub settings: RadarSettings,
@@ -294,6 +309,9 @@ pub struct RuntimeSnapshot {
     pub enrichment: Arc<HashMap<AircraftKey, AircraftEnrichment>>,
     pub environment: Option<EnvironmentReading>,
     pub environment_last_error_at: Option<Duration>,
+    pub solar_schedule: Option<Arc<SolarSchedule>>,
+    pub solar_last_error: Option<SolarFailure>,
+    pub backlight_availability: BacklightAvailability,
     pub fetched_at: Option<Duration>,
     pub has_successful_fetch_for_current_location: bool,
     pub last_error_at: Option<Duration>,
@@ -316,6 +334,9 @@ impl RuntimeModel {
                 enrichment: Arc::new(HashMap::new()),
                 environment: None,
                 environment_last_error_at: None,
+                solar_schedule: None,
+                solar_last_error: None,
+                backlight_availability: BacklightAvailability::Unknown,
                 fetched_at: None,
                 has_successful_fetch_for_current_location: false,
                 last_error_at: None,
@@ -333,6 +354,10 @@ impl RuntimeModel {
     pub fn replace_settings(&self, settings: RadarSettings) -> u64 {
         let mut snapshot = self.snapshot.write().expect("runtime model lock");
         let location_changed = snapshot.settings.location != settings.location;
+        let solar_coordinates_changed = !same_optional_coordinates(
+            snapshot.settings.location.as_ref(),
+            settings.location.as_ref(),
+        );
         let query_changed =
             location_changed || snapshot.settings.range_index != settings.range_index;
         let old_filter = crate::adsb::AltitudeFilter::from(&snapshot.settings);
@@ -356,7 +381,89 @@ impl RuntimeModel {
             snapshot.environment_last_error_at = None;
             snapshot.has_successful_fetch_for_current_location = false;
         }
+        if solar_coordinates_changed
+            || !snapshot.settings.brightness.night.enabled
+            || snapshot.settings.location.is_none()
+        {
+            snapshot.solar_schedule = None;
+            snapshot.solar_last_error = None;
+        }
         bump(&mut snapshot)
+    }
+
+    pub fn record_solar_schedule_if_current(
+        &self,
+        expected_location: &Location,
+        schedule: Arc<SolarSchedule>,
+    ) -> Option<u64> {
+        let mut snapshot = self.snapshot.write().expect("runtime model lock");
+        if !solar_request_is_current(&snapshot, expected_location)
+            || !schedule_matches_location(&schedule, expected_location)
+        {
+            return None;
+        }
+        if snapshot.solar_schedule.as_ref() == Some(&schedule)
+            && snapshot.solar_last_error.is_none()
+        {
+            return None;
+        }
+        snapshot.solar_schedule = Some(schedule);
+        snapshot.solar_last_error = None;
+        Some(bump(&mut snapshot))
+    }
+
+    pub(crate) fn persist_and_record_solar_schedule_if_current<F>(
+        &self,
+        expected_location: &Location,
+        schedule: SolarSchedule,
+        persist: F,
+    ) -> Result<Option<u64>, SolarError>
+    where
+        F: FnOnce(&SolarSchedule) -> Result<(), SolarError>,
+    {
+        let mut snapshot = self.snapshot.write().expect("runtime model lock");
+        if !solar_request_is_current(&snapshot, expected_location)
+            || !schedule_matches_location(&schedule, expected_location)
+        {
+            return Ok(None);
+        }
+        persist(&schedule)?;
+        let schedule = Arc::new(schedule);
+        if snapshot.solar_schedule.as_ref() == Some(&schedule)
+            && snapshot.solar_last_error.is_none()
+        {
+            return Ok(None);
+        }
+        snapshot.solar_schedule = Some(schedule);
+        snapshot.solar_last_error = None;
+        Ok(Some(bump(&mut snapshot)))
+    }
+
+    pub fn record_solar_failure_if_current(
+        &self,
+        expected_location: &Location,
+        failure: SolarFailure,
+    ) -> Option<u64> {
+        let mut snapshot = self.snapshot.write().expect("runtime model lock");
+        if !solar_request_is_current(&snapshot, expected_location)
+            || snapshot.solar_last_error == Some(failure)
+        {
+            return None;
+        }
+        snapshot.solar_last_error = Some(failure);
+        Some(bump(&mut snapshot))
+    }
+
+    pub fn record_backlight_availability(
+        &self,
+        availability: BacklightAvailability,
+    ) -> Option<u64> {
+        let mut snapshot = self.snapshot.write().expect("runtime model lock");
+        if snapshot.backlight_availability == availability {
+            return None;
+        }
+        snapshot.backlight_availability = availability;
+        Some(bump(&mut snapshot))
     }
 
     pub fn record_aircraft(&self, aircraft: Vec<Aircraft>, fetched_at: Duration) -> u64 {
@@ -507,6 +614,31 @@ impl RuntimeModel {
         snapshot.ip_url = ip_url;
         bump(&mut snapshot)
     }
+}
+
+fn same_optional_coordinates(left: Option<&Location>, right: Option<&Location>) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => same_coordinates(left, right),
+        (None, None) => true,
+        (Some(_), None) | (None, Some(_)) => false,
+    }
+}
+
+fn same_coordinates(left: &Location, right: &Location) -> bool {
+    left.latitude == right.latitude && left.longitude == right.longitude
+}
+
+fn schedule_matches_location(schedule: &SolarSchedule, location: &Location) -> bool {
+    schedule.latitude == location.latitude && schedule.longitude == location.longitude
+}
+
+fn solar_request_is_current(snapshot: &RuntimeSnapshot, expected_location: &Location) -> bool {
+    snapshot.settings.brightness.night.enabled
+        && snapshot
+            .settings
+            .location
+            .as_ref()
+            .is_some_and(|location| same_coordinates(location, expected_location))
 }
 
 fn record_enrichment(

@@ -1,6 +1,8 @@
 mod flight_worker;
+mod solar_worker;
 mod weather_worker;
 pub use flight_worker::FlightDataWorker;
+pub use solar_worker::SolarWorker;
 pub use weather_worker::WeatherWorker;
 
 use std::collections::HashSet;
@@ -25,6 +27,7 @@ use crate::model::{AppState, RadarSettings};
 use crate::network::{current_interfaces, discover_ip_url};
 use crate::range::{next_range_index, range_preset};
 use crate::settings::SettingsStore;
+use crate::solar::{SolarClient, load_cache};
 use crate::time::{Clock, SystemClock, ThreadSleeper};
 use crate::weather::WeatherClient;
 use crate::web::{HealthSnapshot, HealthSource, SettingsServer, SettingsService, WebError};
@@ -40,11 +43,13 @@ pub use crate::model::{RuntimeModel, RuntimeSnapshot};
 pub struct RuntimeConfig {
     pub settings_path: PathBuf,
     pub geocode_cache_path: PathBuf,
+    pub solar_cache_path: PathBuf,
     pub http_address: SocketAddr,
     pub local_url: String,
     pub nominatim_url: String,
     pub flight_data_url: String,
     pub weather_url: String,
+    pub solar_url: String,
 }
 
 impl Default for RuntimeConfig {
@@ -52,11 +57,13 @@ impl Default for RuntimeConfig {
         Self {
             settings_path: PathBuf::from("/var/lib/planeradar/settings.json"),
             geocode_cache_path: PathBuf::from("/var/lib/planeradar/geocode-cache.json"),
+            solar_cache_path: PathBuf::from("/var/lib/planeradar/solar-schedule.json"),
             http_address: "0.0.0.0:80".parse().expect("valid default HTTP address"),
             local_url: "http://planeradar.local".to_owned(),
             nominatim_url: "https://nominatim.openstreetmap.org/search".to_owned(),
             flight_data_url: "https://api.adsbdb.com/v0".to_owned(),
             weather_url: "https://api.open-meteo.com/v1/forecast".to_owned(),
+            solar_url: "https://api.open-meteo.com/v1/forecast".to_owned(),
         }
     }
 }
@@ -416,11 +423,16 @@ pub struct RuntimeHandle {
     adsb_worker: Option<JoinHandle<()>>,
     flight_worker: Option<JoinHandle<()>>,
     weather_worker: Option<JoinHandle<()>>,
+    solar_worker: Option<JoinHandle<()>>,
 }
 
 impl RuntimeHandle {
     pub fn cycle_range(&self) -> Result<RadarSettings, RuntimeError> {
         Ok(self.settings.cycle_range()?)
+    }
+
+    pub fn snapshot(&self) -> RuntimeSnapshot {
+        self.model.snapshot()
     }
 
     pub fn monotonic(&self) -> Duration {
@@ -450,6 +462,9 @@ impl RuntimeHandle {
         if let Some(worker) = self.weather_worker.take() {
             failed |= worker.join().is_err();
         }
+        if let Some(worker) = self.solar_worker.take() {
+            failed |= worker.join().is_err();
+        }
         if let Some(worker) = self.web_worker.take() {
             failed |= worker.join().map_or(true, |result| result.is_err());
         }
@@ -477,9 +492,23 @@ impl Clock for SharedClock {
 }
 
 impl RuntimeCoordinator {
-    pub fn start(config: RuntimeConfig) -> Result<RuntimeHandle, RuntimeError> {
-        let store = Arc::new(SettingsStore::new(config.settings_path));
+    fn load_initial_model(
+        config: &RuntimeConfig,
+    ) -> Result<(Arc<SettingsStore>, RuntimeModel), RuntimeError> {
+        let store = Arc::new(SettingsStore::new(config.settings_path.clone()));
         let model = RuntimeModel::new(store.load()?, config.local_url.clone());
+        let snapshot = model.snapshot();
+        if snapshot.settings.brightness.night.enabled
+            && let Some(location) = snapshot.settings.location.as_ref()
+            && let Some(schedule) = load_cache(&config.solar_cache_path, location)
+        {
+            let _ = model.record_solar_schedule_if_current(location, Arc::new(schedule));
+        }
+        Ok((store, model))
+    }
+
+    pub fn start(config: RuntimeConfig) -> Result<RuntimeHandle, RuntimeError> {
+        let (store, model) = Self::load_initial_model(&config)?;
         let route_table = fs::read_to_string("/proc/net/route").unwrap_or_default();
         let ip_url = discover_ip_url(&route_table, current_interfaces()?.into_iter());
         model.set_urls(config.local_url.clone(), ip_url);
@@ -487,10 +516,12 @@ impl RuntimeCoordinator {
         let (adsb_commands, adsb_receiver) = mpsc::channel();
         let (flight_commands, flight_receiver) = mpsc::channel();
         let (weather_commands, weather_receiver) = mpsc::channel();
+        let (solar_commands, solar_receiver) = mpsc::channel();
         let commands = vec![
             adsb_commands.clone(),
             flight_commands.clone(),
             weather_commands.clone(),
+            solar_commands.clone(),
         ];
         let stop = Arc::new(AtomicBool::new(false));
         signal_hook::flag::register(SIGINT, stop.clone()).map_err(|_| RuntimeError::WorkerPanic)?;
@@ -571,6 +602,21 @@ impl RuntimeCoordinator {
             )
             .run(weather_receiver, weather_stop);
         });
+        let solar_model = model.clone();
+        let solar_stop = stop.clone();
+        let solar_clock = clock.clone();
+        let solar_url = config.solar_url;
+        let solar_cache_path = config.solar_cache_path;
+        let solar_worker = thread::spawn(move || {
+            SolarWorker::new(
+                SolarClient::with_provider_base(UreqHttpClient, solar_url),
+                solar_cache_path,
+                solar_model,
+                solar_clock,
+                ChannelWaiter,
+            )
+            .run(solar_receiver, solar_stop);
+        });
         Ok(RuntimeHandle {
             model,
             stop,
@@ -581,6 +627,7 @@ impl RuntimeCoordinator {
             adsb_worker: Some(adsb_worker),
             flight_worker: Some(flight_worker),
             weather_worker: Some(weather_worker),
+            solar_worker: Some(solar_worker),
         })
     }
 }
@@ -799,7 +846,7 @@ mod tests {
     }
 
     #[test]
-    fn shutdown_stops_and_joins_all_three_independent_workers() {
+    fn shutdown_stops_and_joins_all_four_independent_workers() {
         let model = RuntimeModel::new(
             RadarSettings::default(),
             "http://planeradar.local".to_owned(),
@@ -815,7 +862,7 @@ mod tests {
         let mut commands = Vec::new();
         let joined = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mut workers = Vec::new();
-        for _ in 0..3 {
+        for _ in 0..4 {
             let (sender, receiver) = mpsc::channel();
             commands.push(sender);
             let joined = joined.clone();
@@ -825,6 +872,7 @@ mod tests {
             }));
         }
         let weather_worker = workers.pop();
+        let solar_worker = workers.pop();
         let flight_worker = workers.pop();
         let adsb_worker = workers.pop();
         let handle = RuntimeHandle {
@@ -837,12 +885,13 @@ mod tests {
             adsb_worker,
             flight_worker,
             weather_worker,
+            solar_worker,
         };
 
         handle.shutdown().expect("shutdown");
 
         assert!(stop.load(Ordering::Acquire));
-        assert_eq!(joined.load(Ordering::Acquire), 3);
+        assert_eq!(joined.load(Ordering::Acquire), 4);
     }
 
     #[test]
@@ -860,7 +909,7 @@ mod tests {
         let joined = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mut commands = Vec::new();
         let mut workers = Vec::new();
-        for _ in 0..2 {
+        for _ in 0..3 {
             let (sender, receiver) = mpsc::channel();
             commands.push(sender);
             let joined = joined.clone();
@@ -881,9 +930,73 @@ mod tests {
             adsb_worker: Some(thread::spawn(|| panic!("test worker panic"))),
             flight_worker: workers.pop(),
             weather_worker: workers.pop(),
+            solar_worker: workers.pop(),
         };
 
         assert!(matches!(handle.shutdown(), Err(RuntimeError::WorkerPanic)));
-        assert_eq!(joined.load(Ordering::Acquire), 2);
+        assert_eq!(joined.load(Ordering::Acquire), 3);
+    }
+
+    #[test]
+    fn matching_cache_is_in_the_handle_snapshot_before_any_worker_starts() {
+        use crate::model::Location;
+        use crate::solar::{SolarDay, SolarSchedule, save_cache};
+
+        let directory = tempfile::tempdir().expect("state directory");
+        let settings_path = directory.path().join("settings.json");
+        let solar_cache_path = directory.path().join("solar.json");
+        let location = Location {
+            latitude: 40.7769,
+            longitude: -73.874,
+            label: "Radar".to_owned(),
+        };
+        let mut configured = RadarSettings {
+            location: Some(location.clone()),
+            ..RadarSettings::default()
+        };
+        configured.brightness.night.enabled = true;
+        let store = Arc::new(SettingsStore::new(settings_path.clone()));
+        store.save(&configured).expect("settings");
+        let schedule = SolarSchedule {
+            schema_version: 1,
+            latitude: location.latitude,
+            longitude: location.longitude,
+            time_zone: "America/New_York".to_owned(),
+            fetched_at_unix: 1_785_700_000,
+            days: (2..=18)
+                .map(|day| SolarDay {
+                    date: format!("2026-08-{day:02}"),
+                    sunrise_unix: None,
+                })
+                .collect(),
+        };
+        save_cache(&solar_cache_path, &schedule).expect("solar cache");
+        let config = RuntimeConfig {
+            settings_path,
+            solar_cache_path,
+            ..RuntimeConfig::default()
+        };
+        let (store, model) =
+            RuntimeCoordinator::load_initial_model(&config).expect("initial model");
+        let settings = Arc::new(RuntimeSettingsService::new(
+            model.clone(),
+            store,
+            Vec::new(),
+        ));
+        let handle = RuntimeHandle {
+            model,
+            stop: Arc::new(AtomicBool::new(false)),
+            settings,
+            clock: SharedClock(Arc::new(SystemClock::new())),
+            commands: Vec::new(),
+            web_worker: None,
+            adsb_worker: None,
+            flight_worker: None,
+            weather_worker: None,
+            solar_worker: None,
+        };
+
+        assert_eq!(handle.snapshot().solar_schedule.as_deref(), Some(&schedule));
+        handle.shutdown().expect("shutdown");
     }
 }

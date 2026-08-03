@@ -7,12 +7,16 @@ use std::time::Duration;
 use planeradar::adsb::{AdsbClient, AltitudeFilter};
 use planeradar::flight_data::AircraftEnrichment;
 use planeradar::http::{HttpClient, HttpError, HttpRequest, HttpResponse};
-use planeradar::model::{Aircraft, AppState, EnvironmentReading, Location, RadarSettings, Units};
+use planeradar::model::{
+    Aircraft, AppState, BacklightAvailability, EnvironmentReading, Location, RadarSettings,
+    SolarFailure, Units,
+};
 use planeradar::runtime::{
     AdsbWorker, ChannelWaiter, RuntimeConfig, RuntimeHealthSource, RuntimeModel,
     RuntimeSettingsService, WaitResult, Waiter, WorkerCommand,
 };
 use planeradar::settings::SettingsStore;
+use planeradar::solar::{SolarDay, SolarErrorCategory, SolarSchedule};
 use planeradar::time::Clock;
 use planeradar::web::{HealthSource, SettingsService};
 
@@ -25,6 +29,12 @@ fn configured() -> RadarSettings {
         }),
         ..RadarSettings::default()
     }
+}
+
+fn night_configured() -> RadarSettings {
+    let mut settings = configured();
+    settings.brightness.night.enabled = true;
+    settings
 }
 
 fn aircraft() -> Aircraft {
@@ -83,6 +93,12 @@ fn snapshot_updates_are_immutable_and_generation_is_monotonic() {
     assert!(before.enrichment.is_empty());
     assert_eq!(before.environment, None);
     assert_eq!(before.environment_last_error_at, None);
+    assert_eq!(before.solar_schedule, None);
+    assert_eq!(before.solar_last_error, None);
+    assert_eq!(
+        before.backlight_availability,
+        BacklightAvailability::Unknown
+    );
     assert_eq!(after.aircraft.len(), 1);
     assert_eq!(after.generation, 2);
 }
@@ -364,6 +380,11 @@ fn runtime_defaults_are_the_documented_production_values() {
     );
     assert_eq!(config.flight_data_url, "https://api.adsbdb.com/v0");
     assert_eq!(config.weather_url, "https://api.open-meteo.com/v1/forecast");
+    assert_eq!(
+        config.solar_cache_path,
+        std::path::PathBuf::from("/var/lib/planeradar/solar-schedule.json")
+    );
+    assert_eq!(config.solar_url, "https://api.open-meteo.com/v1/forecast");
 }
 
 #[test]
@@ -401,7 +422,7 @@ fn settings_replace_is_persisted_then_published_and_failed_save_is_not_published
 }
 
 #[test]
-fn settings_replacement_is_broadcast_to_three_independent_workers() {
+fn settings_replacement_is_broadcast_to_four_independent_workers() {
     let directory = tempfile::tempdir().expect("temporary directory");
     let store = Arc::new(SettingsStore::new(directory.path().join("settings.json")));
     let model = RuntimeModel::new(
@@ -411,21 +432,161 @@ fn settings_replacement_is_broadcast_to_three_independent_workers() {
     let (adsb_sender, adsb_receiver) = mpsc::channel();
     let (flight_sender, flight_receiver) = mpsc::channel();
     let (weather_sender, weather_receiver) = mpsc::channel();
+    let (solar_sender, solar_receiver) = mpsc::channel();
     let service = RuntimeSettingsService::new(
         model,
         store,
-        vec![adsb_sender, flight_sender, weather_sender],
+        vec![adsb_sender, flight_sender, weather_sender, solar_sender],
     );
 
     service.replace(configured()).expect("replace settings");
 
-    for receiver in [adsb_receiver, flight_receiver, weather_receiver] {
+    for receiver in [
+        adsb_receiver,
+        flight_receiver,
+        weather_receiver,
+        solar_receiver,
+    ] {
         assert!(matches!(
             receiver.try_recv(),
             Ok(WorkerCommand::SettingsChanged(settings)) if settings == configured()
         ));
         assert!(receiver.try_recv().is_err());
     }
+}
+
+fn solar_schedule(location: &Location) -> SolarSchedule {
+    let days = (2..=18)
+        .map(|day| SolarDay {
+            date: format!("2026-08-{day:02}"),
+            sunrise_unix: None,
+        })
+        .collect();
+    SolarSchedule {
+        schema_version: 1,
+        latitude: location.latitude,
+        longitude: location.longitude,
+        time_zone: "America/New_York".to_owned(),
+        fetched_at_unix: 1_785_700_000,
+        days,
+    }
+}
+
+#[test]
+fn solar_and_backlight_publications_compare_identity_and_bump_only_on_changes() {
+    let settings = night_configured();
+    let location = settings.location.clone().expect("location");
+    let model = RuntimeModel::new(settings, "http://planeradar.local".to_owned());
+    let schedule = Arc::new(solar_schedule(&location));
+
+    assert_eq!(
+        model.record_solar_schedule_if_current(&location, schedule.clone()),
+        Some(1)
+    );
+    assert_eq!(
+        model.record_solar_schedule_if_current(&location, schedule.clone()),
+        None,
+        "identical immutable schedule must not republish"
+    );
+
+    let renamed = Location {
+        label: "renamed only".to_owned(),
+        ..location.clone()
+    };
+    let mut renamed_settings = model.snapshot().settings;
+    renamed_settings.location = Some(renamed.clone());
+    assert_eq!(model.replace_settings(renamed_settings), 2);
+    assert_eq!(
+        model.snapshot().solar_schedule.as_deref(),
+        Some(schedule.as_ref())
+    );
+    assert_eq!(
+        model.record_solar_schedule_if_current(&location, schedule.clone()),
+        None,
+        "request coordinates remain current after a label-only change"
+    );
+
+    let failure = SolarFailure {
+        category: SolarErrorCategory::Timeout,
+        at: Duration::from_secs(9),
+    };
+    assert_eq!(
+        model.record_solar_failure_if_current(&renamed, failure),
+        Some(3)
+    );
+    assert_eq!(
+        model.record_solar_failure_if_current(&renamed, failure),
+        None
+    );
+    assert_eq!(
+        model.record_backlight_availability(BacklightAvailability::Available),
+        Some(4)
+    );
+    assert_eq!(
+        model.record_backlight_availability(BacklightAvailability::Available),
+        None
+    );
+
+    let stale = Location {
+        latitude: 34.0,
+        longitude: -118.0,
+        label: "stale".to_owned(),
+    };
+    assert_eq!(
+        model.record_solar_schedule_if_current(&stale, Arc::new(solar_schedule(&stale))),
+        None
+    );
+    assert_eq!(
+        model.record_solar_failure_if_current(
+            &stale,
+            SolarFailure {
+                category: SolarErrorCategory::Transport,
+                at: Duration::from_secs(10),
+            },
+        ),
+        None
+    );
+    assert_eq!(model.snapshot().generation, 4);
+}
+
+#[test]
+fn coordinate_change_or_disable_clears_solar_without_clearing_weather_on_disable() {
+    let settings = night_configured();
+    let location = settings.location.clone().expect("location");
+    let model = RuntimeModel::new(settings, "http://planeradar.local".to_owned());
+    model.record_environment_if_location(&location, environment(Duration::from_secs(4)));
+    model.record_solar_schedule_if_current(&location, Arc::new(solar_schedule(&location)));
+    model.record_solar_failure_if_current(
+        &location,
+        SolarFailure {
+            category: SolarErrorCategory::Timeout,
+            at: Duration::from_secs(5),
+        },
+    );
+
+    let mut disabled = model.snapshot().settings;
+    disabled.brightness.night.enabled = false;
+    model.replace_settings(disabled);
+    let disabled_snapshot = model.snapshot();
+    assert_eq!(disabled_snapshot.solar_schedule, None);
+    assert_eq!(disabled_snapshot.solar_last_error, None);
+    assert_eq!(
+        disabled_snapshot.environment,
+        Some(environment(Duration::from_secs(4)))
+    );
+
+    let mut reenabled = disabled_snapshot.settings;
+    reenabled.brightness.night.enabled = true;
+    model.replace_settings(reenabled);
+    model.record_solar_schedule_if_current(&location, Arc::new(solar_schedule(&location)));
+    let mut moved = model.snapshot().settings;
+    moved.location = Some(Location {
+        latitude: 41.0,
+        longitude: -73.0,
+        label: "moved".to_owned(),
+    });
+    model.replace_settings(moved);
+    assert_eq!(model.snapshot().solar_schedule, None);
 }
 
 #[test]
