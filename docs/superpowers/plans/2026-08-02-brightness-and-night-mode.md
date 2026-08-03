@@ -45,7 +45,7 @@ GitButler commit and leaves the other active branches untouched.
 | `scripts/common.sh`, `scripts/build-driver.sh`, `scripts/check-artifacts.sh` | Validate and package the overlay, module, applied DTB, udev rule, digests, and `pwm-backlight-v1` capability |
 | `scripts/stage-tryboot.sh`, `scripts/lifecycle-remote.sh`, `scripts/accepted-lifecycle.sh`, `scripts/uninstall.sh` | Transactionally stage, verify, accept, roll back, and remove the rule with the driver |
 | `scripts/package-release.sh`, `release/driver-manifest.schema.json` | Publish schema-2 manifests declaring the required capability when a later release is authorized |
-| `tests/gpio_test.c`, `tests/backlight-contract.sh`, `tests/build-contract.sh`, `tests/boot-scripts.sh`, `tests/boot-fixtures.sh`, `tests/release-contract.sh` | Prove kernel source, DT, exact artifacts, permissions, lifecycle, rollback, and release metadata |
+| `tests/gpio_test.c`, `tests/backlight-contract.sh`, `tests/build-contract.sh`, `tests/boot-scripts.sh`, `tests/boot-fixtures.sh`, `tests/release-contract.sh` | Prove compiled DT/module artifacts, behavioral GPIO helper handling, exact artifacts, permissions, lifecycle, rollback, and release metadata |
 | `mise.toml` | Register the focused backlight contract in the complete verification task |
 
 ### Plane Radar new files
@@ -77,7 +77,7 @@ GitButler commit and leaves the other active branches untouched.
 | `src/web.rs` | Add Brightness navigation, native controls, strict parsing, and status from immutable runtime state |
 | `driver.lock.toml`, `release/release-manifest.schema.json`, `crates/planeradarctl/src/*` | Bind the local app candidate to the exact brightness-driver revision and require `pwm-backlight-v1` without bypassing staged activation or rollback |
 | `tests/settings.rs`, `tests/install.rs`, `tests/runtime.rs`, `tests/app.rs`, `tests/web.rs`, `tests/render_*.rs`, `tests/release_contract.rs` | Extend boundaries, integration behavior, fixtures, and release portability |
-| `README.md`, `docs/install.md`, `docs/architecture.md`, `tests/docs_contract.rs` | Document UX, provider/privacy, sysfs ownership, fallback, operation, and physical acceptance |
+| `README.md`, `docs/install.md`, `docs/architecture.md`, `tests/docs_contract.rs` | Document UX, provider/privacy, sysfs ownership, fallback, operation, and physical acceptance; update an existing non-prose documentation contract only when one actually requires it |
 
 ### Cross-task interfaces
 
@@ -169,7 +169,7 @@ and zoned types.
 **Interfaces:**
 - Consumes: Raspberry Pi `pwm1`/GPIO19 pinctrl and DRM panel backlight helpers
 - Produces: `/sys/class/backlight/planeradar-backlight` with max 255 and boot level 13
-- Produces: kernel source and DT contract tests used by artifact verification
+- Produces: compiled overlay/module verification and behavioral GPIO contract tests used by artifact verification
 
 - [ ] **Step 1: Create the driver GitButler branch**
 
@@ -185,10 +185,10 @@ but status
 Expected: the new branch is applied from current driver `main`, with no
 unrelated uncommitted changes assigned to it.
 
-- [ ] **Step 2: Write the failing backlight source/overlay contract**
+- [ ] **Step 2: Write the failing compiled-artifact and GPIO-behavior contract**
 
 Add `tests/backlight-contract.sh` assertions that compile the overlay and use
-`fdtdump`/`fdtget` plus source searches to require:
+`fdtdump`/`fdtget` on the resulting DT artifact to require:
 
 ```text
 compatible = "pwm-backlight"
@@ -202,12 +202,17 @@ brcm,function = <BCM2835_FSEL_ALT5>
 backlight = <&planeradar_backlight>
 ```
 
-Also require `drm_panel_of_backlight(&hp->panel)`, and reject
-`backlight-gpios`, any `devm_gpiod_get` call whose connection ID is
-`"backlight"`, any `gpiod_direction_output` call on `hp->backlight`, and
-`disable_backlight`.
-Register it as `mise run test-backlight-contract` and make `verify` depend on
-it.
+The compiled DT checks must prove the named PWM backlight, GPIO19 Alt5 pinctrl,
+1 MHz PWM clock, panel `backlight` phandle, and the absence of
+`backlight-gpios`. Use the repository's existing module build and artifact
+checks to require a valid `hyperpixel2r_kms.ko` plus its generated build
+metadata (`module.readelf.txt`, `module.modinfo.txt`, checksum, and manifest).
+`tests/gpio_test.c` must behaviorally prove that quiesce deasserts CS, releases
+SDA/SCL, and preserves the first error; it must not infer that behavior from C
+source tokens. The contract's automated evidence is restricted to compiled
+artifacts and behavior. Stable compiled symbol metadata may be inspected only
+when the existing build emits it naturally. Register the new check as
+`mise run test-backlight-contract` and make `verify` depend on it.
 
 - [ ] **Step 3: Run the focused tests and verify RED**
 
@@ -216,10 +221,14 @@ Run:
 ```bash
 mise run test-backlight-contract
 mise run test-gpio
+mise run build-driver
+mise run check-artifacts
 ```
 
-Expected: the new contract fails on the current GPIO-backed overlay/source;
-the existing GPIO test still passes and establishes the safe-bus baseline.
+Expected: the new compiled-overlay contract fails on the current GPIO-backed
+artifact, while the existing GPIO test and module/artifact build verification
+establish the safe helper and packaging baselines. The final physical-panel
+acceptance remains required in Task 12.
 
 - [ ] **Step 4: Define the PWM backlight in the overlay**
 
@@ -268,11 +277,16 @@ Run:
 mise run test-gpio
 mise run test-backlight-contract
 mise run test-build-contract
+mise run build-driver
+mise run check-artifacts
 mise run verify
 ```
 
-Expected: all tests pass and source searches show GPIO19 only in the DT PWM
-pinmux, never in the C driver.
+Expected: all tests pass; the compiled overlay proves the PWM backlight,
+GPIO19 Alt5 pinctrl, clock, panel phandle, and absence of `backlight-gpios`;
+module/build verification proves the packaged module artifacts; and the GPIO
+test proves quiesce and first-error behavior. Complete the final physical-panel
+acceptance in Task 12 before claiming the driver accepted.
 
 - [ ] **Step 7: Commit only Task 1 files**
 
@@ -1194,19 +1208,23 @@ but commit br --only -m "feat: require PWM backlight driver capability"
 - Modify: `README.md`
 - Modify: `docs/install.md`
 - Modify: `docs/architecture.md`
-- Modify: `tests/docs_contract.rs`
+- Modify: `tests/docs_contract.rs` only if an existing non-prose contract must be mechanically updated
 - Modify: any fixture inventory file named by failing existing tests
 
 **Interfaces:**
 - Consumes: completed driver/app behavior
 - Produces: user/operator contract and green all-target verification
 
-- [ ] **Step 1: Add failing documentation contract assertions**
+- [ ] **Step 1: Define the human documentation acceptance checklist**
 
-Require docs to name the 5–100% bounds, 30%/20:00 defaults, radar-local time,
-sunrise and 07:00 fallback, full-device red-only scope, Open-Meteo coordinate
-privacy, named sysfs device, `video` permission, two-second ramps, and the fact
-that no public release is created by local physical staging.
+Review the user/operator documentation for the 5–100% bounds, 30%/20:00
+defaults, radar-local time, sunrise and 07:00 fallback, full-device red-only
+scope, Open-Meteo coordinate privacy, named sysfs device, `video` permission,
+two-second ramps, and the fact that no public release is created by local
+physical staging. These are human documentation acceptance facts, not
+assertions in `tests/docs_contract.rs`. Do not add exact prose-presence or
+change-detector assertions; update `tests/docs_contract.rs` only for a real
+existing non-prose contract that must change mechanically.
 
 - [ ] **Step 2: Update user and architecture docs**
 
