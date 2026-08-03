@@ -112,6 +112,52 @@ impl Default for NightModeSettings {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FrameColorMode {
+    FullColor,
+    RedOnly,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DisplayPeriod {
+    Day,
+    Night,
+}
+
+/// The next instant at which display output should enter `period`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Transition {
+    pub at_unix: i64,
+    pub period: DisplayPeriod,
+}
+
+/// Immutable wall-clock facts used to describe a resolved night interval.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ScheduleFacts {
+    pub start_unix: i64,
+    pub end_unix: i64,
+}
+
+/// Human-facing solar state. `Fallback` may describe either the active night
+/// or the upcoming night; `DisplayPolicy::period` distinguishes those cases.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SolarStatus {
+    Disabled,
+    Waiting,
+    Upcoming(ScheduleFacts),
+    Active(ScheduleFacts),
+    Fallback(ScheduleFacts),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DisplayPolicy {
+    pub period: DisplayPeriod,
+    pub brightness_percent: u8,
+    pub color_mode: FrameColorMode,
+    pub next_transition: Option<Transition>,
+    pub solar_status: SolarStatus,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RadarSettings {

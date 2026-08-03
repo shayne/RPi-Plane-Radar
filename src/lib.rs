@@ -14,6 +14,7 @@ pub mod install;
 pub mod logging;
 pub mod model;
 pub mod network;
+pub mod night_mode;
 pub mod range;
 pub mod render;
 mod route_confidence;
