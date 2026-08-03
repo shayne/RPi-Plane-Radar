@@ -165,13 +165,15 @@ and zoned types.
 - Modify: `kernel/hyperpixel2r_kms_gpio.h`
 - Modify: `tests/gpio_test.c`
 - Modify: `scripts/common.sh`
+- Modify: `scripts/check-artifacts.sh`
+- Modify: `tests/release-contract.sh`
 
 **Interfaces:**
 - Consumes: Raspberry Pi `pwm1`/GPIO19 pinctrl and DRM panel backlight helpers
 - Produces: `/sys/class/backlight/planeradar-backlight` with max 255 and boot level 13
 - Produces: compiled overlay/module verification and behavioral GPIO contract tests used by artifact verification
 
-- [ ] **Step 1: Create the driver GitButler branch**
+- [x] **Step 1: Create the driver GitButler branch**
 
 Run:
 
@@ -185,7 +187,7 @@ but status
 Expected: the new branch is applied from current driver `main`, with no
 unrelated uncommitted changes assigned to it.
 
-- [ ] **Step 2: Write the failing compiled-artifact and GPIO-behavior contract**
+- [x] **Step 2: Write the failing compiled-artifact and GPIO-behavior contract**
 
 Add `tests/backlight-contract.sh` assertions that compile the overlay and use
 `fdtdump`/`fdtget` on the resulting DT artifact to require:
@@ -196,17 +198,18 @@ pwms = <&pwm 1 200000 0>
 brightness-levels = <0 255>
 num-interpolated-steps = <255>
 default-brightness-level = <13>
-clock-frequency = <1000000>
+assigned-clock-rates = <1000000>
 brcm,pins = <19>
 brcm,function = <BCM2835_FSEL_ALT5>
 backlight = <&planeradar_backlight>
 ```
 
 The compiled DT checks must prove the named PWM backlight, GPIO19 Alt5 pinctrl,
-1 MHz PWM clock, panel `backlight` phandle, and the absence of
-`backlight-gpios`. Use the repository's existing local build contract to
-validate the in-progress packaging rules. The immutable module/artifact proof
-belongs in Step 8, after the exact Task 1 source is committed.
+the effective 1 MHz clock-framework assignment, panel `backlight` phandle, and
+the absence of both `backlight-gpios` and the inert `clock-frequency` property.
+Use the repository's existing local build contract to validate the in-progress
+packaging rules. The target-bound immutable module/artifact proof belongs in
+Task 12 after the target runs the kernel for which the bundle will be staged.
 `tests/gpio_test.c` must behaviorally prove that quiesce deasserts CS, releases
 SDA/SCL, and preserves the first error; it must not infer that behavior from C
 source tokens. The contract's automated evidence is restricted to compiled
@@ -214,7 +217,7 @@ artifacts and behavior. Stable compiled symbol metadata may be inspected only
 when the existing build emits it naturally. Register the new check as
 `mise run test-backlight-contract` and make `verify` depend on it.
 
-- [ ] **Step 3: Run the focused tests and verify RED**
+- [x] **Step 3: Run the focused tests and verify RED**
 
 Run:
 
@@ -229,7 +232,7 @@ artifact, while the existing GPIO test and local build contract establish the
 safe helper and packaging baselines. The final physical-panel acceptance
 remains required in Task 12.
 
-- [ ] **Step 4: Define the PWM backlight in the overlay**
+- [x] **Step 4: Define the PWM backlight in the overlay**
 
 Replace `backlight-gpios` with a panel phandle and add the stable root node:
 
@@ -243,12 +246,16 @@ planeradar_backlight: planeradar-backlight {
 };
 ```
 
-Add overlay fragments that enable `&pwm`, assign a 1 MHz clock, select a
-GPIO19 Alt5 pinctrl group, and point `hyperpixel2r_panel.backlight` at the
-named node. Extend `scripts/common.sh` overlay validation for the new
-fragments, fixups, phandles, clock, pinmux, period, interpolation, and default.
+Add overlay fragments that enable `&pwm`, set
+`assigned-clock-rates = <1000000>`, select a GPIO19 Alt5 pinctrl group, and
+point `hyperpixel2r_panel.backlight` at the named node. Do not emit
+`clock-frequency`; the Raspberry Pi PWM driver uses the clock framework rather
+than that inert property. Extend `scripts/common.sh` and
+`scripts/check-artifacts.sh` validation for the new fragments, fixups,
+phandles, effective applied-DT clock, pinmux, period, interpolation, default,
+and rejected inert property.
 
-- [ ] **Step 5: Adopt the DRM panel backlight lifecycle**
+- [x] **Step 5: Adopt the DRM panel backlight lifecycle**
 
 In `hyperpixel2r_kms_main.c`, remove `hp->backlight`, `hp->enabled`, direct
 backlight enable/disable writes, and backlight-specific unwind. After
@@ -268,7 +275,7 @@ error unwind. Remove `disable_backlight` from `hp2r_gpio_ops` and update
 `tests/gpio_test.c` to prove quiesce still deasserts CS and releases SDA/SCL
 while preserving the first error.
 
-- [ ] **Step 6: Run driver unit and contract verification**
+- [x] **Step 6: Run driver unit and contract verification**
 
 Run:
 
@@ -280,13 +287,13 @@ mise run verify
 ```
 
 Expected: all tests pass; the compiled overlay proves the PWM backlight,
-GPIO19 Alt5 pinctrl, clock, panel phandle, and absence of `backlight-gpios`;
-the local build contract validates the in-progress packaging rules; and the
-GPIO test proves quiesce and first-error behavior. Complete the immutable
-artifact proof in Step 8 and final physical-panel acceptance in Task 12 before
-claiming the driver accepted.
+GPIO19 Alt5 pinctrl, assigned 1 MHz clock, panel phandle, and absence of both
+`backlight-gpios` and `clock-frequency`; the local build contract validates the
+in-progress packaging rules; and the GPIO test proves quiesce and first-error
+behavior. Complete the target-bound immutable artifact proof and final
+physical-panel acceptance in Task 12 before claiming the driver installed.
 
-- [ ] **Step 7: Commit only Task 1 files**
+- [x] **Step 7: Commit only Task 1 files**
 
 Stage the exact Task 1 paths, then commit only staged files:
 
@@ -299,30 +306,39 @@ but stage kernel/hyperpixel2r_kms_gpio.c codex/brightness-night-mode-driver
 but stage kernel/hyperpixel2r_kms_gpio.h codex/brightness-night-mode-driver
 but stage tests/gpio_test.c codex/brightness-night-mode-driver
 but stage scripts/common.sh codex/brightness-night-mode-driver
+but stage scripts/check-artifacts.sh codex/brightness-night-mode-driver
+but stage tests/release-contract.sh codex/brightness-night-mode-driver
 but commit codex/brightness-night-mode-driver --only -m "feat: expose PWM panel backlight"
 but status
 ```
 
-Expected: one focused driver commit; no other workspace changes are included.
+Expected: focused Task 1 commits only; no other workspace changes are included.
 
-- [ ] **Step 8: Prove immutable module artifacts from the committed source**
+- [x] **Step 8: Record approved source evidence and defer the target-bound bundle**
 
-With the Task 1 commit applied and the driver source clean, run:
+Task 1 was independently approved at driver commit
+`1141c119b91fd9e867cfc6bb59fa9bf1c17c47af`, tree
+`b2afd1527dbe56cc11653921cebc2843405f1b97`, after these four focused
+commits:
 
-```bash
-HP2R_TARGET=user@radar.local mise run export-target-kbuild
-HP2R_TARGET=user@radar.local mise run build-driver
-HP2R_TARGET=user@radar.local mise run check-artifacts
-```
+- `fa0b94d` — expose the standard PWM panel backlight
+- `16f96a9` — match the target's void DRM lifecycle helpers
+- `c901731` — enforce the effective PWM clock and privacy contracts
+- `1141c11` — harden applied-artifact and privacy validation
 
-Expected: the committed source passes the build scripts' target and
-clean-source requirements. `export-target-kbuild` captures the exact target
-kernel build inputs used by the immutable module proof; the build then emits a
-valid `hyperpixel2r_kms.ko` and its `module.readelf.txt`, `module.modinfo.txt`,
-checksum, and manifest; and the artifact check validates that exact bundle. If
-this proof fails, correct the implementation, commit the correction, and rerun
-the focused verification and this immutable artifact proof before review. Task
-12 still performs final physical-panel acceptance.
+The final `mise run verify` was GREEN in 1177.04 seconds. A native,
+non-installing compile against the exact running `6.18.34+rpt-rpi-v8` headers
+proved the unchanged module sources link with the expected AArch64 vermagic and
+DRM symbols. That transient evidence is not the official immutable artifact
+bundle.
+
+The provenance-bound exporter cannot export the running 6.18.34 source because
+the signed APT metadata now offers 6.18.39 and no trusted historical stanza was
+recovered. Do not weaken that provenance requirement. The target already has
+the 6.18.39 kernel and headers installed but no accepted custom module for that
+release, so reboot was deliberately deferred. Task 12 performs a controlled
+transition to the installed kernel and then runs the supported target-bound
+export, build, and artifact-check sequence before driver staging.
 
 ---
 
@@ -1298,7 +1314,8 @@ independent; nothing has been pushed or tagged.
 - Local generated artifacts only: repository `dist/` output and temporary test captures
 
 **Interfaces:**
-- Consumes: exact local driver/app commits and local prerelease artifacts
+- Consumes: exact local driver/app commits, the installed 6.18.39 target kernel,
+  and provenance-bound local prerelease artifacts exported from that running kernel
 - Produces: installed physical test state and an evidence log for owner acceptance
 - Does not produce: Git tag, push, GitHub release, or public package
 
@@ -1319,22 +1336,102 @@ confirm there are no uncommitted files assigned to them. Do not claim the
 shared workspace `HEAD` alone identifies a virtual branch; record `but status`
 branch commits as the authority.
 
-- [ ] **Step 2: Build and verify the local driver prerelease**
+- [ ] **Step 2: Verify source before the target kernel transition**
 
 From the driver repository, run:
 
 ```bash
 mise run verify
-HP2R_TARGET=user@radar.local mise run build-driver
-HP2R_TARGET=user@radar.local mise run check-artifacts
 ```
+
+Expected: the final driver source, including Task 2, passes the complete suite.
+Retain Task 1's native 6.18.34 exact-header result as compatibility evidence
+only; do not treat it as an artifact that can be staged or accepted.
+
+- [ ] **Step 3: Preflight and perform the controlled 6.18.39 transition**
+
+The exporter deliberately derives its release from the target's live
+`uname -r` and has no non-running-kernel option. Before rebooting, set the
+known installed transition release and perform a read-only preflight:
+
+```bash
+transition_release=6.18.39+rpt-rpi-v8
+ssh user@radar.local "
+set -eu
+test \"\$(uname -r)\" = 6.18.34+rpt-rpi-v8
+dpkg-query -W -f='\${db:Status-Abbrev} \${Version}\\n' \
+  linux-image-rpi-v8 linux-headers-rpi-v8
+test -d /lib/modules/$transition_release/build
+test -f /lib/modules/$transition_release/build/.config
+test -f /lib/modules/$transition_release/build/Module.symvers
+test ! -e /lib/modules/$transition_release/extra/hyperpixel2r_kms.ko
+id planeradar
+command -v chgrp chmod udevadm
+systemctl is-active ssh planeradar
+cat /etc/os-release
+sudo test ! -e /var/lib/hyperpixel2r-kms/tryboot-state
+sudo test ! -e /var/lib/hyperpixel2r-kms/rollback-state
+"
+```
+
+Record the installed package versions, current accepted driver identity,
+normal boot-config digest, accepted receipt, and exact recovery path back to
+6.18.34. Confirm the existing normal boot selection is already the installed
+6.18.39 kernel, the Pi is on stable power, and SSH recovery does not depend on
+the display or touch stack. This is a hard staging checkpoint: if the next
+normal boot release or independent SSH recovery cannot be proven, stop without
+rebooting. Do not invent an exporter flag or weaken signed APT provenance.
+
+Only after that checkpoint, request the already-configured normal reboot, wait
+for identity-bound SSH reconnect, and require the exact live release:
+
+```bash
+set +e
+ssh user@radar.local sudo reboot
+reboot_status=$?
+set -e
+case "$reboot_status" in 0|255) ;; *) exit "$reboot_status" ;; esac
+for attempt in {1..90}; do
+  ssh -o BatchMode=yes -o ConnectTimeout=5 user@radar.local true \
+    >/dev/null 2>&1 && break
+  sleep 2
+done
+test "$(ssh user@radar.local uname -r)" = "$transition_release"
+```
+
+The physical panel may be unavailable between this normal kernel transition
+and the verified tryboot candidate. If SSH does not return or the release does
+not match, use the pre-recorded 6.18.34 recovery path and stop; do not continue
+to artifact creation or staging.
+
+- [ ] **Step 4: Export, build, check, and package the immutable driver bundle**
+
+From a clean driver workspace whose tree matches the durable GitButler branch
+commit, run the supported live-target sequence in this exact order:
+
+```bash
+driver_repo=/Users/shayne/code/hyperpixel2r-kms
+driver_commit="$(git -C "$driver_repo" rev-parse refs/heads/codex/brightness-night-mode-driver^{commit})"
+kernel_release="$(ssh user@radar.local uname -r)"
+test "$kernel_release" = 6.18.39+rpt-rpi-v8
+HP2R_TARGET=user@radar.local mise run export-target-kbuild
+HP2R_TARGET=user@radar.local mise run build-driver -- \
+  --kernel-release "$kernel_release" \
+  --source-revision "$driver_commit"
+HP2R_TARGET=user@radar.local mise run check-artifacts -- \
+  --kernel-release "$kernel_release"
+```
+
+Expected: `export-target-kbuild` binds the signed 6.18.39 source metadata,
+headers, kbuild tree, and base DTB to the live target; `build-driver` binds the
+module and overlay to the durable branch commit; and `check-artifacts` proves
+the exact module, applied DT, rule, capability, manifests, and digests. Any
+failure stops the transition before tryboot staging.
 
 Export the exact driver branch commit into a temporary packaging clone so the
 manifest never names the synthetic GitButler workspace commit:
 
 ```bash
-driver_repo=/Users/shayne/code/hyperpixel2r-kms
-driver_commit="$(git -C "$driver_repo" rev-parse refs/heads/codex/brightness-night-mode-driver^{commit})"
 driver_package_source="$(mktemp -d "${TMPDIR:-/tmp}/hp2r-brightness-package.XXXXXX")"
 test ! -e "$driver_repo/dist/local-brightness-release"
 git clone --no-local "$driver_repo" "$driver_package_source/repo"
@@ -1353,20 +1450,7 @@ Verify the manifest through the driver release-contract command, confirm its
 source commit equals the branch tip, require `pwm-backlight-v1`, and verify
 every asset digest before transfer.
 
-- [ ] **Step 3: Preflight the physical host read-only**
-
-Run:
-
-```bash
-ssh user@radar.local 'uname -r; id planeradar; command -v chgrp chmod udevadm; systemctl is-active planeradar; cat /etc/os-release'
-```
-
-Expected: supported Raspberry Pi OS/kernel, `planeradar` includes `video`, the
-service is active, and required udev helpers exist. Record the current accepted
-driver identity, boot config digest, module state, and whether any prior rule
-exists before staging.
-
-- [ ] **Step 4: Stage the driver through tryboot**
+- [ ] **Step 5: Stage the driver through tryboot**
 
 Resolve the artifact directory from the host kernel and stage it exactly:
 
@@ -1381,7 +1465,7 @@ identity-bound reconnect command. Reboot only through the staged workflow.
 After reconnect, run `verify-boot`, inspect the class device, and do not accept
 until all automated health/provenance checks pass.
 
-- [ ] **Step 5: Verify sysfs identity, permission, and visible levels**
+- [ ] **Step 6: Verify sysfs identity, permission, and visible levels**
 
 On the Pi, record:
 
@@ -1428,9 +1512,9 @@ the rollback restored the prior module, overlay, boot config, and udev rule;
 then re-stage, re-run `verify-boot`, and repeat the named-device permission
 check before continuing.
 
-- [ ] **Step 6: Accept the driver candidate and deploy Plane Radar locally**
+- [ ] **Step 7: Accept the driver candidate and deploy Plane Radar locally**
 
-Commit and accept the restaged tryboot candidate only after Step 5:
+Commit and accept the restaged tryboot candidate only after Step 6:
 
 ```bash
 HP2R_TARGET=user@radar.local mise run commit-boot
@@ -1483,7 +1567,7 @@ stable binary remains available for rollback. Verify `systemctl cat`, service
 identity, embedded binary revision, `/healthz`, debug-frame capture, and
 journal logs.
 
-- [ ] **Step 7: Exercise accelerated policy transitions**
+- [ ] **Step 8: Exercise accelerated policy transitions**
 
 Use settings whose radar location matches the configured device. Set night
 start a few minutes ahead and use a deterministic local solar fixture/test
@@ -1492,7 +1576,7 @@ seam; do not alter production provider DNS. Verify exact start-minute entry,
 exact sunrise exit, 5/30/100 ramps, disabled-mode return to 100%, 12/24 status
 formatting, and the 07:00 fallback with missing future sunrise.
 
-- [ ] **Step 8: Inspect every red physical state**
+- [ ] **Step 9: Inspect every red physical state**
 
 Enable red-only and physically inspect radar, waiting-for-network, setup QR,
 and on-device settings states. Capture debug PNGs and verify all non-alpha
@@ -1500,7 +1584,7 @@ green/blue bytes are zero while QR scanning, aircraft distinction, grid,
 labels, footer, and status remain legible. Restart the application during
 active night and confirm no high-brightness or full-color flash.
 
-- [ ] **Step 9: Verify lifecycle safety**
+- [ ] **Step 10: Verify lifecycle safety**
 
 Confirm touch input and KMS output through service restart and full reboot.
 Exercise module unload safety only through the driver's supported lifecycle.
@@ -1511,7 +1595,7 @@ restart, and verify the feature revision returns. Confirm the accepted driver
 receipt is unchanged throughout, then run both repositories' physical
 smoke/doctor/status commands.
 
-- [ ] **Step 10: Leave the prerelease installed and report evidence**
+- [ ] **Step 11: Leave the prerelease installed and report evidence**
 
 Leave the exact local brightness-driver candidate plus the exact Plane Radar
 feature-branch binary installed for the owner to assess. Report exact branch
