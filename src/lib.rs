@@ -3,6 +3,7 @@
 pub mod adsb;
 pub mod airports;
 pub mod app;
+pub mod backlight;
 pub mod capture;
 pub mod cli;
 pub mod display;
