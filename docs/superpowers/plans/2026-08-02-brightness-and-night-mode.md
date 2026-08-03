@@ -310,17 +310,19 @@ Expected: one focused driver commit; no other workspace changes are included.
 With the Task 1 commit applied and the driver source clean, run:
 
 ```bash
+HP2R_TARGET=user@radar.local mise run export-target-kbuild
 HP2R_TARGET=user@radar.local mise run build-driver
 HP2R_TARGET=user@radar.local mise run check-artifacts
 ```
 
 Expected: the committed source passes the build scripts' target and
-clean-source requirements; the build emits a valid `hyperpixel2r_kms.ko` and
-its `module.readelf.txt`, `module.modinfo.txt`, checksum, and manifest; and
-the artifact check validates that exact bundle. If this proof fails, correct
-the implementation, commit the correction, and rerun the focused verification
-and this immutable artifact proof before review. Task 12 still performs final
-physical-panel acceptance.
+clean-source requirements. `export-target-kbuild` captures the exact target
+kernel build inputs used by the immutable module proof; the build then emits a
+valid `hyperpixel2r_kms.ko` and its `module.readelf.txt`, `module.modinfo.txt`,
+checksum, and manifest; and the artifact check validates that exact bundle. If
+this proof fails, correct the implementation, commit the correction, and rerun
+the focused verification and this immutable artifact proof before review. Task
+12 still performs final physical-panel acceptance.
 
 ---
 
