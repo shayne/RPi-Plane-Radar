@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+pub use crate::route_confidence::RouteCandidate;
+
 use serde::Deserialize;
 use serde_json::Value;
 use thiserror::Error;

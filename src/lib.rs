@@ -16,6 +16,7 @@ pub mod model;
 pub mod network;
 pub mod range;
 pub mod render;
+mod route_confidence;
 pub mod runtime;
 pub mod settings;
 pub mod time;
