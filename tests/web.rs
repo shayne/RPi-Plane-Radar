@@ -545,21 +545,31 @@ fn settings_page_renders_labelled_section_navigation_and_associated_actions() {
             .contains("<nav class=\"settings-navigation\" aria-label=\"Settings sections\">")
     );
     for (target, label) in [
-        ("location", "Location"),
-        ("radar-basics", "Radar basics"),
+        ("location", "Radar location"),
+        ("radar-basics", "Radar display"),
         ("aircraft-labels", "Aircraft labels"),
         ("footer", "Footer"),
         ("traffic-filter", "Traffic filter"),
     ] {
         assert!(
-            response.body.contains(&format!("href=\"#{target}\"")),
-            "missing navigation target {target:?}"
+            response
+                .body
+                .contains(&format!("<a href=\"#{target}\"><span>{label}</span>")),
+            "navigation label did not match target heading {label:?}"
         );
         assert!(
             response.body.contains(&format!("id=\"{target}\"")),
             "missing section id for {label:?}"
         );
     }
+    assert_eq!(
+        response
+            .body
+            .matches("<small aria-hidden=\"true\">")
+            .count(),
+        5,
+        "saved-value summaries should not expand accessible link names"
+    );
     assert!(
         response
             .body
@@ -629,26 +639,75 @@ fn settings_navigation_escapes_saved_location_summary() {
 }
 
 #[test]
-fn settings_navigation_wraps_long_unbroken_location_summary() {
+fn settings_desktop_rail_compacts_long_location_without_hiding_status_or_apply() {
     let mut settings = optional_settings_enabled();
     let label = "x".repeat(512);
     settings.location.as_mut().unwrap().label = label.clone();
 
     let response = TestServer::new(settings, Vec::new()).get("/");
+    let before_navigation = response
+        .body
+        .split_once("<nav class=\"settings-navigation\" aria-label=\"Settings sections\">")
+        .expect("settings navigation should be rendered")
+        .0;
+    let navigation = response
+        .body
+        .split_once("<nav class=\"settings-navigation\" aria-label=\"Settings sections\">")
+        .expect("settings navigation should be rendered")
+        .1
+        .split_once("</nav>")
+        .expect("settings navigation should close")
+        .0;
 
     assert!(
-        response.body.contains(&format!("<small>{label}</small>")),
-        "navigation should preserve the saved location summary"
+        before_navigation.contains(&format!("<span>{label}</span>")),
+        "the full configured location should remain in the accessible status"
+    );
+    assert!(
+        navigation.contains(&format!("<small aria-hidden=\"true\">{label}</small>")),
+        "the visual location summary should remain server-rendered but be hidden from the link name"
     );
     for expected in [
-        ".settings-navigation a small {\n  min-width: 0;\n  overflow-wrap: anywhere;",
-        "grid-template-columns: minmax(0, 1fr) minmax(0, 6rem);",
+        ".control-rail .radar-status span:not(.status-mark) {\n    display: -webkit-box;",
+        "-webkit-line-clamp: 2;",
+        "grid-template-columns: minmax(0, 1fr) minmax(0, 4.5rem);",
+        ".settings-navigation a small {\n    overflow: hidden;\n    text-overflow: ellipsis;\n    white-space: nowrap;",
+        "@media (min-width: 64rem) and (max-height: 767px) {",
+        "max-height: calc(100svh - (var(--space-xl) * 2));\n    overflow-y: auto;",
+        ".button-rail { display: none; }\n.button-content { display: block; }",
+        ".button-rail { display: block; }\n  .button-content { display: none; }",
     ] {
         assert!(
             response.body.contains(expected),
-            "navigation omitted overflow contract {expected:?}"
+            "desktop rail omitted compaction/action contract {expected:?}"
         );
     }
+
+    let standard_desktop = response
+        .body
+        .split_once("@media (min-width: 64rem) {")
+        .expect("desktop breakpoint should render")
+        .1
+        .split_once("@media (min-width: 64rem) and (max-height: 767px) {")
+        .expect("short desktop fallback should render")
+        .0;
+    assert!(
+        !standard_desktop.contains("overflow-y: auto;"),
+        "768px-and-taller desktops must not rely on internal rail scrolling"
+    );
+
+    let rail = response
+        .body
+        .split_once("<aside class=\"control-rail\">")
+        .expect("control rail should render")
+        .1
+        .split_once("</aside>")
+        .expect("control rail should close")
+        .0;
+    assert!(
+        rail.find("</nav>") < rail.find("class=\"button-primary button-rail\""),
+        "desktop Apply should remain in initial rail flow after all navigation links"
+    );
 }
 
 #[test]

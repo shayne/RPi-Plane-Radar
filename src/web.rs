@@ -1103,11 +1103,11 @@ fn render_settings_navigation(settings: &RadarSettings) -> String {
         r##"<nav class="settings-navigation" aria-label="Settings sections">
 <p class="rail-label">Settings</p>
 <ul>
-<li><a href="#location"><span>Location</span><small>{location}</small></a></li>
-<li><a href="#radar-basics"><span>Radar basics</span><small>{}%</small></a></li>
-<li><a href="#aircraft-labels"><span>Aircraft labels</span><small>{aircraft_count} on</small></a></li>
-<li><a href="#footer"><span>Footer</span><small>{footer_count} on</small></a></li>
-<li><a href="#traffic-filter"><span>Traffic filter</span><small>{traffic}</small></a></li>
+<li><a href="#location"><span>Radar location</span><small aria-hidden="true">{location}</small></a></li>
+<li><a href="#radar-basics"><span>Radar display</span><small aria-hidden="true">{}%</small></a></li>
+<li><a href="#aircraft-labels"><span>Aircraft labels</span><small aria-hidden="true">{aircraft_count} on</small></a></li>
+<li><a href="#footer"><span>Footer</span><small aria-hidden="true">{footer_count} on</small></a></li>
+<li><a href="#traffic-filter"><span>Traffic filter</span><small aria-hidden="true">{traffic}</small></a></li>
 </ul>
 </nav>"##,
         settings.radar_text_scale_percent
@@ -1809,10 +1809,14 @@ fieldset > p {{ margin-top: calc(var(--space-sm) * -1); }}
   .control-rail {{
     position: sticky;
     top: var(--space-xl);
-    max-height: calc(100svh - (var(--space-xl) * 2));
-    overflow-y: auto;
     padding-right: var(--space-lg);
     border-right: 1px solid var(--border);
+  }}
+  .control-rail .radar-status span:not(.status-mark) {{
+    display: -webkit-box;
+    overflow: hidden;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2;
   }}
   .control-rail .masthead {{
     grid-template-columns: auto minmax(0, 1fr);
@@ -1823,10 +1827,15 @@ fieldset > p {{ margin-top: calc(var(--space-sm) * -1); }}
   .settings-navigation {{ overflow: visible; }}
   .settings-navigation ul {{ display: grid; width: auto; }}
   .settings-navigation a {{
-    grid-template-columns: minmax(0, 1fr) minmax(0, 6rem);
+    grid-template-columns: minmax(0, 1fr) minmax(0, 4.5rem);
     gap: var(--space-sm);
   }}
-  .settings-navigation a small {{ text-align: right; }}
+  .settings-navigation a small {{
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    text-align: right;
+  }}
   .button-rail {{ display: block; }}
   .button-content {{ display: none; }}
   .radar-basics-grid {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
@@ -1834,6 +1843,13 @@ fieldset > p {{ margin-top: calc(var(--space-sm) * -1); }}
   .switch-grid {{ grid-template-columns: repeat(3, minmax(0, 1fr)); }}
   .footer-format-grid {{ grid-template-columns: repeat(3, minmax(0, 1fr)); }}
   .footer-format-grid > :last-child {{ grid-column: auto; }}
+}}
+
+@media (min-width: 64rem) and (max-height: 767px) {{
+  .control-rail {{
+    max-height: calc(100svh - (var(--space-xl) * 2));
+    overflow-y: auto;
+  }}
 }}
 
 @media (prefers-reduced-motion: reduce) {{
