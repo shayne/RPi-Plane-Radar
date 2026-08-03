@@ -1,0 +1,38 @@
+{
+  "artifacts": [
+    {
+      "kind": "source-archive",
+      "name": "hyperpixel2r-kms-source.tar.zst",
+      "sha256": "7fa8b76d873a72609853706c7e22336f0f827f42fb774858121014488c2ea1c6",
+      "size": 149486
+    },
+    {
+      "kind": "sbom",
+      "name": "SBOM.spdx.json",
+      "sha256": "b1abd03baa3fd4637cc9cbb4186d31e0400a6a2068f42a213cd99b739d0cbcde",
+      "size": 39151
+    }
+  ],
+  "driver_version": "0.1.1",
+  "reproducibility": {
+    "archive_format": "tar+zstd",
+    "group": 0,
+    "mode_policy": "git-executable-or-regular",
+    "owner": 0,
+    "source_date_epoch": 1785559128
+  },
+  "schema_version": 1,
+  "source": {
+    "commit": "261a29f45963ef3fcaf1a23e8e444b4e68d4c370",
+    "date_epoch": 1785559128,
+    "repository": "https://github.com/shayne/hyperpixel2r-kms",
+    "tree": "c6a5a63b5ad54d0b541b71940d951c45d6c2f96c"
+  },
+  "supported": {
+    "architecture": "aarch64",
+    "board": "Raspberry Pi Zero 2 W",
+    "display": "HyperPixel 2.1 Round",
+    "kernel_policy": "exact-release-only",
+    "operating_system": "Raspberry Pi OS Lite (Trixie, 64-bit)"
+  }
+}

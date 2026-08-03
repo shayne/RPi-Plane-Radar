@@ -9,6 +9,11 @@ use sha2::{Digest, Sha256};
 pub const SOURCE_COMMIT: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 pub const SOURCE_TREE: &str = "cccccccccccccccccccccccccccccccccccccccc";
 pub const SOURCE_DATE_EPOCH: u64 = 1_785_153_600;
+pub const TASK_TWO_DRIVER_VERSION: &str = "0.1.1";
+pub const TASK_TWO_DRIVER_COMMIT: &str = "bb76bf8a3e9e02ce1b1acd4df97200083ca57277";
+pub const TASK_TWO_DRIVER_TREE: &str = "0693468744845cc03e91b6dfdd10b8cd676dbce6";
+pub const TASK_TWO_DRIVER_DATE_EPOCH: u64 = 1_785_742_634;
+pub const TASK_TWO_DRIVER_CAPABILITY: &str = "pwm-backlight-v1";
 
 pub struct ReleaseFixture {
     pub directory: PathBuf,
@@ -21,8 +26,20 @@ pub fn build_release(directory: &Path) -> ReleaseFixture {
 }
 
 pub fn build_release_with_payload(directory: &Path, payload: Vec<u8>) -> ReleaseFixture {
-    fs::create_dir_all(directory).expect("release fixture directory");
     let lock = DriverLock::checked_in().expect("checked-in driver lock");
+    build_release_with_payload_and_driver(directory, payload, &lock)
+}
+
+pub fn build_release_with_driver(directory: &Path, lock: &DriverLock) -> ReleaseFixture {
+    build_release_with_payload_and_driver(directory, fixture_payload(4096), lock)
+}
+
+fn build_release_with_payload_and_driver(
+    directory: &Path,
+    payload: Vec<u8>,
+    lock: &DriverLock,
+) -> ReleaseFixture {
+    fs::create_dir_all(directory).expect("release fixture directory");
     let application_archive = application_archive(&payload);
     let control_aarch64 = b"deterministic aarch64 control archive\n".to_vec();
     let control_x86_64 = b"deterministic x86_64 control archive\n".to_vec();
@@ -73,7 +90,7 @@ pub fn build_release_with_payload(directory: &Path, payload: Vec<u8>) -> Release
             "version": lock.version.to_string(),
             "commit": lock.commit.clone(),
             "manifest_sha256": lock.manifest_sha256.clone(),
-            "required_capability": "pwm-backlight-v1",
+            "required_capability": lock.required_capability.clone(),
             "lifecycle_protocol": "accepted-driver-v2"
         },
         "artifacts": {
@@ -131,9 +148,69 @@ pub fn build_release_with_payload(directory: &Path, payload: Vec<u8>) -> Release
         },
         driver: ArtifactIdentity {
             version: lock.version.to_string(),
-            source_commit: lock.commit,
-            sha256: lock.manifest_sha256,
+            source_commit: lock.commit.clone(),
+            sha256: lock.manifest_sha256.clone(),
         },
+    }
+}
+
+pub fn task_two_driver_manifest() -> Vec<u8> {
+    let source_archive = b"task-two-candidate-source-archive\n";
+    let sbom = b"task-two-candidate-sbom\n";
+    let mut manifest = serde_json::to_vec_pretty(&json!({
+        "schema_version": 2,
+        "driver_version": TASK_TWO_DRIVER_VERSION,
+        "capabilities": [TASK_TWO_DRIVER_CAPABILITY],
+        "source": {
+            "repository": "https://github.com/shayne/hyperpixel2r-kms",
+            "commit": TASK_TWO_DRIVER_COMMIT,
+            "tree": TASK_TWO_DRIVER_TREE,
+            "date_epoch": TASK_TWO_DRIVER_DATE_EPOCH,
+        },
+        "supported": {
+            "board": "Raspberry Pi Zero 2 W",
+            "display": "HyperPixel 2.1 Round",
+            "operating_system": "Raspberry Pi OS Lite (Trixie, 64-bit)",
+            "architecture": "aarch64",
+            "kernel_policy": "exact-release-only",
+        },
+        "reproducibility": {
+            "archive_format": "tar+zstd",
+            "source_date_epoch": TASK_TWO_DRIVER_DATE_EPOCH,
+            "owner": 0,
+            "group": 0,
+            "mode_policy": "git-executable-or-regular",
+        },
+        "artifacts": [
+            {
+                "name": "hyperpixel2r-kms-source.tar.zst",
+                "kind": "source-archive",
+                "sha256": sha256(source_archive),
+                "size": source_archive.len(),
+            },
+            {
+                "name": "SBOM.spdx.json",
+                "kind": "sbom",
+                "sha256": sha256(sbom),
+                "size": sbom.len(),
+            },
+        ],
+    }))
+    .expect("Task 2 driver manifest fixture");
+    manifest.push(b'\n');
+    manifest
+}
+
+pub fn task_two_driver_lock() -> DriverLock {
+    let manifest = task_two_driver_manifest();
+    DriverLock {
+        repository: "https://github.com/shayne/hyperpixel2r-kms".into(),
+        version: TASK_TWO_DRIVER_VERSION
+            .parse()
+            .expect("Task 2 driver version"),
+        commit: TASK_TWO_DRIVER_COMMIT.into(),
+        manifest_sha256: sha256(&manifest),
+        required_capability: TASK_TWO_DRIVER_CAPABILITY.into(),
     }
 }
 

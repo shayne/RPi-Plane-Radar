@@ -30,6 +30,11 @@ const EXPECTED_VERMAGIC: &str = "6.18.34+rpt-rpi-v8 SMP preempt mod_unload modve
 const REQUIRED_CAPABILITY: &str = "pwm-backlight-v1";
 const BACKLIGHT_RULE_FILE: &str = "70-planeradar-backlight.rules";
 const BACKLIGHT_RULE: &[u8] = b"SUBSYSTEM==\"backlight\", KERNEL==\"planeradar-backlight\", RUN+=\"/usr/bin/chgrp video /sys%p/brightness\", RUN+=\"/usr/bin/chmod 0660 /sys%p/brightness\"\n";
+const TASK_TWO_DRIVER_COMMIT: &str = "bb76bf8a3e9e02ce1b1acd4df97200083ca57277";
+const TASK_TWO_DRIVER_TREE: &str = "0693468744845cc03e91b6dfdd10b8cd676dbce6";
+const TASK_TWO_DRIVER_DATE_EPOCH: u64 = 1_785_742_634;
+const PUBLISHED_SCHEMA_ONE_MANIFEST: &[u8] =
+    include_bytes!("../../../tests/fixtures/driver/published-0.1.1-driver-manifest.json");
 
 fn probe(kernel_release: &str) -> TargetProbe {
     let vermagic = if kernel_release == "6.18.34+rpt-rpi-v8" {
@@ -142,24 +147,34 @@ fn source_archive() -> Vec<u8> {
 }
 
 fn source_archive_with_identity(repository: &str, commit: &str, tree: &str) -> Vec<u8> {
+    source_archive_with_version_and_identity("0.1.0", repository, commit, tree)
+}
+
+fn source_archive_with_version_and_identity(
+    version: &str,
+    repository: &str,
+    commit: &str,
+    tree: &str,
+) -> Vec<u8> {
     let identity = format!(
         "schema_version\t1\nrepository\t{repository}\nsource_revision\t{commit}\nsource_tree\t{tree}\n"
     );
+    let prefix = format!("hyperpixel2r-kms-{version}");
     archive(&[
         (
-            "hyperpixel2r-kms-0.1.0/scripts/verify-boot.sh",
+            &format!("{prefix}/scripts/verify-boot.sh"),
             EntryType::Regular,
             b"#!/usr/bin/env bash\n",
             None,
         ),
         (
-            "hyperpixel2r-kms-0.1.0/kernel/Kbuild",
+            &format!("{prefix}/kernel/Kbuild"),
             EntryType::Regular,
             b"obj-m += hyperpixel2r_kms.o\n",
             None,
         ),
         (
-            "hyperpixel2r-kms-0.1.0/release/source-identity.txt",
+            &format!("{prefix}/release/source-identity.txt"),
             EntryType::Regular,
             identity.as_bytes(),
             None,
@@ -274,6 +289,61 @@ fn release_manifest(source: &[u8], prebuilt: Option<(&[u8], &str)>) -> Vec<u8> {
         "artifacts": artifacts,
     }))
     .expect("manifest JSON")
+}
+
+fn task_two_candidate_manifest(source: &[u8], sbom: &[u8]) -> Vec<u8> {
+    let mut manifest = serde_json::to_vec_pretty(&serde_json::json!({
+        "schema_version": 2,
+        "driver_version": "0.1.1",
+        "capabilities": [REQUIRED_CAPABILITY],
+        "source": {
+            "repository": "https://github.com/shayne/hyperpixel2r-kms",
+            "commit": TASK_TWO_DRIVER_COMMIT,
+            "tree": TASK_TWO_DRIVER_TREE,
+            "date_epoch": TASK_TWO_DRIVER_DATE_EPOCH,
+        },
+        "supported": {
+            "board": "Raspberry Pi Zero 2 W",
+            "display": "HyperPixel 2.1 Round",
+            "operating_system": "Raspberry Pi OS Lite (Trixie, 64-bit)",
+            "architecture": "aarch64",
+            "kernel_policy": "exact-release-only",
+        },
+        "reproducibility": {
+            "archive_format": "tar+zstd",
+            "source_date_epoch": TASK_TWO_DRIVER_DATE_EPOCH,
+            "owner": 0,
+            "group": 0,
+            "mode_policy": "git-executable-or-regular",
+        },
+        "artifacts": [
+            {
+                "name": "hyperpixel2r-kms-source.tar.zst",
+                "kind": "source-archive",
+                "sha256": digest(source),
+                "size": source.len(),
+            },
+            {
+                "name": "SBOM.spdx.json",
+                "kind": "sbom",
+                "sha256": digest(sbom),
+                "size": sbom.len(),
+            },
+        ],
+    }))
+    .expect("Task 2 candidate manifest");
+    manifest.push(b'\n');
+    manifest
+}
+
+fn task_two_candidate_lock(manifest: &[u8]) -> DriverLock {
+    DriverLock {
+        repository: "https://github.com/shayne/hyperpixel2r-kms".into(),
+        version: Version::parse("0.1.1").expect("Task 2 driver version"),
+        commit: TASK_TWO_DRIVER_COMMIT.into(),
+        manifest_sha256: digest(manifest),
+        required_capability: REQUIRED_CAPABILITY.into(),
+    }
 }
 
 fn prebuilt_contract(bytes: &[u8]) -> (String, String) {
@@ -692,6 +762,78 @@ fn sync_verifies_the_locked_release_and_materializes_safe_source_and_prebuilt_ar
     assert_eq!(
         verifier.calls.lock().expect("verifier calls").as_slice(),
         &[(Version::parse("0.1.0-rc.11").expect("version"), 4)]
+    );
+}
+
+#[test]
+fn published_schema_one_manifest_matches_the_production_lock_and_fails_sync() {
+    let lock = DriverLock::checked_in().expect("published driver lock");
+    let manifest: serde_json::Value =
+        serde_json::from_slice(PUBLISHED_SCHEMA_ONE_MANIFEST).expect("published driver manifest");
+
+    assert_eq!(lock.version, Version::parse("0.1.1").expect("version"));
+    assert_eq!(lock.commit, "261a29f45963ef3fcaf1a23e8e444b4e68d4c370");
+    assert_eq!(digest(PUBLISHED_SCHEMA_ONE_MANIFEST), lock.manifest_sha256);
+    assert_eq!(manifest["schema_version"], 1);
+    assert_eq!(manifest["source"]["commit"], lock.commit);
+    assert!(manifest.get("capabilities").is_none());
+
+    let manager = DriverManager::new(
+        FakeReleaseSource::with_assets([(
+            "driver-manifest.json".into(),
+            PUBLISHED_SCHEMA_ONE_MANIFEST.to_vec(),
+        )]),
+        FakeReleaseVerifier::default(),
+        tempfile::tempdir()
+            .expect("temporary cache parent")
+            .keep()
+            .join("cache"),
+    );
+
+    assert!(matches!(
+        manager.sync(&lock),
+        Err(DriverError::InvalidManifest)
+    ));
+}
+
+#[test]
+fn task_two_schema_two_candidate_syncs_only_under_its_test_lock() {
+    let source = source_archive_with_version_and_identity(
+        "0.1.1",
+        "https://github.com/shayne/hyperpixel2r-kms",
+        TASK_TWO_DRIVER_COMMIT,
+        TASK_TWO_DRIVER_TREE,
+    );
+    let sbom = b"task-two-candidate-sbom\n";
+    let manifest = task_two_candidate_manifest(&source, sbom);
+    let lock = task_two_candidate_lock(&manifest);
+    let production = DriverLock::checked_in().expect("published driver lock");
+    let verifier = FakeReleaseVerifier::default();
+    let manager = DriverManager::new(
+        FakeReleaseSource::with_assets([
+            ("driver-manifest.json".into(), manifest.clone()),
+            ("hyperpixel2r-kms-source.tar.zst".into(), source),
+            ("SBOM.spdx.json".into(), sbom.to_vec()),
+        ]),
+        verifier.clone(),
+        tempfile::tempdir()
+            .expect("temporary cache parent")
+            .keep()
+            .join("cache"),
+    );
+
+    assert_ne!(lock.commit, production.commit);
+    assert_ne!(lock.manifest_sha256, production.manifest_sha256);
+    let synced = manager.sync(&lock).expect("sync Task 2 candidate");
+    assert!(
+        synced
+            .source_root()
+            .join("scripts/verify-boot.sh")
+            .is_file()
+    );
+    assert_eq!(
+        verifier.calls.lock().expect("verifier calls").as_slice(),
+        &[(Version::parse("0.1.1").expect("version"), 3)]
     );
 }
 

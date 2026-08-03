@@ -48,6 +48,8 @@ const FIXTURE_ROOT: &str = "tests/fixtures/pi-os-trixie";
 const REQUIRED_DRIVER_CAPABILITY: &str = "pwm-backlight-v1";
 const BACKLIGHT_RULE_FILE: &str = "70-planeradar-backlight.rules";
 const BACKLIGHT_RULE: &[u8] = b"SUBSYSTEM==\"backlight\", KERNEL==\"planeradar-backlight\", RUN+=\"/usr/bin/chgrp video /sys%p/brightness\", RUN+=\"/usr/bin/chmod 0660 /sys%p/brightness\"\n";
+const TASK_TWO_DRIVER_COMMIT: &str = release_fixture::TASK_TWO_DRIVER_COMMIT;
+const TASK_TWO_DRIVER_TREE: &str = release_fixture::TASK_TWO_DRIVER_TREE;
 
 fn schema_two_driver_tool_fixture() -> (tempfile::TempDir, DriverTool<()>) {
     let temporary = tempfile::tempdir().expect("schema-two driver fixture");
@@ -55,8 +57,8 @@ fn schema_two_driver_tool_fixture() -> (tempfile::TempDir, DriverTool<()>) {
     let artifact = temporary.path().join("artifact");
     fs::create_dir_all(&source).expect("driver source fixture");
     fs::create_dir_all(&artifact).expect("driver artifact fixture");
-    let revision = "261a29f45963ef3fcaf1a23e8e444b4e68d4c370";
-    let tree = "cccccccccccccccccccccccccccccccccccccccc";
+    let revision = TASK_TWO_DRIVER_COMMIT;
+    let tree = TASK_TWO_DRIVER_TREE;
     let kernel = "6.18.39+rpt-rpi-v8";
     let overlay = format!("hyperpixel2r-kms-{}.dtbo", &revision[..12]);
     let module = b"module\n";
@@ -107,10 +109,38 @@ fn schema_two_pwm_driver_bundle_is_accepted_with_its_exact_named_rule() {
         .expect("schema-two PWM driver postconditions");
 
     assert_eq!(postconditions.driver_version, "0.1.1");
+    assert_eq!(postconditions.source_revision, TASK_TWO_DRIVER_COMMIT);
+    assert_eq!(postconditions.source_tree, TASK_TWO_DRIVER_TREE);
     assert_eq!(
-        postconditions.source_revision,
-        "261a29f45963ef3fcaf1a23e8e444b4e68d4c370"
+        postconditions.backlight_rule_sha256,
+        "579166d62b6444ea3b289b62d68a9c41ee3120262e2e2bca18967550e8423c11"
     );
+}
+
+#[test]
+fn positive_pwm_lifecycle_release_uses_the_task_two_candidate_not_the_published_lock() {
+    let temporary = tempfile::tempdir().expect("candidate release fixture");
+    let (_, driver, _) = fixture_release(temporary.path());
+    let published = DriverLock::checked_in().expect("published driver lock");
+    let public_manifest = release_fixture::task_two_driver_manifest();
+    let public: serde_json::Value =
+        serde_json::from_slice(&public_manifest).expect("Task 2 public driver manifest");
+
+    assert_eq!(driver.version, "0.1.1");
+    assert_eq!(driver.source_commit, TASK_TWO_DRIVER_COMMIT);
+    assert_eq!(
+        driver.sha256,
+        format!("{:x}", Sha256::digest(&public_manifest))
+    );
+    assert_eq!(public["schema_version"], 2);
+    assert_eq!(
+        public["capabilities"],
+        serde_json::json!([REQUIRED_DRIVER_CAPABILITY])
+    );
+    assert_eq!(public["source"]["commit"], TASK_TWO_DRIVER_COMMIT);
+    assert_eq!(public["source"]["tree"], TASK_TWO_DRIVER_TREE);
+    assert_ne!(driver.source_commit, published.commit);
+    assert_ne!(driver.sha256, published.manifest_sha256);
 }
 
 fn fixture_files(root: &Path) -> Vec<PathBuf> {
@@ -590,7 +620,7 @@ impl DriverActions<FixtureSystem> for FixtureSystem {
         Ok(DriverPostconditions {
             driver_version: driver.version.clone(),
             source_revision: driver.source_commit.clone(),
-            source_tree: release_fixture::SOURCE_TREE.into(),
+            source_tree: TASK_TWO_DRIVER_TREE.into(),
             kernel_release: kernel.into(),
             capability: REQUIRED_DRIVER_CAPABILITY.into(),
             module_vermagic: format!("{kernel} SMP preempt mod_unload modversions aarch64"),
@@ -641,7 +671,7 @@ impl DriverActions<FixtureSystem> for FixtureSystem {
                 "schema_version\t2\ndriver_version\t{}\nsource_revision\t{}\nsource_tree\t{}\nkernel_release\t{kernel}\narchitecture\taarch64\nbase_dtb_sha256\t{}\ncapability\t{REQUIRED_DRIVER_CAPABILITY}\nmodule_file\thyperpixel2r_kms.ko\nmodule_sha256\t{}\nmodule_vermagic\t{kernel} SMP preempt mod_unload modversions aarch64\noverlay_file\t{overlay}\noverlay_sha256\t{}\napplied_dtb_file\thyperpixel2r-kms-applied.dtb\napplied_dtb_sha256\t{}\nbacklight_rule_file\t{BACKLIGHT_RULE_FILE}\nbacklight_rule_sha256\t{}\n",
                 driver.version,
                 driver.source_commit,
-                release_fixture::SOURCE_TREE,
+                TASK_TWO_DRIVER_TREE,
                 "a".repeat(64),
                 self.sha256(artifact.join("hyperpixel2r_kms.ko")),
                 self.sha256(artifact.join(&overlay)),
@@ -688,7 +718,7 @@ impl DriverActions<FixtureSystem> for FixtureSystem {
                 "schema_version=4\ndriver_version={}\nsource_revision={}\nsource_tree={}\nkernel_release={kernel}\nmodule_file=hyperpixel2r_kms.ko\nmodule_sha256={}\noverlay_file={overlay}\noverlay_sha256={}\napplied_dtb_file=hyperpixel2r-kms-applied.dtb\napplied_dtb_sha256={}\nnormal_config_sha256={}\ncandidate_config_sha256={}\ntryboot_existed=false\nprior_tryboot_sha256=none\nreplaced_overlay=vc4-kms-dpi-hyperpixel2r\nmodule_existed=false\noverlay_existed=false\nprior_dkms_inventory_sha256={}\nbacklight_rule_file={BACKLIGHT_RULE_FILE}\nbacklight_rule_sha256={}\nprior_backlight_rule_existed=false\nprior_backlight_rule_sha256=none\n",
                 driver.version,
                 driver.source_commit,
-                release_fixture::SOURCE_TREE,
+                TASK_TWO_DRIVER_TREE,
                 self.sha256(artifact.join("hyperpixel2r_kms.ko")),
                 self.sha256(artifact.join(&overlay)),
                 self.sha256(artifact.join("hyperpixel2r-kms-applied.dtb")),
@@ -1149,7 +1179,8 @@ impl OperationsBackend for SmokeDoctorBackend {
 }
 
 fn fixture_release(root: &Path) -> (ArtifactIdentity, ArtifactIdentity, ApplicationPayload) {
-    let generated = release_fixture::build_release(&root.join("release"));
+    let lock = release_fixture::task_two_driver_lock();
+    let generated = release_fixture::build_release_with_driver(&root.join("release"), &lock);
     let release = generated.directory;
     let raw: serde_json::Value = serde_json::from_slice(
         &fs::read(release.join("release-manifest.json")).expect("assembled release manifest"),
@@ -1157,7 +1188,6 @@ fn fixture_release(root: &Path) -> (ArtifactIdentity, ArtifactIdentity, Applicat
     .expect("release manifest JSON");
     let version = Version::parse(raw["version"].as_str().expect("release version"))
         .expect("semantic release version");
-    let lock = DriverLock::checked_in().expect("driver lock");
     let manifest = ReleaseManifest::parse(
         &fs::read(release.join("release-manifest.json")).expect("release manifest"),
         &version,
@@ -1261,8 +1291,10 @@ fn write_rgba_png(path: &Path, color: png::ColorType) {
 #[test]
 fn smoke_verifier_binds_doctor_screenshot_and_local_release_identities() {
     let temporary = tempfile::tempdir().expect("smoke verifier fixture");
-    let release = release_fixture::build_release(&temporary.path().join("release")).directory;
-    let (application, driver, _payload) = fixture_release(temporary.path());
+    let generated = release_fixture::build_release(&temporary.path().join("release"));
+    let release = generated.directory;
+    let application = generated.application;
+    let driver = generated.driver;
     let target = temporary.path().join("target-health");
     fs::create_dir_all(target.join("lib/modules/6.12.47+rpt-rpi-v8/extra"))
         .expect("health module parent");
@@ -1698,7 +1730,29 @@ fn controller_install_resume_reaches_every_real_phase() {
         .join(&driver.version)
         .join(&driver.source_commit)
         .join("6.12.47+rpt-rpi-v8");
-    assert!(driver_root.join("manifest.txt").is_file());
+    let exact_manifest =
+        fs::read_to_string(driver_root.join("manifest.txt")).expect("exact driver manifest");
+    assert_eq!(exact_manifest.lines().count(), 17);
+    assert!(
+        exact_manifest
+            .lines()
+            .any(|row| row == format!("source_revision\t{TASK_TWO_DRIVER_COMMIT}"))
+    );
+    assert!(
+        exact_manifest
+            .lines()
+            .any(|row| row == format!("source_tree\t{TASK_TWO_DRIVER_TREE}"))
+    );
+    assert!(exact_manifest.lines().any(|row| {
+        row == "backlight_rule_sha256\t579166d62b6444ea3b289b62d68a9c41ee3120262e2e2bca18967550e8423c11"
+    }));
+    let accepted = fs::read_to_string(root.join("var/lib/hyperpixel2r-kms/accepted-state"))
+        .expect("accepted driver receipt");
+    assert!(
+        accepted
+            .lines()
+            .any(|row| row == format!("source_revision={TASK_TWO_DRIVER_COMMIT}"))
+    );
     assert_eq!(
         fs::read_to_string(root.join("var/lib/planeradar-installer/driver-manifest.sha256"))
             .expect("driver manifest identity")
@@ -1732,7 +1786,7 @@ fn controller_install_resume_reaches_every_real_phase() {
         "pi@planeradar.local"
             .parse()
             .expect("diagnostic fixture target"),
-        DriverLock::checked_in().expect("diagnostic driver lock"),
+        release_fixture::task_two_driver_lock(),
     );
     let client = OperationsClient::new(&operations, ZeroClock);
     let doctor = client.doctor().expect("healthy fixture doctor");
