@@ -85,12 +85,13 @@ tree:
 
 ```bash
 companion_archive="$(mktemp -d "${TMPDIR:-/tmp}/planeradar-companion.XXXXXX")"
-mv /Users/shayne/code/RPi-Plane-Radar/.superpowers "$companion_archive/"
+mv /Users/shayne/code/RPi-Plane-Radar/.superpowers/brainstorm "$companion_archive/"
 git status --short
 ```
 
-Expected: `.superpowers/` is absent from `git status`; the approved design spec
-and plan remain committed on `codex/optional-radar-features`.
+Expected: `.superpowers/brainstorm` is absent from `git status`, while the
+git-ignored `.superpowers/sdd` execution ledger remains in place. The approved
+design spec and plan remain committed on `codex/optional-radar-features`.
 
 - [ ] **Step 2: Write failing navigation and form-association tests**
 
