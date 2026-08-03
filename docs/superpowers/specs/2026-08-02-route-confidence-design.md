@@ -1,6 +1,6 @@
 # Route Confidence for ADSBDB Enrichment
 
-Status: direction approved; written specification awaiting review
+Status: approved in conversation
 
 Date: 2026-08-02
 
