@@ -128,11 +128,14 @@ All browser and touch settings changes use one transaction:
 4. notify all three settings wake channels.
 
 Old aircraft replies are discarded when their location or range no longer
-matches. The enrichment cache keeps successes for six hours and definite
-misses for ten minutes, with bounded least-recently-used eviction. The
-environment worker refreshes required weather or radar-local time data no more
-than once every 15 minutes after success. Zulu-only time and date need no
-Open-Meteo request.
+matches. The enrichment cache keeps structured ADSBDB route candidates and
+model strings for six hours and definite misses for ten minutes, with bounded
+least-recently-used eviction. Cached route candidates are re-evaluated against
+every live aircraft position using a conservative great-circle corridor;
+implausible candidates publish no route, while valid midpoints remain visible
+in the compact label. The environment worker refreshes required weather or
+radar-local time data no more than once every 15 minutes after success.
+Zulu-only time and date need no Open-Meteo request.
 
 Primary position age alone controls `DATA STALE`; service errors do not set
 `DATA STALE`. When the primary feed stops, the last good frame remains visible

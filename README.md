@@ -84,6 +84,12 @@ both means those values may share one request. Weather and radar-local time
 send the configured coordinates to Open-Meteo. Zulu-only time and date send
 nothing to Open-Meteo.
 
+ADSBDB route records are static candidates, not live flight plans. Plane Radar
+uses the returned airport coordinates and each aircraft's live position to hide
+clearly incompatible routes, and it shows a returned midpoint explicitly. A
+plausible label can still be outdated or have the wrong direction; authoritative
+operational routes require a current-flight provider.
+
 The saved location is persisted locally on the Pi. When an enabled feature
 requires Open-Meteo, Plane Radar also transmits the configured coordinates as
 described above. Plane Radar does not control Open-Meteo's retention or
