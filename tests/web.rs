@@ -6,12 +6,19 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use jiff::Timestamp;
+use jiff::civil::Date;
+use jiff::tz::TimeZone as JiffTimeZone;
 use planeradar::geocode::{GeocodeError, GeocodeResult, GeocodeService};
 use planeradar::model::{
-    AppState, ClockFormat, FooterSettings, Location, RadarSettings, TemperatureUnit, TimeZone,
-    Units,
+    AppState, BacklightAvailability, ClockFormat, FooterSettings, Location, RadarSettings,
+    TemperatureUnit, TimeZone, Units,
 };
-use planeradar::web::{HealthSnapshot, HealthSource, SettingsServer, SettingsService, WebError};
+use planeradar::night_mode::display_policy;
+use planeradar::solar::{SolarDay, SolarSchedule};
+use planeradar::web::{
+    HealthSnapshot, HealthSource, SettingsPageState, SettingsServer, SettingsService, WebError,
+};
 
 const SESSION_COOKIE: &str = "planeradar_session";
 const LOCAL_URL: &str = "http://hangar-2.local";
@@ -19,15 +26,27 @@ const LOCAL_HOST: &str = "hangar-2.local";
 
 #[derive(Clone)]
 struct TestSettings {
-    current: Arc<Mutex<RadarSettings>>,
+    current: Arc<Mutex<TestPageInputs>>,
     replacements: Arc<Mutex<Vec<RadarSettings>>>,
     fail_replacements: bool,
+}
+
+struct TestPageInputs {
+    settings: RadarSettings,
+    schedule: Option<SolarSchedule>,
+    unix_seconds: u64,
+    backlight_availability: BacklightAvailability,
 }
 
 impl TestSettings {
     fn new(current: RadarSettings) -> Self {
         Self {
-            current: Arc::new(Mutex::new(current)),
+            current: Arc::new(Mutex::new(TestPageInputs {
+                settings: current,
+                schedule: None,
+                unix_seconds: 0,
+                backlight_availability: BacklightAvailability::Unknown,
+            })),
             replacements: Arc::new(Mutex::new(Vec::new())),
             fail_replacements: false,
         }
@@ -35,20 +54,56 @@ impl TestSettings {
 
     fn failing(current: RadarSettings) -> Self {
         Self {
-            current: Arc::new(Mutex::new(current)),
+            current: Arc::new(Mutex::new(TestPageInputs {
+                settings: current,
+                schedule: None,
+                unix_seconds: 0,
+                backlight_availability: BacklightAvailability::Unknown,
+            })),
             replacements: Arc::new(Mutex::new(Vec::new())),
             fail_replacements: true,
+        }
+    }
+
+    fn with_page_inputs(
+        current: RadarSettings,
+        schedule: Option<SolarSchedule>,
+        unix_seconds: u64,
+        backlight_availability: BacklightAvailability,
+    ) -> Self {
+        Self {
+            current: Arc::new(Mutex::new(TestPageInputs {
+                settings: current,
+                schedule,
+                unix_seconds,
+                backlight_availability,
+            })),
+            replacements: Arc::new(Mutex::new(Vec::new())),
+            fail_replacements: false,
         }
     }
 
     fn replacement_count(&self) -> usize {
         self.replacements.lock().unwrap().len()
     }
+
+    fn current(&self) -> RadarSettings {
+        self.current.lock().unwrap().settings.clone()
+    }
 }
 
 impl SettingsService for TestSettings {
-    fn current(&self) -> RadarSettings {
-        self.current.lock().unwrap().clone()
+    fn page_state(&self) -> SettingsPageState {
+        let current = self.current.lock().unwrap();
+        SettingsPageState {
+            settings: current.settings.clone(),
+            display_policy: display_policy(
+                &current.settings,
+                current.schedule.as_ref(),
+                current.unix_seconds,
+            ),
+            backlight_availability: current.backlight_availability,
+        }
     }
 
     fn replace(&self, candidate: RadarSettings) -> Result<(), WebError> {
@@ -56,7 +111,7 @@ impl SettingsService for TestSettings {
             return Err(WebError::Settings);
         }
         self.replacements.lock().unwrap().push(candidate.clone());
-        *self.current.lock().unwrap() = candidate;
+        self.current.lock().unwrap().settings = candidate;
         Ok(())
     }
 }
@@ -154,6 +209,23 @@ impl TestServer {
             queries: queries.clone(),
         });
         Self::start(TestSettings::failing(initial), geocoder, queries)
+    }
+
+    fn with_page_inputs(
+        initial: RadarSettings,
+        schedule: Option<SolarSchedule>,
+        unix_seconds: u64,
+        backlight_availability: BacklightAvailability,
+    ) -> Self {
+        let queries = Arc::new(Mutex::new(Vec::new()));
+        Self::start(
+            TestSettings::with_page_inputs(initial, schedule, unix_seconds, backlight_availability),
+            Box::new(TestGeocoder {
+                results: Vec::new(),
+                queries: queries.clone(),
+            }),
+            queries,
+        )
     }
 
     fn start(
@@ -461,6 +533,69 @@ fn optional_settings_enabled() -> RadarSettings {
     }
 }
 
+const STATUS_LATITUDE: f64 = 40.7769;
+const STATUS_LONGITUDE: f64 = -73.8740;
+
+fn unix(value: &str) -> u64 {
+    u64::try_from(
+        value
+            .parse::<Timestamp>()
+            .expect("literal UTC timestamp")
+            .as_second(),
+    )
+    .expect("positive fixture time")
+}
+
+fn status_settings(clock_format: ClockFormat) -> RadarSettings {
+    let mut settings = RadarSettings {
+        location: Some(Location {
+            latitude: STATUS_LATITUDE,
+            longitude: STATUS_LONGITUDE,
+            label: "LaGuardia Airport".to_owned(),
+        }),
+        ..RadarSettings::default()
+    };
+    settings.footer.clock_format = clock_format;
+    settings.brightness.day_percent = 85;
+    settings.brightness.night.enabled = true;
+    settings.brightness.night.brightness_percent = 25;
+    settings.brightness.night.start_hour = 20;
+    settings.brightness.night.start_minute = 0;
+    settings.brightness.night.red_mode = true;
+    settings
+}
+
+fn status_schedule(has_sunrise: bool) -> SolarSchedule {
+    let zone = JiffTimeZone::get("America/New_York").unwrap();
+    let mut date = "2026-08-02".parse::<Date>().unwrap();
+    let mut days = Vec::with_capacity(17);
+    for _ in 0..17 {
+        days.push(SolarDay {
+            date: date.to_string(),
+            sunrise_unix: has_sunrise
+                .then(|| zone.to_timestamp(date.at(6, 0, 0, 0)).unwrap().as_second()),
+        });
+        date = date.tomorrow().unwrap();
+    }
+    SolarSchedule {
+        schema_version: 1,
+        latitude: STATUS_LATITUDE,
+        longitude: STATUS_LONGITUDE,
+        time_zone: "America/New_York".to_owned(),
+        fetched_at_unix: 0,
+        days,
+    }
+}
+
+fn brightness_section(body: &str) -> &str {
+    body.split_once("id=\"brightness-settings\"")
+        .expect("brightness section should render")
+        .1
+        .split_once("</details>")
+        .expect("brightness section should close")
+        .0
+}
+
 fn geocode_result(display_name: &str) -> GeocodeResult {
     GeocodeResult {
         display_name: display_name.to_owned(),
@@ -547,6 +682,7 @@ fn settings_page_renders_labelled_section_navigation_and_associated_actions() {
     for (target, label) in [
         ("location", "Radar location"),
         ("radar-basics", "Radar display"),
+        ("brightness-settings", "Brightness"),
         ("aircraft-labels", "Aircraft labels"),
         ("footer", "Footer"),
         ("traffic-filter", "Traffic filter"),
@@ -567,7 +703,7 @@ fn settings_page_renders_labelled_section_navigation_and_associated_actions() {
             .body
             .matches("<small aria-hidden=\"true\">")
             .count(),
-        5,
+        6,
         "saved-value summaries should not expand accessible link names"
     );
     assert!(
@@ -586,6 +722,226 @@ fn settings_page_renders_labelled_section_navigation_and_associated_actions() {
             .contains("class=\"button-primary button-content\" type=\"submit\"")
     );
     assert!(!response.body.contains("<script"));
+}
+
+#[test]
+fn brightness_destination_renders_saved_native_controls_and_descriptions() {
+    let mut settings = optional_settings_enabled();
+    settings.brightness.day_percent = 75;
+    settings.brightness.night.enabled = false;
+    settings.brightness.night.brightness_percent = 25;
+    settings.brightness.night.start_hour = 21;
+    settings.brightness.night.start_minute = 35;
+    settings.brightness.night.red_mode = true;
+
+    let response = TestServer::new(settings, Vec::new()).get("/");
+
+    assert_eq!(response.status, 200);
+    let navigation = response
+        .body
+        .split_once("<nav class=\"settings-navigation\" aria-label=\"Settings sections\">")
+        .expect("settings navigation should be rendered")
+        .1
+        .split_once("</nav>")
+        .expect("settings navigation should close")
+        .0;
+    let radar_display = navigation.find("href=\"#radar-basics\"").unwrap();
+    let brightness = navigation.find("href=\"#brightness-settings\"").unwrap();
+    let aircraft = navigation.find("href=\"#aircraft-labels\"").unwrap();
+    assert!(radar_display < brightness && brightness < aircraft);
+
+    for expected in [
+        "<input type=\"range\" name=\"brightness_day_percent\" min=\"5\" max=\"100\" step=\"5\" value=\"75\"",
+        "<input type=\"range\" name=\"brightness_night_percent\" min=\"5\" max=\"100\" step=\"5\" value=\"25\"",
+        "<input type=\"time\" name=\"brightness_night_start\" step=\"60\" value=\"21:35\"",
+        "name=\"brightness_night_enabled_present\" value=\"true\"",
+        "name=\"brightness_red_mode_present\" value=\"true\"",
+        "for=\"brightness-day\"",
+        "for=\"brightness-night\"",
+        "for=\"brightness-night-start\"",
+        "aria-describedby=\"brightness-day-description brightness-day-scale\"",
+        "aria-describedby=\"brightness-night-description brightness-night-scale\"",
+        "aria-describedby=\"brightness-night-start-description\"",
+        "id=\"brightness-day-scale\"><span>5%</span><span>50%</span><span>100%</span>",
+        "id=\"brightness-night-scale\"><span>5%</span><span>50%</span><span>100%</span>",
+        "data-section=\"brightness\" open",
+    ] {
+        assert!(
+            response.body.contains(expected),
+            "brightness section omitted {expected:?}"
+        );
+    }
+    let section = response
+        .body
+        .split_once("id=\"brightness-settings\"")
+        .expect("brightness section should render")
+        .1
+        .split_once("</details>")
+        .expect("brightness section should close")
+        .0;
+    assert!(!section.contains(" disabled"));
+    assert!(section.contains("name=\"brightness_red_mode\" value=\"true\" checked"));
+    assert!(!response.body.contains("<script"));
+}
+
+#[test]
+fn brightness_status_reports_disabled_upcoming_active_fallback_waiting_and_driver_facts() {
+    struct Case {
+        name: &'static str,
+        settings: RadarSettings,
+        schedule: Option<SolarSchedule>,
+        now: &'static str,
+        availability: BacklightAvailability,
+        expected: &'static [&'static str],
+    }
+
+    let mut disabled = status_settings(ClockFormat::Twelve);
+    disabled.brightness.night.enabled = false;
+    let cases = [
+        Case {
+            name: "disabled",
+            settings: disabled,
+            schedule: Some(status_schedule(true)),
+            now: "2026-08-03T01:00:00Z",
+            availability: BacklightAvailability::Available,
+            expected: &["Night mode off", "Day brightness is 85%."],
+        },
+        Case {
+            name: "upcoming 12-hour",
+            settings: status_settings(ClockFormat::Twelve),
+            schedule: Some(status_schedule(true)),
+            now: "2026-08-02T23:00:00Z",
+            availability: BacklightAvailability::Available,
+            expected: &[
+                "Night mode starts at 8:00 PM",
+                "Display will dim to 25% until sunrise. Red-only color is on.",
+            ],
+        },
+        Case {
+            name: "upcoming 24-hour",
+            settings: status_settings(ClockFormat::TwentyFour),
+            schedule: Some(status_schedule(true)),
+            now: "2026-08-02T23:00:00Z",
+            availability: BacklightAvailability::Available,
+            expected: &["Night mode starts at 20:00"],
+        },
+        Case {
+            name: "active",
+            settings: status_settings(ClockFormat::Twelve),
+            schedule: Some(status_schedule(true)),
+            now: "2026-08-03T01:00:00Z",
+            availability: BacklightAvailability::Available,
+            expected: &[
+                "Night mode active at 25%",
+                "Day brightness returns at sunrise. Red-only color is on.",
+            ],
+        },
+        Case {
+            name: "fallback",
+            settings: status_settings(ClockFormat::Twelve),
+            schedule: Some(status_schedule(false)),
+            now: "2026-08-03T01:00:00Z",
+            availability: BacklightAvailability::Available,
+            expected: &[
+                "Night mode active at 25%",
+                "Sunrise data is unavailable, so day brightness returns at 7:00 AM.",
+                "Red-only color is on.",
+            ],
+        },
+        Case {
+            name: "waiting",
+            settings: status_settings(ClockFormat::Twelve),
+            schedule: None,
+            now: "2026-08-03T01:00:00Z",
+            availability: BacklightAvailability::Available,
+            expected: &[
+                "Waiting for sunrise data",
+                "Day brightness stays at 85% until a radar-local schedule is ready.",
+            ],
+        },
+        Case {
+            name: "driver unavailable",
+            settings: status_settings(ClockFormat::Twelve),
+            schedule: Some(status_schedule(true)),
+            now: "2026-08-03T01:00:00Z",
+            availability: BacklightAvailability::Unavailable,
+            expected: &[
+                "Display brightness unavailable",
+                "Settings are saved, but the installed display driver cannot adjust the backlight.",
+            ],
+        },
+    ];
+
+    for case in cases {
+        let response = TestServer::with_page_inputs(
+            case.settings,
+            case.schedule,
+            unix(case.now),
+            case.availability,
+        )
+        .get("/");
+        let status = brightness_section(&response.body);
+        for expected in case.expected {
+            assert!(
+                status.contains(expected),
+                "{} omitted status fact {expected:?}: {status}",
+                case.name
+            );
+        }
+        for forbidden in [
+            "open-meteo",
+            "provider",
+            "40.7769",
+            "-73.874",
+            "timeout",
+            "transport",
+        ] {
+            assert!(
+                !status.to_ascii_lowercase().contains(forbidden),
+                "{} exposed {forbidden:?}",
+                case.name
+            );
+        }
+    }
+}
+
+#[test]
+fn brightness_save_is_reflected_by_the_next_policy_snapshot_immediately() {
+    let mut settings = status_settings(ClockFormat::Twelve);
+    settings.brightness.night.enabled = false;
+    settings.brightness.night.red_mode = false;
+    let server = TestServer::with_page_inputs(
+        settings,
+        Some(status_schedule(true)),
+        unix("2026-08-03T01:00:00Z"),
+        BacklightAvailability::Available,
+    );
+    let session = server.session();
+
+    let response = server.post_form(
+        "/settings",
+        &[
+            ("latitude", "40.7769"),
+            ("longitude", "-73.874"),
+            ("label", "LaGuardia Airport"),
+            ("brightness_day_percent", "85"),
+            ("brightness_night_percent", "25"),
+            ("brightness_night_start", "20:00"),
+            ("brightness_night_enabled_present", "true"),
+            ("brightness_night_enabled", "true"),
+            ("brightness_red_mode_present", "true"),
+            ("brightness_red_mode", "true"),
+        ],
+        &session,
+        Some(&server.current_ip_origin()),
+        None,
+    );
+
+    assert_eq!(response.status, 303);
+    let saved = server.get("/?saved=1");
+    let status = brightness_section(&saved.body);
+    assert!(status.contains("Night mode active at 25%"));
+    assert!(status.contains("Red-only color is on."));
 }
 
 #[test]
@@ -1676,6 +2032,206 @@ fn optional_settings_invalid_duplicate_and_unknown_values_are_atomic() {
             "replaced for {name}"
         );
     }
+}
+
+#[test]
+fn brightness_form_rejects_missing_duplicate_malformed_and_invalid_values_atomically() {
+    type InvalidBrightnessCase<'a> = (&'a str, Vec<(&'a str, &'a str)>);
+    let cases: Vec<InvalidBrightnessCase<'_>> = vec![
+        (
+            "duplicate day percentage",
+            vec![
+                ("brightness_day_percent", "50"),
+                ("brightness_day_percent", "55"),
+                ("brightness_night_percent", "30"),
+                ("brightness_night_start", "20:00"),
+            ],
+        ),
+        (
+            "missing night percentage",
+            vec![
+                ("brightness_day_percent", "50"),
+                ("brightness_night_start", "20:00"),
+            ],
+        ),
+        (
+            "malformed percentage",
+            vec![
+                ("brightness_day_percent", "bright"),
+                ("brightness_night_percent", "30"),
+                ("brightness_night_start", "20:00"),
+            ],
+        ),
+        (
+            "out-of-range percentage",
+            vec![
+                ("brightness_day_percent", "0"),
+                ("brightness_night_percent", "30"),
+                ("brightness_night_start", "20:00"),
+            ],
+        ),
+        (
+            "non-step percentage",
+            vec![
+                ("brightness_day_percent", "52"),
+                ("brightness_night_percent", "30"),
+                ("brightness_night_start", "20:00"),
+            ],
+        ),
+        (
+            "missing time",
+            vec![
+                ("brightness_day_percent", "50"),
+                ("brightness_night_percent", "30"),
+            ],
+        ),
+        (
+            "non-exact time",
+            vec![
+                ("brightness_day_percent", "50"),
+                ("brightness_night_percent", "30"),
+                ("brightness_night_start", "8:00"),
+            ],
+        ),
+        (
+            "non-ascii time",
+            vec![
+                ("brightness_day_percent", "50"),
+                ("brightness_night_percent", "30"),
+                ("brightness_night_start", "٢٠:٠٠"),
+            ],
+        ),
+        (
+            "out-of-range hour",
+            vec![
+                ("brightness_day_percent", "50"),
+                ("brightness_night_percent", "30"),
+                ("brightness_night_start", "24:00"),
+            ],
+        ),
+        (
+            "out-of-range minute",
+            vec![
+                ("brightness_day_percent", "50"),
+                ("brightness_night_percent", "30"),
+                ("brightness_night_start", "20:60"),
+            ],
+        ),
+        (
+            "duplicate night sentinel",
+            vec![
+                ("brightness_day_percent", "50"),
+                ("brightness_night_percent", "30"),
+                ("brightness_night_start", "20:00"),
+                ("brightness_night_enabled_present", "true"),
+                ("brightness_night_enabled_present", "true"),
+            ],
+        ),
+    ];
+
+    for (name, extra) in cases {
+        let mut initial = optional_settings_enabled();
+        initial.brightness.day_percent = 75;
+        initial.brightness.night.brightness_percent = 25;
+        initial.brightness.night.start_hour = 21;
+        initial.brightness.night.start_minute = 35;
+        let server = TestServer::new(initial.clone(), Vec::new());
+        let session = server.session();
+        let mut fields = vec![("latitude", "40.7"), ("longitude", "-74.0")];
+        fields.extend(extra);
+
+        let response = server.post_form(
+            "/settings",
+            &fields,
+            &session,
+            Some(&server.current_ip_origin()),
+            None,
+        );
+
+        assert_eq!(response.status, 400, "accepted {name}");
+        assert!(
+            response.body.contains("data-section=\"brightness\" open"),
+            "did not open Brightness for {name}"
+        );
+        assert!(response.body.contains(
+            "Brightness needs percentages from 5% to 100% in 5% steps and a valid start time."
+        ));
+        assert_eq!(
+            server.settings.current(),
+            initial,
+            "changed settings for {name}"
+        );
+        assert_eq!(
+            server.settings.replacement_count(),
+            0,
+            "replaced for {name}"
+        );
+    }
+}
+
+#[test]
+fn brightness_form_uses_sentinels_and_preserves_unrelated_settings() {
+    let mut initial = optional_settings_enabled();
+    initial.brightness.day_percent = 75;
+    initial.brightness.night.enabled = true;
+    initial.brightness.night.brightness_percent = 25;
+    initial.brightness.night.start_hour = 21;
+    initial.brightness.night.start_minute = 35;
+    initial.brightness.night.red_mode = true;
+    let server = TestServer::new(initial.clone(), Vec::new());
+    let session = server.session();
+
+    let response = server.post_form(
+        "/settings",
+        &[
+            ("latitude", "51.5072"),
+            ("longitude", "-0.1276"),
+            ("brightness_day_percent", "65"),
+            ("brightness_night_percent", "20"),
+            ("brightness_night_start", "22:15"),
+            ("brightness_night_enabled_present", "true"),
+            ("brightness_red_mode_present", "true"),
+        ],
+        &session,
+        Some(&server.current_ip_origin()),
+        None,
+    );
+
+    assert_eq!(response.status, 303);
+    let mut expected = initial;
+    expected.location.as_mut().unwrap().label.clear();
+    expected.brightness.day_percent = 65;
+    expected.brightness.night.enabled = false;
+    expected.brightness.night.brightness_percent = 20;
+    expected.brightness.night.start_hour = 22;
+    expected.brightness.night.start_minute = 15;
+    expected.brightness.night.red_mode = false;
+    assert_eq!(server.settings.current(), expected);
+    assert_eq!(server.settings.replacement_count(), 1);
+}
+
+#[test]
+fn partial_location_form_preserves_the_entire_brightness_configuration() {
+    let mut initial = configured_settings();
+    initial.brightness.day_percent = 65;
+    initial.brightness.night.enabled = true;
+    initial.brightness.night.brightness_percent = 20;
+    initial.brightness.night.start_hour = 22;
+    initial.brightness.night.start_minute = 15;
+    initial.brightness.night.red_mode = true;
+    let server = TestServer::new(initial.clone(), Vec::new());
+    let session = server.session();
+
+    let response = server.post_form(
+        "/settings",
+        &[("latitude", "40.7"), ("longitude", "-74.0")],
+        &session,
+        Some(&server.current_ip_origin()),
+        None,
+    );
+
+    assert_eq!(response.status, 303);
+    assert_eq!(server.settings.current().brightness, initial.brightness);
 }
 
 #[test]

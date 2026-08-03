@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use signal_hook::consts::signal::{SIGINT, SIGTERM};
 use thiserror::Error;
@@ -25,12 +25,15 @@ use crate::geocode::{GeocodeService, Geocoder};
 use crate::http::{HttpClient, UreqHttpClient};
 use crate::model::{AppState, RadarSettings};
 use crate::network::{current_interfaces, discover_ip_url};
+use crate::night_mode::display_policy;
 use crate::range::{next_range_index, range_preset};
 use crate::settings::SettingsStore;
 use crate::solar::{SolarClient, load_cache};
 use crate::time::{Clock, SystemClock, ThreadSleeper};
 use crate::weather::WeatherClient;
-use crate::web::{HealthSnapshot, HealthSource, SettingsServer, SettingsService, WebError};
+use crate::web::{
+    HealthSnapshot, HealthSource, SettingsPageState, SettingsServer, SettingsService, WebError,
+};
 
 const SUCCESS_INTERVAL: Duration = Duration::from_secs(3);
 const IDLE_INTERVAL: Duration = Duration::from_secs(30);
@@ -360,8 +363,21 @@ impl RuntimeSettingsService {
 }
 
 impl SettingsService for RuntimeSettingsService {
-    fn current(&self) -> RadarSettings {
-        self.model.snapshot().settings
+    fn page_state(&self) -> SettingsPageState {
+        let snapshot = self.model.snapshot();
+        let unix_seconds = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::ZERO)
+            .as_secs();
+        SettingsPageState {
+            display_policy: display_policy(
+                &snapshot.settings,
+                snapshot.solar_schedule.as_deref(),
+                unix_seconds,
+            ),
+            settings: snapshot.settings,
+            backlight_availability: snapshot.backlight_availability,
+        }
     }
 
     fn replace(&self, candidate: RadarSettings) -> Result<(), WebError> {

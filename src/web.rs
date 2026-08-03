@@ -14,8 +14,9 @@ use url::Url;
 
 use crate::geocode::{GeocodeResult, GeocodeService};
 use crate::model::{
-    AppState, ClockFormat, FooterSettings, Location, RadarSettings, SETTINGS_SCHEMA_VERSION,
-    TemperatureUnit, TimeZone, Units,
+    AppState, BacklightAvailability, ClockFormat, DisplayPeriod, DisplayPolicy, FooterSettings,
+    Location, RadarSettings, SETTINGS_SCHEMA_VERSION, SolarStatus, TemperatureUnit, TimeZone,
+    Units,
 };
 use crate::range::{format_range_label, range_preset};
 use crate::settings::validate_settings;
@@ -28,8 +29,15 @@ const SESSION_COOKIE: &str = "planeradar_session";
 const MAX_IN_FLIGHT_REQUESTS: usize = 16;
 
 pub trait SettingsService: Send + Sync {
-    fn current(&self) -> RadarSettings;
+    fn page_state(&self) -> SettingsPageState;
     fn replace(&self, candidate: RadarSettings) -> Result<(), WebError>;
+}
+
+#[derive(Clone, Debug)]
+pub struct SettingsPageState {
+    pub settings: RadarSettings,
+    pub display_policy: DisplayPolicy,
+    pub backlight_availability: BacklightAvailability,
 }
 
 pub trait HealthSource: Send + Sync {
@@ -153,8 +161,9 @@ impl ServerState {
 
     fn page(&self, saved: bool) -> Result<Outgoing, WebError> {
         let (session_id, csrf_token) = self.sessions.lock().map_err(|_| WebError::State)?.create();
+        let page_state = self.settings.page_state();
         let body = render_page(
-            &self.settings.current(),
+            &page_state,
             &self.local_url,
             &csrf_token,
             SearchState::Idle,
@@ -234,8 +243,9 @@ impl ServerState {
         {
             Ok(results) => results,
             Err(_) => {
+                let page_state = self.settings.page_state();
                 let body = render_page(
-                    &self.settings.current(),
+                    &page_state,
                     &self.local_url,
                     csrf_token,
                     SearchState::Unavailable,
@@ -249,19 +259,14 @@ impl ServerState {
         } else {
             SearchState::Results(&results)
         };
-        let body = render_page(
-            &self.settings.current(),
-            &self.local_url,
-            csrf_token,
-            search,
-            None,
-        );
+        let page_state = self.settings.page_state();
+        let body = render_page(&page_state, &self.local_url, csrf_token, search, None);
         Ok(Outgoing::html(200, body).with_header("Cache-Control", "no-store"))
     }
 
     fn replace_settings(&self, form: Form, csrf_token: &str) -> Result<Outgoing, WebError> {
-        let current = self.settings.current();
-        let candidate = match candidate_from_form(&current, &form) {
+        let current = self.settings.page_state();
+        let candidate = match candidate_from_form(&current.settings, &form) {
             Ok(candidate) => candidate,
             Err(error) => {
                 let body = render_page(
@@ -278,12 +283,17 @@ impl ServerState {
         let validated = match validate_settings(value) {
             Ok(validated) => validated,
             Err(_) => {
+                let error = if brightness_form_submitted(&form) {
+                    FormError::brightness()
+                } else {
+                    FormError::generic(None)
+                };
                 let body = render_page(
                     &current,
                     &self.local_url,
                     csrf_token,
                     SearchState::Idle,
-                    Some(PageNotice::InvalidSettings(FormError::generic(None))),
+                    Some(PageNotice::InvalidSettings(error)),
                 );
                 return Ok(Outgoing::html(400, body).with_header("Cache-Control", "no-store"));
             }
@@ -536,9 +546,12 @@ impl Form {
 
 const INVALID_SETTINGS_MESSAGE: &str =
     "Those settings could not be applied. Check the coordinates and try again.";
+const INVALID_BRIGHTNESS_MESSAGE: &str =
+    "Brightness needs percentages from 5% to 100% in 5% steps and a valid start time.";
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum SettingsSection {
+    Brightness,
     Aircraft,
     Footer,
     Traffic,
@@ -561,6 +574,13 @@ impl FormError {
     fn in_section(mut self, section: SettingsSection) -> Self {
         self.section = Some(section);
         self
+    }
+
+    fn brightness() -> Self {
+        Self {
+            section: Some(SettingsSection::Brightness),
+            message: INVALID_BRIGHTNESS_MESSAGE,
+        }
     }
 }
 
@@ -625,6 +645,38 @@ fn parse_clock_format(value: &str) -> Result<ClockFormat, FormError> {
     }
 }
 
+fn brightness_form_submitted(form: &Form) -> bool {
+    form.fields
+        .iter()
+        .any(|(name, _)| name.starts_with("brightness_"))
+}
+
+fn required_brightness_percent(form: &Form, name: &str) -> Result<u8, FormError> {
+    form.single(name)
+        .map_err(|()| FormError::brightness())?
+        .ok_or_else(FormError::brightness)?
+        .parse()
+        .map_err(|_| FormError::brightness())
+}
+
+fn parse_brightness_time(value: &str) -> Result<(u8, u8), FormError> {
+    let bytes = value.as_bytes();
+    if bytes.len() != 5
+        || bytes[2] != b':'
+        || ![bytes[0], bytes[1], bytes[3], bytes[4]]
+            .into_iter()
+            .all(|byte| byte.is_ascii_digit())
+    {
+        return Err(FormError::brightness());
+    }
+    let hour = (bytes[0] - b'0') * 10 + (bytes[1] - b'0');
+    let minute = (bytes[3] - b'0') * 10 + (bytes[4] - b'0');
+    if hour > 23 || minute > 59 {
+        return Err(FormError::brightness());
+    }
+    Ok((hour, minute))
+}
+
 fn candidate_from_form(current: &RadarSettings, form: &Form) -> Result<RadarSettings, FormError> {
     const KNOWN_FIELDS: &[&str] = &[
         "csrf_token",
@@ -642,6 +694,13 @@ fn candidate_from_form(current: &RadarSettings, form: &Form) -> Result<RadarSett
         "show_expanded_model_present",
         "show_expanded_model",
         "radar_text_scale_percent",
+        "brightness_day_percent",
+        "brightness_night_percent",
+        "brightness_night_start",
+        "brightness_night_enabled_present",
+        "brightness_night_enabled",
+        "brightness_red_mode_present",
+        "brightness_red_mode",
         "footer_show_condition_present",
         "footer_show_condition",
         "footer_show_temperature_present",
@@ -750,6 +809,33 @@ fn candidate_from_form(current: &RadarSettings, form: &Form) -> Result<RadarSett
         ) {
             return Err(FormError::generic(None));
         }
+    }
+
+    if brightness_form_submitted(form) {
+        candidate.brightness.day_percent =
+            required_brightness_percent(form, "brightness_day_percent")?;
+        candidate.brightness.night.brightness_percent =
+            required_brightness_percent(form, "brightness_night_percent")?;
+        let start = form
+            .single("brightness_night_start")
+            .map_err(|()| FormError::brightness())?
+            .ok_or_else(FormError::brightness)?;
+        (
+            candidate.brightness.night.start_hour,
+            candidate.brightness.night.start_minute,
+        ) = parse_brightness_time(start)?;
+        candidate.brightness.night.enabled = checkbox(
+            form,
+            "brightness_night_enabled",
+            candidate.brightness.night.enabled,
+        )
+        .map_err(|_| FormError::brightness())?;
+        candidate.brightness.night.red_mode = checkbox(
+            form,
+            "brightness_red_mode",
+            candidate.brightness.night.red_mode,
+        )
+        .map_err(|_| FormError::brightness())?;
     }
 
     candidate.footer.show_condition = checkbox(
@@ -1105,22 +1191,97 @@ fn render_settings_navigation(settings: &RadarSettings) -> String {
 <ul>
 <li><a href="#location"><span>Radar location</span><small aria-hidden="true">{location}</small></a></li>
 <li><a href="#radar-basics"><span>Radar display</span><small aria-hidden="true">{}%</small></a></li>
+<li><a href="#brightness-settings"><span>Brightness</span><small aria-hidden="true">{}% day</small></a></li>
 <li><a href="#aircraft-labels"><span>Aircraft labels</span><small aria-hidden="true">{aircraft_count} on</small></a></li>
 <li><a href="#footer"><span>Footer</span><small aria-hidden="true">{footer_count} on</small></a></li>
 <li><a href="#traffic-filter"><span>Traffic filter</span><small aria-hidden="true">{traffic}</small></a></li>
 </ul>
 </nav>"##,
-        settings.radar_text_scale_percent
+        settings.radar_text_scale_percent, settings.brightness.day_percent
+    )
+}
+
+fn format_clock_time(hour: u8, minute: u8, format: ClockFormat) -> String {
+    match format {
+        ClockFormat::TwentyFour => format!("{hour:02}:{minute:02}"),
+        ClockFormat::Twelve => {
+            let period = if hour < 12 { "AM" } else { "PM" };
+            let display_hour = match hour % 12 {
+                0 => 12,
+                hour => hour,
+            };
+            format!("{display_hour}:{minute:02} {period}")
+        }
+    }
+}
+
+fn render_brightness_status(page_state: &SettingsPageState) -> String {
+    let settings = &page_state.settings;
+    let policy = page_state.display_policy;
+    let start = format_clock_time(
+        settings.brightness.night.start_hour,
+        settings.brightness.night.start_minute,
+        settings.footer.clock_format,
+    );
+    let fallback = format_clock_time(7, 0, settings.footer.clock_format);
+    let red = if settings.brightness.night.red_mode {
+        " Red-only color is on."
+    } else {
+        ""
+    };
+    let (title, detail) = match policy.solar_status {
+        SolarStatus::Disabled => (
+            "Night mode off".to_owned(),
+            format!("Day brightness is {}%.", settings.brightness.day_percent),
+        ),
+        SolarStatus::Waiting => (
+            "Waiting for sunrise data".to_owned(),
+            format!(
+                "Day brightness stays at {}% until a radar-local schedule is ready.",
+                settings.brightness.day_percent
+            ),
+        ),
+        SolarStatus::Upcoming(_) => (
+            format!("Night mode starts at {start}"),
+            format!(
+                "Display will dim to {}% until sunrise.{red}",
+                settings.brightness.night.brightness_percent
+            ),
+        ),
+        SolarStatus::Active(_) => (
+            format!("Night mode active at {}%", policy.brightness_percent),
+            format!("Day brightness returns at sunrise.{red}"),
+        ),
+        SolarStatus::Fallback(_) if policy.period == DisplayPeriod::Night => (
+            format!("Night mode active at {}%", policy.brightness_percent),
+            format!("Sunrise data is unavailable, so day brightness returns at {fallback}.{red}"),
+        ),
+        SolarStatus::Fallback(_) => (
+            format!("Night mode starts at {start}"),
+            format!("Sunrise data is unavailable, so day brightness returns at {fallback}.{red}"),
+        ),
+    };
+    let driver = if page_state.backlight_availability == BacklightAvailability::Unavailable {
+        r#"<p class="brightness-driver"><strong>Display brightness unavailable</strong><span>Settings are saved, but the installed display driver cannot adjust the backlight.</span></p>"#
+    } else {
+        ""
+    };
+    format!(
+        r#"<div class="brightness-status" role="status">
+<p><strong>{title}</strong><span>{detail}</span></p>
+{driver}
+</div>"#
     )
 }
 
 fn render_page(
-    settings: &RadarSettings,
+    page_state: &SettingsPageState,
     local_url: &str,
     csrf_token: &str,
     search: SearchState<'_>,
     notice: Option<PageNotice>,
 ) -> String {
+    let settings = &page_state.settings;
     let (latitude, longitude, label) = settings
         .location
         .as_ref()
@@ -1155,6 +1316,13 @@ fn render_page(
     } else {
         ""
     };
+    let brightness_open = if settings.brightness != Default::default()
+        || error_section == Some(SettingsSection::Brightness)
+    {
+        " open"
+    } else {
+        ""
+    };
     let footer_open = if settings.footer != Default::default()
         || error_section == Some(SettingsSection::Footer)
     {
@@ -1172,6 +1340,14 @@ fn render_page(
     let show_callsign_checked = checked(settings.show_callsign);
     let show_route_checked = checked(settings.show_route);
     let show_expanded_model_checked = checked(settings.show_expanded_model);
+    let night_enabled_checked = checked(settings.brightness.night.enabled);
+    let red_mode_checked = checked(settings.brightness.night.red_mode);
+    let day_brightness = settings.brightness.day_percent;
+    let night_brightness = settings.brightness.night.brightness_percent;
+    let night_start = format!(
+        "{:02}:{:02}",
+        settings.brightness.night.start_hour, settings.brightness.night.start_minute
+    );
     let footer_condition_checked = checked(settings.footer.show_condition);
     let footer_temperature_checked = checked(settings.footer.show_temperature);
     let footer_humidity_checked = checked(settings.footer.show_humidity);
@@ -1204,6 +1380,7 @@ fn render_page(
         ""
     };
     let status = render_status(settings);
+    let brightness_status = render_brightness_status(page_state);
     let settings_navigation = render_settings_navigation(settings);
     let notice = render_notice(notice);
     let search_results = render_search_results(settings, &csrf, search);
@@ -1520,7 +1697,7 @@ h3 {{ font-size: 1rem; font-weight: 700; line-height: 1.25; }}
   text-transform: uppercase;
 }}
 
-#location, #radar-basics, #aircraft-labels, #footer, #traffic-filter {{
+#location, #radar-basics, #brightness-settings, #aircraft-labels, #footer, #traffic-filter {{
   scroll-margin-top: var(--space-xl);
 }}
 
@@ -1552,6 +1729,39 @@ input[type="search"], input[type="number"], input:not([type]), select {{
 
 input::placeholder {{ color: var(--text-faint); opacity: 1; }}
 input:hover, select:hover {{ border-color: var(--text-muted); }}
+
+input[type="time"] {{
+  width: 100%;
+  min-width: 0;
+  min-height: 44px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--text);
+  padding: 0.65rem 0.75rem;
+  font-variant-numeric: tabular-nums;
+}}
+
+input[type="range"] {{ width: 100%; min-height: 44px; accent-color: var(--accent); }}
+.range-field {{ display: grid; gap: var(--space-sm); min-width: 0; }}
+.range-scale {{
+  display: flex;
+  justify-content: space-between;
+  color: var(--text-faint);
+  font-size: 0.75rem;
+  font-variant-numeric: tabular-nums;
+}}
+.field-description {{ color: var(--text-muted); font-size: 0.8125rem; line-height: 1.45; }}
+.brightness-status {{
+  display: grid;
+  gap: var(--space-md);
+  padding: var(--space-md) 0;
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+}}
+.brightness-status p, .brightness-status span {{ display: grid; gap: 0.125rem; }}
+.brightness-status span {{ color: var(--text-muted); font-size: 0.8125rem; line-height: 1.45; }}
+.brightness-driver {{ color: var(--warning); }}
 
 .location > form button {{ margin-top: var(--space-xs); }}
 
@@ -1941,6 +2151,44 @@ Radar text size
 </label>
 </div>
 <div class="option-groups">
+<details class="option-group" id="brightness-settings" data-section="brightness"{brightness_open}>
+<summary>Brightness: {day_brightness}% day</summary>
+<div class="option-content">
+{brightness_status}
+<div class="paired-fields">
+<div class="range-field">
+<label for="brightness-day">Day brightness</label>
+<p class="field-description" id="brightness-day-description">Brightness outside night mode.</p>
+<input type="range" name="brightness_day_percent" min="5" max="100" step="5" value="{day_brightness}" id="brightness-day" aria-describedby="brightness-day-description brightness-day-scale">
+<div class="range-scale" id="brightness-day-scale"><span>5%</span><span>50%</span><span>100%</span></div>
+</div>
+<div class="range-field">
+<label for="brightness-night">Night brightness</label>
+<p class="field-description" id="brightness-night-description">Brightness after night mode begins.</p>
+<input type="range" name="brightness_night_percent" min="5" max="100" step="5" value="{night_brightness}" id="brightness-night" aria-describedby="brightness-night-description brightness-night-scale">
+<div class="range-scale" id="brightness-night-scale"><span>5%</span><span>50%</span><span>100%</span></div>
+</div>
+</div>
+<input type="hidden" name="brightness_night_enabled_present" value="true">
+<label class="switch">
+<input type="checkbox" name="brightness_night_enabled" value="true"{night_enabled_checked}>
+<span class="switch-track" aria-hidden="true"></span>
+<span class="switch-copy"><strong>Night mode</strong><small>Dim at the scheduled time until sunrise.</small></span>
+</label>
+<div class="paired-fields">
+<label class="field" for="brightness-night-start">Night mode starts
+<input type="time" name="brightness_night_start" step="60" value="{night_start}" id="brightness-night-start" aria-describedby="brightness-night-start-description">
+<span class="field-description" id="brightness-night-start-description">Uses the radar location's local time.</span>
+</label>
+<input type="hidden" name="brightness_red_mode_present" value="true">
+<label class="switch">
+<input type="checkbox" name="brightness_red_mode" value="true"{red_mode_checked}>
+<span class="switch-track" aria-hidden="true"></span>
+<span class="switch-copy"><strong>Red-only night display</strong><small>Show the physical radar in shades of red at night.</small></span>
+</label>
+</div>
+</div>
+</details>
 <details class="option-group" id="aircraft-labels" data-section="aircraft"{aircraft_open}>
 <summary>Aircraft labels</summary>
 <div class="option-content">
