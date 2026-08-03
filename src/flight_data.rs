@@ -9,7 +9,7 @@ use thiserror::Error;
 use url::Url;
 
 use crate::http::{HttpClient, HttpError, HttpRequest, HttpResponse};
-use crate::model::Aircraft;
+use crate::model::{Aircraft, GeoPoint};
 use crate::time::{Clock, Sleeper};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -40,9 +40,9 @@ pub enum LookupValue<T> {
     Missing,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct FlightLookup {
-    pub route: LookupValue<String>,
+    pub route: LookupValue<RouteCandidate>,
     pub model: LookupValue<String>,
 }
 
@@ -52,15 +52,15 @@ pub struct CacheResolution {
 }
 
 pub struct EnrichmentCache {
-    route_entries: HashMap<String, CacheEntry>,
-    model_entries: HashMap<String, CacheEntry>,
+    route_entries: HashMap<String, CacheEntry<RouteCandidate>>,
+    model_entries: HashMap<String, CacheEntry<String>>,
     capacity: usize,
     access_serial: u64,
 }
 
 #[derive(Clone, Debug)]
-struct CacheEntry {
-    value: Option<String>,
+struct CacheEntry<T> {
+    value: Option<T>,
     expires_at: Duration,
     access_serial: u64,
 }
@@ -93,7 +93,11 @@ impl EnrichmentCache {
             match self.route_entries.get_mut(&key.callsign) {
                 Some(entry) => {
                     entry.access_serial = serial;
-                    resolution.enrichment.route = entry.value.clone();
+                    resolution.enrichment.route = entry
+                        .value
+                        .as_ref()
+                        .and_then(|candidate| candidate.label_for(aircraft))
+                        .map(str::to_owned);
                 }
                 None => resolution.pending.route = true,
             }
@@ -170,7 +174,7 @@ impl EnrichmentCache {
     }
 }
 
-fn rebase_access_serials(entries: &mut HashMap<String, CacheEntry>) -> u64 {
+fn rebase_access_serials<T>(entries: &mut HashMap<String, CacheEntry<T>>) -> u64 {
     let mut oldest_first: Vec<_> = entries.values_mut().collect();
     oldest_first.sort_unstable_by_key(|entry| entry.access_serial);
 
@@ -191,7 +195,7 @@ pub(crate) fn normalized_aircraft_key(aircraft: &Aircraft) -> crate::model::Airc
     }
 }
 
-fn cache_value(value: &LookupValue<String>) -> Option<(Option<String>, Duration)> {
+fn cache_value<T: Clone>(value: &LookupValue<T>) -> Option<(Option<T>, Duration)> {
     match value {
         LookupValue::NotRequested => None,
         LookupValue::Found(value) => Some((Some(value.clone()), SUCCESS_TTL)),
@@ -199,7 +203,7 @@ fn cache_value(value: &LookupValue<String>) -> Option<(Option<String>, Duration)
     }
 }
 
-fn evict_lru(entries: &mut HashMap<String, CacheEntry>, capacity: usize) {
+fn evict_lru<T>(entries: &mut HashMap<String, CacheEntry<T>>, capacity: usize) {
     while entries.len() > capacity {
         let Some(lru_key) = entries
             .iter()
@@ -412,7 +416,7 @@ struct ResponseObject {
     #[serde(default)]
     aircraft: Option<ProviderAircraft>,
     #[serde(default)]
-    flightroute: Option<FlightRoute>,
+    flightroute: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -421,22 +425,6 @@ struct ProviderAircraft {
     model_type: Option<String>,
     #[serde(default)]
     icao_type: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct FlightRoute {
-    #[serde(default)]
-    origin: Option<RouteEndpoint>,
-    #[serde(default)]
-    destination: Option<RouteEndpoint>,
-}
-
-#[derive(Debug, Deserialize)]
-struct RouteEndpoint {
-    #[serde(default)]
-    iata_code: Option<String>,
-    #[serde(default)]
-    icao_code: Option<String>,
 }
 
 fn parse_response(body: &[u8]) -> Result<ProviderPayload, FlightDataError> {
@@ -466,12 +454,12 @@ fn parse_response(body: &[u8]) -> Result<ProviderPayload, FlightDataError> {
     }
 }
 
-fn route_lookup(payload: &ProviderPayload) -> LookupValue<String> {
+fn route_lookup(payload: &ProviderPayload) -> LookupValue<RouteCandidate> {
     match payload {
         ProviderPayload::Response(response) => response
             .flightroute
             .as_ref()
-            .and_then(parse_route)
+            .and_then(parse_route_candidate)
             .map(LookupValue::Found)
             .unwrap_or(LookupValue::Missing),
         ProviderPayload::Missing | ProviderPayload::NotFound => LookupValue::Missing,
@@ -490,18 +478,40 @@ fn model_lookup(payload: &ProviderPayload) -> LookupValue<String> {
     }
 }
 
-fn parse_route(route: &FlightRoute) -> Option<String> {
-    let origin = route.origin.as_ref().and_then(endpoint_code)?;
-    let destination = route.destination.as_ref().and_then(endpoint_code)?;
-    Some(format!("{origin}→{destination}"))
+fn parse_route_candidate(value: &Value) -> Option<RouteCandidate> {
+    let route = value.as_object()?;
+    let (origin_code, origin) = parse_endpoint(route.get("origin")?)?;
+    let (destination_code, destination) = parse_endpoint(route.get("destination")?)?;
+    let mut codes = vec![origin_code];
+    let mut points = vec![origin];
+    if let Some(midpoint) = route.get("midpoint") {
+        let (midpoint_code, midpoint) = parse_endpoint(midpoint)?;
+        codes.push(midpoint_code);
+        points.push(midpoint);
+    }
+    codes.push(destination_code);
+    points.push(destination);
+    RouteCandidate::new(codes.join("→"), points)
 }
 
-fn endpoint_code(endpoint: &RouteEndpoint) -> Option<&str> {
-    non_blank(endpoint.iata_code.as_deref()).or_else(|| non_blank(endpoint.icao_code.as_deref()))
+fn parse_endpoint(value: &Value) -> Option<(String, GeoPoint)> {
+    let endpoint = value.as_object()?;
+    let code = valid_code(endpoint.get("iata_code"), 3)
+        .or_else(|| valid_code(endpoint.get("icao_code"), 4))?;
+    let point = GeoPoint {
+        latitude: endpoint.get("latitude")?.as_f64()?,
+        longitude: endpoint.get("longitude")?.as_f64()?,
+    };
+    Some((code, point))
 }
 
-fn non_blank(value: Option<&str>) -> Option<&str> {
-    value.map(str::trim).filter(|value| !value.is_empty())
+fn valid_code(value: Option<&Value>, length: usize) -> Option<String> {
+    let normalized = value?.as_str()?.trim().to_ascii_uppercase();
+    (normalized.len() == length
+        && normalized
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric()))
+    .then_some(normalized)
 }
 
 fn compact_aircraft_model(aircraft: &ProviderAircraft) -> Option<String> {
@@ -548,18 +558,18 @@ mod tests {
     #[test]
     fn access_serial_rebases_at_u64_max_without_losing_lru_order() {
         let mut cache = EnrichmentCache::new(2);
-        cache.route_entries.insert(
+        cache.model_entries.insert(
             "OLDER".to_owned(),
             CacheEntry {
-                value: Some("JFK→LAX".to_owned()),
+                value: Some("OLDER".to_owned()),
                 expires_at: Duration::from_secs(u64::MAX),
                 access_serial: u64::MAX - 1,
             },
         );
-        cache.route_entries.insert(
+        cache.model_entries.insert(
             "NEWER".to_owned(),
             CacheEntry {
-                value: Some("SFO→SEA".to_owned()),
+                value: Some("NEWER".to_owned()),
                 expires_at: Duration::from_secs(u64::MAX),
                 access_serial: u64::MAX,
             },
@@ -569,7 +579,7 @@ mod tests {
         let next = cache.next_access_serial();
 
         assert_eq!(next, 3);
-        assert_eq!(cache.route_entries["OLDER"].access_serial, 1);
-        assert_eq!(cache.route_entries["NEWER"].access_serial, 2);
+        assert_eq!(cache.model_entries["OLDER"].access_serial, 1);
+        assert_eq!(cache.model_entries["NEWER"].access_serial, 2);
     }
 }

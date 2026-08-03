@@ -8,10 +8,10 @@ use log::{Log, Metadata, Record};
 use planeradar::adsb::AdsbClient;
 use planeradar::flight_data::{
     EnrichmentNeeds, FlightDataClient, FlightDataError, FlightDataService, FlightLookup,
-    LookupValue,
+    LookupValue, RouteCandidate,
 };
 use planeradar::http::{HttpClient, HttpError, HttpRequest, HttpResponse};
-use planeradar::model::{Aircraft, Location, RadarSettings};
+use planeradar::model::{Aircraft, GeoPoint, Location, RadarSettings};
 use planeradar::runtime::{
     AdsbWorker, ChannelWaiter, FlightDataWorker, RuntimeModel, WaitResult, Waiter, WorkerCommand,
 };
@@ -313,7 +313,22 @@ fn missing_model() -> Result<FlightLookup, FlightDataError> {
 
 fn found_both() -> Result<FlightLookup, FlightDataError> {
     Ok(FlightLookup {
-        route: LookupValue::Found("JFK→LAX".to_owned()),
+        route: LookupValue::Found(
+            RouteCandidate::new(
+                "JFK→LAX".to_owned(),
+                vec![
+                    GeoPoint {
+                        latitude: 40.6413,
+                        longitude: -73.7781,
+                    },
+                    GeoPoint {
+                        latitude: 33.9416,
+                        longitude: -118.4085,
+                    },
+                ],
+            )
+            .expect("route candidate"),
+        ),
         model: LookupValue::Found("737-800".to_owned()),
     })
 }
@@ -412,7 +427,7 @@ fn route_only_sends_the_raw_callsign_without_the_hex() {
         vec![aircraft("private hex", "aa-l 12!", 40.01, -74.0)],
         Duration::ZERO,
     );
-    let route_response = br#"{"response":{"flightroute":{"origin":{"iata_code":"JFK"},"destination":{"iata_code":"LAX"}}}}"#;
+    let route_response = br#"{"response":{"flightroute":{"origin":{"iata_code":"JFK","latitude":40.6413,"longitude":-73.7781},"destination":{"iata_code":"LAX","latitude":33.9416,"longitude":-118.4085}}}}"#;
     let (service, requests, _) = client(clock.clone(), [response(route_response)]);
     let (waiter, _) = ScriptedWaiter::new(clock.clone(), [WaitOutcome::Stop]);
 
@@ -985,6 +1000,57 @@ fn cached_result_republishes_for_a_returning_aircraft_without_a_network_request(
             Duration::from_secs(3),
             Duration::from_secs(3),
         ]
+    );
+}
+
+#[test]
+fn cached_route_is_suppressed_after_the_same_aircraft_moves_off_corridor() {
+    let clock = FakeClock::default();
+    let model = RuntimeModel::new(configured(true, false), "http://local".to_owned());
+    let near_iah = aircraft("abc123", "ual1", 29.9902, -95.3368);
+    model.record_aircraft(vec![near_iah], Duration::ZERO);
+    let candidate = RouteCandidate::new(
+        "IAH→ABQ".to_owned(),
+        vec![
+            GeoPoint {
+                latitude: 29.9902,
+                longitude: -95.3368,
+            },
+            GeoPoint {
+                latitude: 35.0402,
+                longitude: -106.6090,
+            },
+        ],
+    )
+    .expect("route candidate");
+    let result = Ok(FlightLookup {
+        route: LookupValue::Found(candidate),
+        model: LookupValue::NotRequested,
+    });
+    let (service, calls) = FakeService::new(clock.clone(), [result]);
+    let moved_model = model.clone();
+    let manhattan = aircraft("abc123", "ual1", 40.792_283, -73.972_639_1);
+    let key = manhattan.key();
+    let (waiter, _) = ScriptedWaiter::new(
+        clock.clone(),
+        [
+            WaitOutcome::Action(Box::new(move || {
+                moved_model.record_aircraft(vec![manhattan], Duration::from_millis(750));
+            })),
+            WaitOutcome::Stop,
+        ],
+    );
+
+    run(service, model.clone(), clock, waiter);
+
+    assert_eq!(calls.lock().expect("calls").len(), 1);
+    assert_eq!(
+        model
+            .snapshot()
+            .enrichment
+            .get(&key)
+            .and_then(|enrichment| enrichment.route.as_deref()),
+        None
     );
 }
 

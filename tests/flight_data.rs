@@ -4,9 +4,10 @@ use std::time::Duration;
 
 use planeradar::flight_data::{
     EnrichmentCache, EnrichmentNeeds, FlightDataClient, FlightDataError, FlightLookup, LookupValue,
+    RouteCandidate,
 };
 use planeradar::http::{HttpClient, HttpError, HttpRequest, HttpResponse};
-use planeradar::model::Aircraft;
+use planeradar::model::{Aircraft, GeoPoint};
 use planeradar::time::{Clock, Sleeper};
 
 #[derive(Clone, Debug, Default)]
@@ -166,21 +167,22 @@ fn both() -> EnrichmentNeeds {
     }
 }
 
+fn route_label<'a>(lookup: &'a FlightLookup, aircraft: &Aircraft) -> Option<&'a str> {
+    match &lookup.route {
+        LookupValue::Found(candidate) => candidate.label_for(aircraft),
+        LookupValue::NotRequested | LookupValue::Missing => None,
+    }
+}
+
 #[test]
 fn combined_fixture_prefers_iata_and_compacts_the_model() {
     let (mut client, _, _) = client([ok(include_bytes!("fixtures/adsbdb/combined.json"))]);
+    let plane = aircraft("a1-b2 c3", "aa 123");
 
-    let lookup = client
-        .lookup(&aircraft("a1-b2 c3", "aa 123"), both())
-        .expect("combined lookup");
+    let lookup = client.lookup(&plane, both()).expect("combined lookup");
 
-    assert_eq!(
-        lookup,
-        FlightLookup {
-            route: LookupValue::Found("JFK→LAX".to_owned()),
-            model: LookupValue::Found("737-800".to_owned()),
-        }
-    );
+    assert_eq!(route_label(&lookup, &plane), Some("JFK→LAX"));
+    assert_eq!(lookup.model, LookupValue::Found("737-800".to_owned()));
 }
 
 #[test]
@@ -188,8 +190,8 @@ fn route_uses_icao_fallback_and_rejects_a_one_ended_route() {
     let icao_only = serde_json::json!({
         "response": {
             "flightroute": {
-                "origin": {"iata_code": " ", "icao_code": "KSEA"},
-                "destination": {"iata_code": null, "icao_code": "KORD"}
+                "origin": {"iata_code": " ", "icao_code": "KSEA", "latitude": 47.4502, "longitude": -122.3088},
+                "destination": {"iata_code": null, "icao_code": "KORD", "latitude": 41.9742, "longitude": -87.9073}
             }
         }
     });
@@ -207,15 +209,12 @@ fn route_uses_icao_fallback_and_rejects_a_one_ended_route() {
         model: false,
     };
 
-    assert_eq!(
-        client
-            .lookup(&aircraft("abc123", "asa1"), needs)
-            .expect("ICAO route"),
-        FlightLookup {
-            route: LookupValue::Found("KSEA→KORD".to_owned()),
-            model: LookupValue::NotRequested,
-        }
-    );
+    let mut near_seattle = aircraft("abc123", "asa1");
+    near_seattle.latitude = 47.45;
+    near_seattle.longitude = -122.31;
+    let lookup = client.lookup(&near_seattle, needs).expect("ICAO route");
+    assert_eq!(route_label(&lookup, &near_seattle), Some("KSEA→KORD"));
+    assert_eq!(lookup.model, LookupValue::NotRequested);
     assert_eq!(
         client
             .lookup(&aircraft("abc123", "asa2"), needs)
@@ -225,6 +224,91 @@ fn route_uses_icao_fallback_and_rejects_a_one_ended_route() {
             model: LookupValue::NotRequested,
         }
     );
+}
+
+#[test]
+fn midpoint_is_preserved_in_the_candidate_label() {
+    let response = serde_json::json!({
+        "response": {"flightroute": {
+            "origin": {"iata_code":"SFO","icao_code":"KSFO","latitude":37.6213,"longitude":-122.3790},
+            "midpoint": {"iata_code":"HNL","icao_code":"PHNL","latitude":21.3187,"longitude":-157.9225},
+            "destination": {"iata_code":"NRT","icao_code":"RJAA","latitude":35.7720,"longitude":140.3929}
+        }}
+    });
+    let plane = aircraft("abc123", "aal1");
+    let mut near_midpoint = plane.clone();
+    near_midpoint.latitude = 21.35;
+    near_midpoint.longitude = -157.90;
+    let (mut client, _, _) = client([json_response(response)]);
+    let lookup = client
+        .lookup(
+            &near_midpoint,
+            EnrichmentNeeds {
+                route: true,
+                model: false,
+            },
+        )
+        .expect("midpoint route");
+    assert_eq!(route_label(&lookup, &near_midpoint), Some("SFO→HNL→NRT"));
+}
+
+#[test]
+fn malformed_route_does_not_discard_a_valid_combined_model() {
+    let response = serde_json::json!({
+        "response": {
+            "aircraft": {"type":"Boeing 737-800","icao_type":"B738"},
+            "flightroute": {
+                "origin": {"iata_code":42,"latitude":"north","longitude":-73.7781},
+                "destination": {"iata_code":"LAX","latitude":33.9416,"longitude":-118.4085}
+            }
+        }
+    });
+    let (mut client, http, _) = client([
+        json_response(response),
+        ok(include_bytes!("fixtures/adsbdb/unknown.json")),
+    ]);
+    let lookup = client
+        .lookup(&aircraft("abc123", "aal1"), both())
+        .expect("combined lookup");
+    assert_eq!(lookup.route, LookupValue::Missing);
+    assert_eq!(lookup.model, LookupValue::Found("737-800".to_owned()));
+    assert_eq!(http.request_count(), 2);
+}
+
+#[test]
+fn route_endpoint_validation_fails_closed_with_icao_fallback() {
+    let valid_icao = serde_json::json!({
+        "response": {"flightroute": {
+            "origin": {"iata_code":"too-long","icao_code":"KJFK","latitude":40.6413,"longitude":-73.7781},
+            "destination": {"iata_code":null,"icao_code":"KLAX","latitude":33.9416,"longitude":-118.4085}
+        }}
+    });
+    let invalid_routes = [
+        serde_json::json!({"origin":{"iata_code":"JFK","longitude":-73.7781},"destination":{"iata_code":"LAX","latitude":33.9416,"longitude":-118.4085}}),
+        serde_json::json!({"origin":{"iata_code":"JFK","latitude":91.0,"longitude":-73.7781},"destination":{"iata_code":"LAX","latitude":33.9416,"longitude":-118.4085}}),
+        serde_json::json!({"origin":{"iata_code":"J@K","icao_code":"BAD","latitude":40.6413,"longitude":-73.7781},"destination":{"iata_code":"LAX","latitude":33.9416,"longitude":-118.4085}}),
+        serde_json::json!({"origin":{"iata_code":"JFK","latitude":40.6413,"longitude":-73.7781},"midpoint":null,"destination":{"iata_code":"LAX","latitude":33.9416,"longitude":-118.4085}}),
+    ];
+    let responses = std::iter::once(json_response(valid_icao)).chain(
+        invalid_routes.into_iter().map(|flightroute| {
+            json_response(serde_json::json!({"response":{"flightroute":flightroute}}))
+        }),
+    );
+    let (mut client, _, _) = client(responses);
+    let plane = aircraft("abc123", "aal1");
+    let needs = EnrichmentNeeds {
+        route: true,
+        model: false,
+    };
+
+    let fallback = client.lookup(&plane, needs).expect("ICAO fallback");
+    assert_eq!(route_label(&fallback, &plane), Some("KJFK→KLAX"));
+    for _ in 0..4 {
+        assert_eq!(
+            client.lookup(&plane, needs).expect("invalid route").route,
+            LookupValue::Missing
+        );
+    }
 }
 
 #[test]
@@ -523,15 +607,12 @@ fn missing_identifiers_issue_only_requests_that_can_satisfy_a_field() {
     assert!(model_http.requests()[0].1.query.is_empty());
 
     let (mut no_hex, route_http, _) = client([ok(include_bytes!("fixtures/adsbdb/callsign.json"))]);
-    assert_eq!(
-        no_hex
-            .lookup(&aircraft("---", "aa 12"), both())
-            .expect("route-only fallback"),
-        FlightLookup {
-            route: LookupValue::Found("JFK→LAX".to_owned()),
-            model: LookupValue::Missing,
-        }
-    );
+    let no_hex_plane = aircraft("---", "aa 12");
+    let no_hex_lookup = no_hex
+        .lookup(&no_hex_plane, both())
+        .expect("route-only fallback");
+    assert_eq!(route_label(&no_hex_lookup, &no_hex_plane), Some("JFK→LAX"));
+    assert_eq!(no_hex_lookup.model, LookupValue::Missing);
     assert_eq!(route_http.request_count(), 1);
     assert_eq!(
         route_http.requests()[0].1.url,
@@ -579,7 +660,10 @@ fn combined_callsign_fallback_uses_the_spaced_execute_path() {
         .lookup(&aircraft("abc123", "aal1"), both())
         .expect("fallback lookup");
 
-    assert_eq!(lookup.route, LookupValue::Found("JFK→LAX".to_owned()));
+    assert_eq!(
+        route_label(&lookup, &aircraft("abc123", "aal1")),
+        Some("JFK→LAX")
+    );
     assert_eq!(lookup.model, LookupValue::Found("737-800".to_owned()));
     let requests = http.requests();
     assert_eq!(requests.len(), 2);
@@ -604,7 +688,10 @@ fn combined_unknown_aircraft_still_uses_callsign_fallback_for_route() {
         .lookup(&aircraft("abc123", "aal1"), both())
         .expect("unknown-aircraft route fallback");
 
-    assert_eq!(lookup.route, LookupValue::Found("JFK→LAX".to_owned()));
+    assert_eq!(
+        route_label(&lookup, &aircraft("abc123", "aal1")),
+        Some("JFK→LAX")
+    );
     assert_eq!(lookup.model, LookupValue::Missing);
     assert_eq!(http.request_count(), 2);
 }
@@ -622,9 +709,26 @@ fn combined_404_is_a_terminal_miss_without_callsign_fallback() {
     assert_eq!(http.request_count(), 1);
 }
 
+fn route_candidate(label: &str) -> RouteCandidate {
+    RouteCandidate::new(
+        label.to_owned(),
+        vec![
+            GeoPoint {
+                latitude: 40.0,
+                longitude: -75.0,
+            },
+            GeoPoint {
+                latitude: 40.0,
+                longitude: -73.0,
+            },
+        ],
+    )
+    .expect("route candidate")
+}
+
 fn found(route: &str, model: &str) -> FlightLookup {
     FlightLookup {
-        route: LookupValue::Found(route.to_owned()),
+        route: LookupValue::Found(route_candidate(route)),
         model: LookupValue::Found(model.to_owned()),
     }
 }
@@ -665,6 +769,71 @@ fn cache_keys_routes_by_callsign_and_models_by_hex() {
     );
     assert!(same_hex_new_callsign.pending.route);
     assert!(!same_hex_new_callsign.pending.model);
+}
+
+#[test]
+fn cached_route_is_rechecked_for_each_aircraft_position() {
+    let mut cache = EnrichmentCache::new(256);
+    let near = aircraft("hex-one", "flight-one");
+    cache.record(
+        &near,
+        EnrichmentNeeds {
+            route: true,
+            model: false,
+        },
+        &FlightLookup {
+            route: LookupValue::Found(route_candidate("JFK→LAX")),
+            model: LookupValue::NotRequested,
+        },
+        Duration::ZERO,
+    );
+
+    assert_eq!(
+        cache
+            .resolve(
+                &near,
+                EnrichmentNeeds {
+                    route: true,
+                    model: false,
+                },
+                Duration::from_secs(1),
+            )
+            .enrichment
+            .route
+            .as_deref(),
+        Some("JFK→LAX")
+    );
+
+    let mut far = near.clone();
+    far.latitude = 0.0;
+    far.longitude = 0.0;
+    assert_eq!(
+        cache
+            .resolve(
+                &far,
+                EnrichmentNeeds {
+                    route: true,
+                    model: false,
+                },
+                Duration::from_secs(2),
+            )
+            .enrichment
+            .route,
+        None
+    );
+    assert!(
+        !cache
+            .resolve(
+                &far,
+                EnrichmentNeeds {
+                    route: true,
+                    model: false,
+                },
+                Duration::from_secs(3),
+            )
+            .pending
+            .route
+    );
 }
 
 #[test]
@@ -739,7 +908,7 @@ fn full_and_partial_cache_hits_request_only_uncached_fields() {
             model: false,
         },
         &FlightLookup {
-            route: LookupValue::Found("JFK→LAX".to_owned()),
+            route: LookupValue::Found(route_candidate("JFK→LAX")),
             model: LookupValue::NotRequested,
         },
         Duration::ZERO,
@@ -816,7 +985,7 @@ fn route_and_model_maps_each_evict_the_least_recently_used_of_256_entries() {
             model: false,
         },
         &FlightLookup {
-            route: LookupValue::Found("R256→D256".to_owned()),
+            route: LookupValue::Found(route_candidate("R256→D256")),
             model: LookupValue::NotRequested,
         },
         Duration::from_secs(2),

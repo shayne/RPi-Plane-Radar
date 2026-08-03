@@ -5,8 +5,18 @@
       "icao_type": "B738"
     },
     "flightroute": {
-      "origin": { "iata_code": "JFK", "icao_code": "KJFK" },
-      "destination": { "iata_code": "LAX", "icao_code": "KLAX" }
+      "origin": {
+        "iata_code": "JFK",
+        "icao_code": "KJFK",
+        "latitude": 40.6413,
+        "longitude": -73.7781
+      },
+      "destination": {
+        "iata_code": "LAX",
+        "icao_code": "KLAX",
+        "latitude": 33.9416,
+        "longitude": -118.4085
+      }
     }
   }
 }
