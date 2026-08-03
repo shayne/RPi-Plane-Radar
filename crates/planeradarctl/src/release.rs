@@ -287,6 +287,7 @@ impl ReleaseManifest {
             || raw.driver.version != driver_lock.version.to_string()
             || raw.driver.commit != driver_lock.commit
             || raw.driver.manifest_sha256 != driver_lock.manifest_sha256
+            || raw.driver.required_capability != driver_lock.required_capability
             || raw.driver.lifecycle_protocol != DRIVER_LIFECYCLE_PROTOCOL
         {
             return Err(ReleaseError::DriverLockMismatch);
@@ -435,6 +436,7 @@ struct RawLockedDriver {
     version: String,
     commit: String,
     manifest_sha256: String,
+    required_capability: String,
     lifecycle_protocol: String,
 }
 

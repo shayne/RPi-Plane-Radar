@@ -359,6 +359,7 @@ fn rejects_every_driver_lock_mismatch() {
             "/driver/manifest_sha256",
             json!("1111111111111111111111111111111111111111111111111111111111111111"),
         ),
+        ("/driver/required_capability", json!("ambient-light-v1")),
     ] {
         let mut value = valid_value();
         set_path(&mut value, pointer, replacement);
@@ -395,6 +396,14 @@ fn rejects_forged_supplied_driver_lock_identity_and_grammar() {
             },
             "/driver/manifest_sha256",
             json!("BAD-DIGEST"),
+        ),
+        (
+            DriverLock {
+                required_capability: "ambient-light-v1".into(),
+                ..lock()
+            },
+            "/driver/required_capability",
+            json!("ambient-light-v1"),
         ),
     ] {
         let mut matching_forged_manifest = valid_value();

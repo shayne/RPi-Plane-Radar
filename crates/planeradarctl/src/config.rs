@@ -12,6 +12,7 @@ use crate::cli::{Cli, Command, MutatingOptions, UninstallOptions};
 pub const DEFAULT_HOSTNAME: &str = "planeradar";
 pub const DRIVER_REPOSITORY: &str = "https://github.com/shayne/hyperpixel2r-kms";
 pub const DRIVER_LIFECYCLE_PROTOCOL: &str = "accepted-driver-v2";
+pub const REQUIRED_DRIVER_CAPABILITY: &str = "pwm-backlight-v1";
 const MAX_PROMPT_TARGET_BYTES: usize = 255;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -217,6 +218,7 @@ pub struct DriverLock {
     pub version: Version,
     pub commit: String,
     pub manifest_sha256: String,
+    pub required_capability: String,
 }
 
 impl DriverLock {
@@ -234,6 +236,7 @@ impl DriverLock {
             version,
             commit: raw.commit,
             manifest_sha256: raw.manifest_sha256,
+            required_capability: raw.required_capability,
         };
         lock.validate()?;
         Ok(lock)
@@ -261,6 +264,9 @@ impl DriverLock {
                 digest: self.manifest_sha256.clone(),
             });
         }
+        if self.required_capability != REQUIRED_DRIVER_CAPABILITY {
+            return Err(DriverLockError::InvalidRequiredCapability);
+        }
         Ok(())
     }
 
@@ -276,6 +282,7 @@ struct RawDriverLock {
     version: String,
     commit: String,
     manifest_sha256: String,
+    required_capability: String,
     lifecycle_protocol: String,
 }
 
@@ -368,4 +375,6 @@ pub enum DriverLockError {
     InvalidManifestSha256 { digest: String },
     #[error("driver lock does not name the accepted driver lifecycle protocol")]
     InvalidLifecycleProtocol,
+    #[error("driver lock does not require the supported driver capability")]
+    InvalidRequiredCapability,
 }

@@ -310,6 +310,7 @@ driver_repository="$(awk -F ' *= *' '$1 == "repository" { gsub(/"/, "", $2); pri
 driver_version="$(awk -F ' *= *' '$1 == "version" { gsub(/"/, "", $2); print $2 }' driver.lock.toml)"
 driver_commit="$(awk -F ' *= *' '$1 == "commit" { gsub(/"/, "", $2); print $2 }' driver.lock.toml)"
 driver_manifest="$(awk -F ' *= *' '$1 == "manifest_sha256" { gsub(/"/, "", $2); print $2 }' driver.lock.toml)"
+driver_capability="$(awk -F ' *= *' '$1 == "required_capability" { gsub(/"/, "", $2); print $2 }' driver.lock.toml)"
 driver_protocol="$(awk -F ' *= *' '$1 == "lifecycle_protocol" { gsub(/"/, "", $2); print $2 }' driver.lock.toml)"
 
 export PLANERADAR_PACKAGE_VERSION="$version"
@@ -327,6 +328,7 @@ export PLANERADAR_DRIVER_REPOSITORY="$driver_repository"
 export PLANERADAR_DRIVER_VERSION="$driver_version"
 export PLANERADAR_DRIVER_COMMIT="$driver_commit"
 export PLANERADAR_DRIVER_MANIFEST="$driver_manifest"
+export PLANERADAR_DRIVER_CAPABILITY="$driver_capability"
 export PLANERADAR_DRIVER_PROTOCOL="$driver_protocol"
 python3 - <<'PY'
 import datetime
@@ -538,6 +540,7 @@ manifest = {
         "version": os.environ["PLANERADAR_DRIVER_VERSION"],
         "commit": os.environ["PLANERADAR_DRIVER_COMMIT"],
         "manifest_sha256": os.environ["PLANERADAR_DRIVER_MANIFEST"],
+        "required_capability": os.environ["PLANERADAR_DRIVER_CAPABILITY"],
         "lifecycle_protocol": os.environ["PLANERADAR_DRIVER_PROTOCOL"],
     },
     "artifacts": artifact_manifest,

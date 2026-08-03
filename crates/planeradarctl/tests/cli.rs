@@ -257,6 +257,7 @@ fn driver_lock_matches_the_accepted_stable_release_gate() {
         lock.manifest_sha256,
         "b75adb56cb6298d648f7e78e640e003bf611a3d48628b6ff881c3c845b7934ba"
     );
+    assert_eq!(lock.required_capability, "pwm-backlight-v1");
 }
 
 #[test]
@@ -306,6 +307,14 @@ fn driver_lock_rejects_invalid_or_ambiguous_identity_fields() {
         (
             "wrong lifecycle protocol",
             replace_current("accepted-driver-v2", "unsupported-driver-v1"),
+        ),
+        (
+            "missing required capability",
+            LOCK.replace("required_capability = \"pwm-backlight-v1\"\n", ""),
+        ),
+        (
+            "unknown required capability",
+            replace_current("pwm-backlight-v1", "ambient-light-v1"),
         ),
         ("unknown field", format!("{LOCK}unexpected = \"value\"\n")),
         (

@@ -328,8 +328,13 @@ fn release_manifest_schema_carries_complete_source_driver_and_artifact_identity(
             "lifecycle_protocol",
             "manifest_sha256",
             "repository",
+            "required_capability",
             "version",
         ])
+    );
+    assert_eq!(
+        schema["properties"]["driver"]["properties"]["required_capability"]["const"],
+        "pwm-backlight-v1"
     );
 
     let artifact_required = schema["$defs"]["artifact"]["required"]
@@ -3944,6 +3949,7 @@ fn assembled_release_fixture_is_schema_bound_normalized_and_arch_correct() {
         "version",
         "commit",
         "manifest_sha256",
+        "required_capability",
         "lifecycle_protocol",
     ] {
         assert_eq!(

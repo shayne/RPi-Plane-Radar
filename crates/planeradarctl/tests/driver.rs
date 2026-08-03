@@ -27,6 +27,9 @@ const DRIVER_COMMIT: &str = "ca95ffeb30b3c361f16cfc228c7bf2b78abf2b4c";
 const DRIVER_TREE: &str = "1111111111111111111111111111111111111111";
 const TAG_OBJECT: &str = "e205b33925c9f0cfe7be5b47d30c5a013a3577ac";
 const EXPECTED_VERMAGIC: &str = "6.18.34+rpt-rpi-v8 SMP preempt mod_unload modversions aarch64";
+const REQUIRED_CAPABILITY: &str = "pwm-backlight-v1";
+const BACKLIGHT_RULE_FILE: &str = "70-planeradar-backlight.rules";
+const BACKLIGHT_RULE: &[u8] = b"SUBSYSTEM==\"backlight\", KERNEL==\"planeradar-backlight\", RUN+=\"/usr/bin/chgrp video /sys%p/brightness\", RUN+=\"/usr/bin/chmod 0660 /sys%p/brightness\"\n";
 
 fn probe(kernel_release: &str) -> TargetProbe {
     let vermagic = if kernel_release == "6.18.34+rpt-rpi-v8" {
@@ -170,11 +173,17 @@ fn prebuilt_archive(
     declared_module_digest: Option<&str>,
 ) -> Vec<u8> {
     let module = b"module bytes";
+    let overlay = b"overlay bytes";
+    let applied_dtb = b"applied dtb bytes";
     let module_digest = declared_module_digest
         .map(str::to_owned)
         .unwrap_or_else(|| digest(module));
     let manifest = format!(
-        "schema_version\t1\nsource_revision\t{DRIVER_COMMIT}\nkernel_release\t{kernel_release}\nmodule_file\thyperpixel2r_kms.ko\nmodule_sha256\t{module_digest}\nmodule_vermagic\t{vermagic}\n"
+        "schema_version\t2\ndriver_version\t0.1.0\nsource_revision\t{DRIVER_COMMIT}\nsource_tree\t{DRIVER_TREE}\nkernel_release\t{kernel_release}\narchitecture\taarch64\nbase_dtb_sha256\t{}\ncapability\t{REQUIRED_CAPABILITY}\nmodule_file\thyperpixel2r_kms.ko\nmodule_sha256\t{module_digest}\nmodule_vermagic\t{vermagic}\noverlay_file\thyperpixel2r-kms-ca95ffeb30b3.dtbo\noverlay_sha256\t{}\napplied_dtb_file\thyperpixel2r-kms-applied.dtb\napplied_dtb_sha256\t{}\nbacklight_rule_file\t{BACKLIGHT_RULE_FILE}\nbacklight_rule_sha256\t{}\n",
+        "a".repeat(64),
+        digest(overlay),
+        digest(applied_dtb),
+        digest(BACKLIGHT_RULE),
     );
     archive(&[
         (
@@ -187,6 +196,24 @@ fn prebuilt_archive(
             "hyperpixel2r-kms-0.1.0-6.18.34+rpt-rpi-v8-aarch64/hyperpixel2r_kms.ko",
             EntryType::Regular,
             module,
+            None,
+        ),
+        (
+            "hyperpixel2r-kms-0.1.0-6.18.34+rpt-rpi-v8-aarch64/hyperpixel2r-kms-ca95ffeb30b3.dtbo",
+            EntryType::Regular,
+            overlay,
+            None,
+        ),
+        (
+            "hyperpixel2r-kms-0.1.0-6.18.34+rpt-rpi-v8-aarch64/hyperpixel2r-kms-applied.dtb",
+            EntryType::Regular,
+            applied_dtb,
+            None,
+        ),
+        (
+            "hyperpixel2r-kms-0.1.0-6.18.34+rpt-rpi-v8-aarch64/70-planeradar-backlight.rules",
+            EntryType::Regular,
+            BACKLIGHT_RULE,
             None,
         ),
     ])
@@ -221,8 +248,9 @@ fn release_manifest(source: &[u8], prebuilt: Option<(&[u8], &str)>) -> Vec<u8> {
         }));
     }
     serde_json::to_vec(&serde_json::json!({
-        "schema_version": 1,
+        "schema_version": 2,
         "driver_version": "0.1.0",
+        "capabilities": [REQUIRED_CAPABILITY],
         "source": {
             "repository": "https://github.com/shayne/hyperpixel2r-kms",
             "commit": DRIVER_COMMIT,
@@ -278,6 +306,7 @@ fn lock_for(manifest: &[u8]) -> DriverLock {
         version: Version::parse("0.1.0-rc.11").expect("version"),
         commit: DRIVER_COMMIT.into(),
         manifest_sha256: digest(manifest),
+        required_capability: REQUIRED_CAPABILITY.into(),
     }
 }
 
@@ -667,6 +696,55 @@ fn sync_verifies_the_locked_release_and_materializes_safe_source_and_prebuilt_ar
 }
 
 #[test]
+fn sync_rejects_missing_unknown_or_duplicate_driver_capabilities() {
+    for (label, capabilities) in [
+        ("missing", None),
+        ("unknown", Some(serde_json::json!(["ambient-light-v1"]))),
+        (
+            "duplicate",
+            Some(serde_json::json!([
+                REQUIRED_CAPABILITY,
+                REQUIRED_CAPABILITY
+            ])),
+        ),
+    ] {
+        let source = source_archive();
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&release_manifest(&source, None)).expect("driver manifest");
+        match capabilities {
+            Some(capabilities) => manifest["capabilities"] = capabilities,
+            None => {
+                manifest
+                    .as_object_mut()
+                    .expect("driver manifest object")
+                    .remove("capabilities");
+            }
+        }
+        let manifest = serde_json::to_vec(&manifest).expect("mutated driver manifest");
+        let manager = DriverManager::new(
+            FakeReleaseSource::with_assets([
+                ("driver-manifest.json".into(), manifest.clone()),
+                ("hyperpixel2r-kms-source.tar.zst".into(), source),
+                ("SBOM.spdx.json".into(), b"sbom".to_vec()),
+            ]),
+            FakeReleaseVerifier::default(),
+            tempfile::tempdir()
+                .expect("temporary cache parent")
+                .keep()
+                .join("cache"),
+        );
+
+        assert!(
+            matches!(
+                manager.sync(&lock_for(&manifest)),
+                Err(DriverError::InvalidManifest)
+            ),
+            "driver manifest accepted {label} capabilities"
+        );
+    }
+}
+
+#[test]
 fn resolved_driver_plan_drives_the_exact_prebuilt_and_crossbuild_command_sequences() {
     let source = source_archive();
     let prebuilt = prebuilt_archive("6.18.34+rpt-rpi-v8", EXPECTED_VERMAGIC, None);
@@ -789,12 +867,14 @@ fn crossbuild_reuses_exact_verified_artifacts_when_the_moving_package_index_is_u
     fs::write(artifact.join("hyperpixel2r_kms.ko"), module).expect("module");
     fs::write(artifact.join("hyperpixel2r-kms-ca95ffeb30b3.dtbo"), overlay).expect("overlay");
     fs::write(artifact.join("hyperpixel2r-kms-applied.dtb"), applied).expect("applied dtb");
+    fs::write(artifact.join(BACKLIGHT_RULE_FILE), BACKLIGHT_RULE).expect("backlight rule");
     let manifest = format!(
-        "schema_version\t1\ndriver_version\t0.1.0\nsource_revision\t{DRIVER_COMMIT}\nsource_tree\t{DRIVER_TREE}\nkernel_release\t{kernel_release}\narchitecture\taarch64\nbase_dtb_sha256\t{}\nmodule_file\thyperpixel2r_kms.ko\nmodule_sha256\t{}\nmodule_vermagic\t{EXPECTED_VERMAGIC}\noverlay_file\thyperpixel2r-kms-ca95ffeb30b3.dtbo\noverlay_sha256\t{}\napplied_dtb_file\thyperpixel2r-kms-applied.dtb\napplied_dtb_sha256\t{}\n",
+        "schema_version\t2\ndriver_version\t0.1.0\nsource_revision\t{DRIVER_COMMIT}\nsource_tree\t{DRIVER_TREE}\nkernel_release\t{kernel_release}\narchitecture\taarch64\nbase_dtb_sha256\t{}\ncapability\t{REQUIRED_CAPABILITY}\nmodule_file\thyperpixel2r_kms.ko\nmodule_sha256\t{}\nmodule_vermagic\t{EXPECTED_VERMAGIC}\noverlay_file\thyperpixel2r-kms-ca95ffeb30b3.dtbo\noverlay_sha256\t{}\napplied_dtb_file\thyperpixel2r-kms-applied.dtb\napplied_dtb_sha256\t{}\nbacklight_rule_file\t{BACKLIGHT_RULE_FILE}\nbacklight_rule_sha256\t{}\n",
         "a".repeat(64),
         digest(module),
         digest(overlay),
         digest(applied),
+        digest(BACKLIGHT_RULE),
     );
     fs::write(artifact.join("manifest.txt"), manifest).expect("manifest");
 
@@ -819,6 +899,7 @@ fn crossbuild_reuses_exact_verified_artifacts_when_the_moving_package_index_is_u
         },
         "0.1.0".into(),
         DRIVER_COMMIT.into(),
+        REQUIRED_CAPABILITY.into(),
     )
     .expect("crossbuild tool");
 
@@ -860,6 +941,7 @@ fn crossbuild_reuses_exact_verified_artifacts_when_the_moving_package_index_is_u
         },
         "0.1.0".into(),
         DRIVER_COMMIT.into(),
+        REQUIRED_CAPABILITY.into(),
     )
     .expect("rejecting crossbuild tool");
     assert!(matches!(
@@ -953,6 +1035,7 @@ printf 'unexpected build\n' > "$output/build-was-run"
         },
         "0.1.0".into(),
         DRIVER_COMMIT.into(),
+        REQUIRED_CAPABILITY.into(),
     )
     .expect("production prebuilt tool");
 
@@ -982,12 +1065,14 @@ fn driver_postconditions_come_from_exact_verified_local_artifact_bytes() {
     fs::write(artifact.join("hyperpixel2r_kms.ko"), module).expect("module");
     fs::write(artifact.join("hyperpixel2r-kms-ca95ffeb30b3.dtbo"), overlay).expect("overlay");
     fs::write(artifact.join("hyperpixel2r-kms-applied.dtb"), applied).expect("applied");
+    fs::write(artifact.join(BACKLIGHT_RULE_FILE), BACKLIGHT_RULE).expect("backlight rule");
     let manifest = format!(
-        "schema_version\t1\ndriver_version\t0.1.0\nsource_revision\t{DRIVER_COMMIT}\nsource_tree\t{DRIVER_TREE}\nkernel_release\t6.18.34+rpt-rpi-v8\narchitecture\taarch64\nbase_dtb_sha256\t{}\nmodule_file\thyperpixel2r_kms.ko\nmodule_sha256\t{}\nmodule_vermagic\t{EXPECTED_VERMAGIC}\noverlay_file\thyperpixel2r-kms-ca95ffeb30b3.dtbo\noverlay_sha256\t{}\napplied_dtb_file\thyperpixel2r-kms-applied.dtb\napplied_dtb_sha256\t{}\n",
+        "schema_version\t2\ndriver_version\t0.1.0\nsource_revision\t{DRIVER_COMMIT}\nsource_tree\t{DRIVER_TREE}\nkernel_release\t6.18.34+rpt-rpi-v8\narchitecture\taarch64\nbase_dtb_sha256\t{}\ncapability\t{REQUIRED_CAPABILITY}\nmodule_file\thyperpixel2r_kms.ko\nmodule_sha256\t{}\nmodule_vermagic\t{EXPECTED_VERMAGIC}\noverlay_file\thyperpixel2r-kms-ca95ffeb30b3.dtbo\noverlay_sha256\t{}\napplied_dtb_file\thyperpixel2r-kms-applied.dtb\napplied_dtb_sha256\t{}\nbacklight_rule_file\t{BACKLIGHT_RULE_FILE}\nbacklight_rule_sha256\t{}\n",
         "a".repeat(64),
         digest(module),
         digest(overlay),
         digest(applied),
+        digest(BACKLIGHT_RULE),
     );
     fs::write(artifact.join("manifest.txt"), &manifest).expect("manifest");
     let tool = DriverTool::new(
@@ -1005,6 +1090,7 @@ fn driver_postconditions_come_from_exact_verified_local_artifact_bytes() {
         },
         "0.1.0".into(),
         DRIVER_COMMIT.into(),
+        REQUIRED_CAPABILITY.into(),
     )
     .expect("tool");
 
@@ -1013,6 +1099,58 @@ fn driver_postconditions_come_from_exact_verified_local_artifact_bytes() {
     assert_eq!(expected.module_sha256, digest(module));
     assert_eq!(expected.overlay_sha256, digest(overlay));
     assert_eq!(expected.applied_dtb_sha256, digest(applied));
+    assert_eq!(expected.capability, REQUIRED_CAPABILITY);
+    assert_eq!(expected.backlight_rule_file, BACKLIGHT_RULE_FILE);
+    assert_eq!(expected.backlight_rule_sha256, digest(BACKLIGHT_RULE));
+
+    fs::remove_file(artifact.join(BACKLIGHT_RULE_FILE)).expect("remove backlight rule");
+    assert!(
+        tool.postconditions().is_err(),
+        "missing named backlight rule was accepted"
+    );
+    fs::write(artifact.join(BACKLIGHT_RULE_FILE), b"tampered rule\n")
+        .expect("tampered backlight rule");
+    assert!(
+        tool.postconditions().is_err(),
+        "tampered named backlight rule was accepted"
+    );
+    fs::write(artifact.join(BACKLIGHT_RULE_FILE), BACKLIGHT_RULE).expect("restore backlight rule");
+
+    fs::write(
+        artifact.join("manifest.txt"),
+        manifest.replace(REQUIRED_CAPABILITY, "ambient-light-v1"),
+    )
+    .expect("unknown capability manifest");
+    assert!(
+        tool.postconditions().is_err(),
+        "exact manifest capability inconsistent with the required capability was accepted"
+    );
+    fs::write(
+        artifact.join("manifest.txt"),
+        manifest.replace(BACKLIGHT_RULE_FILE, "71-attacker.rules"),
+    )
+    .expect("inconsistent rule manifest");
+    assert!(
+        tool.postconditions().is_err(),
+        "exact manifest with an inconsistent named rule was accepted"
+    );
+    let legacy_manifest = manifest
+        .lines()
+        .filter(|line| {
+            !line.starts_with("capability\t")
+                && !line.starts_with("backlight_rule_file\t")
+                && !line.starts_with("backlight_rule_sha256\t")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        .replace("schema_version\t2", "schema_version\t1")
+        + "\n";
+    fs::write(artifact.join("manifest.txt"), legacy_manifest).expect("legacy manifest");
+    assert!(
+        tool.postconditions().is_err(),
+        "schema-one GPIO-only manifest was accepted"
+    );
+    fs::write(artifact.join("manifest.txt"), &manifest).expect("restore manifest");
 
     fs::write(artifact.join("hyperpixel2r_kms.ko"), b"tampered").expect("tamper");
     assert!(tool.postconditions().is_err());
@@ -1436,6 +1574,7 @@ fn lifecycle_tools_preserve_bounded_nonzero_and_spawn_diagnostics() {
         context.clone(),
         "0.1.0".into(),
         DRIVER_COMMIT.into(),
+        REQUIRED_CAPABILITY.into(),
     )
     .expect("nonzero tool");
     let error = nonzero
@@ -1466,6 +1605,7 @@ fn lifecycle_tools_preserve_bounded_nonzero_and_spawn_diagnostics() {
         context,
         "0.1.0".into(),
         DRIVER_COMMIT.into(),
+        REQUIRED_CAPABILITY.into(),
     )
     .expect("spawn tool");
     let error = spawn
@@ -1505,6 +1645,7 @@ fn driver_staging_accepts_only_an_absent_or_exact_supported_overlay_replacement(
             },
             "0.1.0".into(),
             DRIVER_COMMIT.into(),
+            REQUIRED_CAPABILITY.into(),
         )
         .expect("supported replacement context");
         tool.run(DriverAction::StageTryboot)
@@ -1545,6 +1686,7 @@ fn driver_staging_accepts_only_an_absent_or_exact_supported_overlay_replacement(
             },
             "0.1.0".into(),
             DRIVER_COMMIT.into(),
+            REQUIRED_CAPABILITY.into(),
         );
         assert!(result.is_err(), "accepted replacement {replacement:?}");
     }
@@ -1623,6 +1765,7 @@ fn typed_actions_invoke_only_the_exact_external_driver_scripts_and_parse_verific
         },
         "0.1.0".into(),
         DRIVER_COMMIT.into(),
+        REQUIRED_CAPABILITY.into(),
     )
     .expect("valid driver tool");
 
@@ -1730,6 +1873,7 @@ fn accepted_driver_protocol_actions_are_typed_exact_and_bounded() {
         },
         "0.1.0".into(),
         DRIVER_COMMIT.into(),
+        REQUIRED_CAPABILITY.into(),
     )
     .expect("valid driver protocol tool");
 
@@ -1753,6 +1897,7 @@ fn accepted_driver_protocol_actions_are_typed_exact_and_bounded() {
         source_revision: DRIVER_COMMIT.into(),
         source_tree: "1".repeat(40),
         kernel_release: "6.18.34+rpt-rpi-v8".into(),
+        capability: REQUIRED_CAPABILITY.into(),
         module_vermagic: "6.18.34+rpt-rpi-v8 SMP preempt mod_unload aarch64".into(),
         manifest_sha256: "2".repeat(64),
         module_file: "hyperpixel2r_kms.ko".into(),
@@ -1761,6 +1906,8 @@ fn accepted_driver_protocol_actions_are_typed_exact_and_bounded() {
         overlay_sha256: "4".repeat(64),
         applied_dtb_file: "hyperpixel2r-kms-applied.dtb".into(),
         applied_dtb_sha256: "5".repeat(64),
+        backlight_rule_file: "70-planeradar-backlight.rules".into(),
+        backlight_rule_sha256: "6".repeat(64),
         replaced_overlay: "vc4-kms-dpi-hyperpixel2r".into(),
     })
     .expect("pre-mutation accepted journal");
@@ -1831,6 +1978,7 @@ fn verify_boot_rejects_json_for_a_different_locked_driver_version() {
         },
         "0.1.0".into(),
         DRIVER_COMMIT.into(),
+        REQUIRED_CAPABILITY.into(),
     )
     .expect("valid locked tool");
 
@@ -1872,6 +2020,7 @@ fn normal_boot_verification_keeps_the_same_locked_candidate_identity() {
         },
         "0.1.0".into(),
         DRIVER_COMMIT.into(),
+        REQUIRED_CAPABILITY.into(),
     )
     .expect("valid locked tool");
 
@@ -1911,6 +2060,7 @@ fn legacy_cleanup_uses_the_locked_overlay_through_the_existing_uninstall_action(
         },
         "0.1.0".into(),
         DRIVER_COMMIT.into(),
+        REQUIRED_CAPABILITY.into(),
     )
     .expect("valid locked tool");
 

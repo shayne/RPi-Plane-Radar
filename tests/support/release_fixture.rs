@@ -73,6 +73,7 @@ pub fn build_release_with_payload(directory: &Path, payload: Vec<u8>) -> Release
             "version": lock.version.to_string(),
             "commit": lock.commit.clone(),
             "manifest_sha256": lock.manifest_sha256.clone(),
+            "required_capability": "pwm-backlight-v1",
             "lifecycle_protocol": "accepted-driver-v2"
         },
         "artifacts": {

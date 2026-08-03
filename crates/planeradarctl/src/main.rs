@@ -1049,6 +1049,7 @@ impl<R: TransportCommandRunner, C: Clock> SystemLifecycleBackend<R, C> {
             version: Version::parse(&identity.version).map_err(|_| LifecycleError::Backend)?,
             commit: identity.source_commit.clone(),
             manifest_sha256: identity.sha256.clone(),
+            required_capability: planeradarctl::config::REQUIRED_DRIVER_CAPABILITY.into(),
         };
         let facts = TargetPreflight::new(&self.transport, SystemUnixClock)
             .facts(&self.target())
@@ -1582,6 +1583,7 @@ impl<R: TransportCommandRunner, C: Clock> LifecycleBackend for SystemLifecycleBa
                 .map_err(|_| LifecycleError::ImmutableReleaseMismatch)?,
             commit: expected.driver.source_commit.clone(),
             manifest_sha256: expected.driver.sha256.clone(),
+            required_capability: planeradarctl::config::REQUIRED_DRIVER_CAPABILITY.into(),
         };
         let (verified, payload) = self.verify_release_with_lock(&version, &lock)?;
         if &verified != expected {
@@ -3430,6 +3432,7 @@ mod tests {
             source_revision: "58c42896c8829a034f42a4bc92886dd6f21775a8".into(),
             source_tree: "1111111111111111111111111111111111111111".into(),
             kernel_release: "6.12.47+rpt-rpi-v8".into(),
+            capability: "pwm-backlight-v1".into(),
             module_vermagic: "6.12.47+rpt-rpi-v8 SMP preempt mod_unload aarch64".into(),
             manifest_sha256: "2222222222222222222222222222222222222222222222222222222222222222"
                 .into(),
@@ -3442,18 +3445,22 @@ mod tests {
             applied_dtb_file: "hyperpixel2r-kms-applied.dtb".into(),
             applied_dtb_sha256: "5555555555555555555555555555555555555555555555555555555555555555"
                 .into(),
+            backlight_rule_file: "70-planeradar-backlight.rules".into(),
+            backlight_rule_sha256:
+                "6666666666666666666666666666666666666666666666666666666666666666".into(),
             replaced_overlay: "vc4-kms-dpi-hyperpixel2r".into(),
         };
         let command =
             staged_driver_transaction_command(&expected).expect("staged transaction command");
         assert!(command.is_interactive_sudo());
         let staged_check = &command.arguments()[3];
-        assert!(staged_check.contains("1) expected_rows=16"));
-        assert!(staged_check.contains("2) expected_rows=18"));
-        assert!(staged_check.contains("3) expected_rows=19"));
+        assert!(staged_check.contains("test \"$(value schema_version)\" = 4"));
+        assert!(staged_check.contains("23:0"));
         assert!(staged_check.contains("module_existed"));
         assert!(staged_check.contains("overlay_existed"));
         assert!(staged_check.contains("prior_dkms_inventory_sha256"));
+        assert!(staged_check.contains("prior_backlight_rule_existed"));
+        assert!(staged_check.contains("backlight_rule_sha256"));
         assert!(staged_check.contains("boot_regular \"$overlay\""));
         assert!(staged_check.contains("boot_regular \"$normal\""));
         assert!(staged_check.contains("boot_regular \"$candidate\""));
@@ -3474,6 +3481,9 @@ mod tests {
                 "hyperpixel2r-kms-applied.dtb",
                 "5555555555555555555555555555555555555555555555555555555555555555",
                 "vc4-kms-dpi-hyperpixel2r",
+                "pwm-backlight-v1",
+                "70-planeradar-backlight.rules",
+                "6666666666666666666666666666666666666666666666666666666666666666",
             ]
         );
 
@@ -3482,7 +3492,7 @@ mod tests {
         let no_replacement = staged_driver_transaction_command(&no_replaced_overlay)
             .expect("staged transaction without a replaced overlay");
         assert_eq!(
-            no_replacement.arguments().last().map(String::as_str),
+            no_replacement.arguments().get(17).map(String::as_str),
             Some("none")
         );
 
@@ -3490,6 +3500,7 @@ mod tests {
         assert!(committed.is_interactive_sudo());
         let committed_check = &committed.arguments()[3];
         assert!(committed_check.contains("boot_regular \"$overlay\""));
+        assert!(committed_check.contains("regular \"$rule\" 644"));
         assert!(committed_check.contains("boot_regular \"$config\""));
         assert_eq!(
             &committed.arguments()[4..],
@@ -3508,6 +3519,9 @@ mod tests {
                 "hyperpixel2r-kms-applied.dtb",
                 "5555555555555555555555555555555555555555555555555555555555555555",
                 "vc4-kms-dpi-hyperpixel2r",
+                "pwm-backlight-v1",
+                "70-planeradar-backlight.rules",
+                "6666666666666666666666666666666666666666666666666666666666666666",
             ]
         );
     }

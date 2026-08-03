@@ -121,6 +121,7 @@
         "version",
         "commit",
         "manifest_sha256",
+        "required_capability",
         "lifecycle_protocol"
       ],
       "properties": {
@@ -135,6 +136,9 @@
         },
         "manifest_sha256": {
           "$ref": "#/$defs/sha256"
+        },
+        "required_capability": {
+          "const": "pwm-backlight-v1"
         },
         "lifecycle_protocol": {
           "const": "accepted-driver-v2"

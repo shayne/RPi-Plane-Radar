@@ -15,7 +15,7 @@ use planeradar::install::{
     read_optional_installer_state_json, write_installer_state_json,
 };
 use planeradarctl::DriverLock;
-use planeradarctl::driver::DriverPostconditions;
+use planeradarctl::driver::{DriverContext, DriverPlan, DriverPostconditions, DriverTool};
 use planeradarctl::install::{
     ApplicationPayload, BackendFailure, InstallOutcome, InstallRequest,
     Installer as ControllerInstaller, InterruptionReason, extract_application_payload_at_mtime,
@@ -45,6 +45,73 @@ use sha2::{Digest, Sha256};
 mod release_fixture;
 
 const FIXTURE_ROOT: &str = "tests/fixtures/pi-os-trixie";
+const REQUIRED_DRIVER_CAPABILITY: &str = "pwm-backlight-v1";
+const BACKLIGHT_RULE_FILE: &str = "70-planeradar-backlight.rules";
+const BACKLIGHT_RULE: &[u8] = b"SUBSYSTEM==\"backlight\", KERNEL==\"planeradar-backlight\", RUN+=\"/usr/bin/chgrp video /sys%p/brightness\", RUN+=\"/usr/bin/chmod 0660 /sys%p/brightness\"\n";
+
+fn schema_two_driver_tool_fixture() -> (tempfile::TempDir, DriverTool<()>) {
+    let temporary = tempfile::tempdir().expect("schema-two driver fixture");
+    let source = temporary.path().join("source");
+    let artifact = temporary.path().join("artifact");
+    fs::create_dir_all(&source).expect("driver source fixture");
+    fs::create_dir_all(&artifact).expect("driver artifact fixture");
+    let revision = "261a29f45963ef3fcaf1a23e8e444b4e68d4c370";
+    let tree = "cccccccccccccccccccccccccccccccccccccccc";
+    let kernel = "6.18.39+rpt-rpi-v8";
+    let overlay = format!("hyperpixel2r-kms-{}.dtbo", &revision[..12]);
+    let module = b"module\n";
+    let overlay_bytes = b"overlay\n";
+    let applied = b"applied-dtb\n";
+    fs::write(artifact.join("hyperpixel2r_kms.ko"), module).expect("module fixture");
+    fs::write(artifact.join(&overlay), overlay_bytes).expect("overlay fixture");
+    fs::write(artifact.join("hyperpixel2r-kms-applied.dtb"), applied).expect("applied DT fixture");
+    fs::write(artifact.join(BACKLIGHT_RULE_FILE), BACKLIGHT_RULE).expect("rule fixture");
+    let digest = |bytes: &[u8]| format!("{:x}", Sha256::digest(bytes));
+    fs::write(
+        artifact.join("manifest.txt"),
+        format!(
+            "schema_version\t2\ndriver_version\t0.1.1\nsource_revision\t{revision}\nsource_tree\t{tree}\nkernel_release\t{kernel}\narchitecture\taarch64\nbase_dtb_sha256\t{}\ncapability\t{REQUIRED_DRIVER_CAPABILITY}\nmodule_file\thyperpixel2r_kms.ko\nmodule_sha256\t{}\nmodule_vermagic\t{kernel} SMP preempt mod_unload modversions aarch64\noverlay_file\t{overlay}\noverlay_sha256\t{}\napplied_dtb_file\thyperpixel2r-kms-applied.dtb\napplied_dtb_sha256\t{}\nbacklight_rule_file\t{BACKLIGHT_RULE_FILE}\nbacklight_rule_sha256\t{}\n",
+            "a".repeat(64),
+            digest(module),
+            digest(overlay_bytes),
+            digest(applied),
+            digest(BACKLIGHT_RULE),
+        ),
+    )
+    .expect("exact manifest fixture");
+    let tool = DriverTool::new(
+        (),
+        source,
+        DriverPlan::Prebuilt { archive: artifact },
+        DriverContext {
+            target: "pi@planeradar.local".into(),
+            kernel_release: kernel.into(),
+            kernel_export: temporary.path().join("kernel-export"),
+            artifacts: temporary.path().join("artifacts"),
+            replace_overlay: "vc4-kms-dpi-hyperpixel2r".into(),
+        },
+        "0.1.1".into(),
+        revision.into(),
+        REQUIRED_DRIVER_CAPABILITY.into(),
+    )
+    .expect("driver tool fixture");
+    (temporary, tool)
+}
+
+#[test]
+fn schema_two_pwm_driver_bundle_is_accepted_with_its_exact_named_rule() {
+    let (_temporary, tool) = schema_two_driver_tool_fixture();
+
+    let postconditions = tool
+        .postconditions()
+        .expect("schema-two PWM driver postconditions");
+
+    assert_eq!(postconditions.driver_version, "0.1.1");
+    assert_eq!(
+        postconditions.source_revision,
+        "261a29f45963ef3fcaf1a23e8e444b4e68d4c370"
+    );
+}
 
 fn fixture_files(root: &Path) -> Vec<PathBuf> {
     fn visit(root: &Path, current: &Path, files: &mut Vec<PathBuf>) {
@@ -504,6 +571,8 @@ impl DriverActions<FixtureSystem> for FixtureSystem {
                 "hyperpixel2r-kms-{}.dtbo",
                 &self.shared.driver.source_commit[..12]
             ),
+            required_capability: REQUIRED_DRIVER_CAPABILITY.into(),
+            backlight_rule_file: BACKLIGHT_RULE_FILE.into(),
         })
     }
 
@@ -523,14 +592,17 @@ impl DriverActions<FixtureSystem> for FixtureSystem {
             source_revision: driver.source_commit.clone(),
             source_tree: release_fixture::SOURCE_TREE.into(),
             kernel_release: kernel.into(),
+            capability: REQUIRED_DRIVER_CAPABILITY.into(),
             module_vermagic: format!("{kernel} SMP preempt mod_unload modversions aarch64"),
-            manifest_sha256: driver.sha256.clone(),
+            manifest_sha256: self.sha256(artifact.join("manifest.txt")),
             module_file: "hyperpixel2r_kms.ko".into(),
             module_sha256: self.sha256(artifact.join("hyperpixel2r_kms.ko")),
             overlay_file: overlay.clone(),
             overlay_sha256: self.sha256(artifact.join(&overlay)),
             applied_dtb_file: "hyperpixel2r-kms-applied.dtb".into(),
             applied_dtb_sha256: self.sha256(artifact.join("hyperpixel2r-kms-applied.dtb")),
+            backlight_rule_file: BACKLIGHT_RULE_FILE.into(),
+            backlight_rule_sha256: self.sha256(artifact.join(BACKLIGHT_RULE_FILE)),
             replaced_overlay: "vc4-kms-dpi-hyperpixel2r".into(),
         })
     }
@@ -561,16 +633,20 @@ impl DriverActions<FixtureSystem> for FixtureSystem {
             &applied_dtb_bytes,
         )
         .map_err(|_| BackendFailure::OperationFailed)?;
+        fs::write(artifact.join(BACKLIGHT_RULE_FILE), BACKLIGHT_RULE)
+            .map_err(|_| BackendFailure::OperationFailed)?;
         fs::write(
             artifact.join("manifest.txt"),
             format!(
-                "driver_version\t{}\nsource_revision\t{}\nsource_tree\t{}\nkernel_release\t{kernel}\nmodule_vermagic\t{kernel} SMP preempt mod_unload modversions aarch64\nmodule_file\thyperpixel2r_kms.ko\nmodule_sha256\t{}\noverlay_file\t{overlay}\noverlay_sha256\t{}\napplied_dtb_file\thyperpixel2r-kms-applied.dtb\napplied_dtb_sha256\t{}\n",
+                "schema_version\t2\ndriver_version\t{}\nsource_revision\t{}\nsource_tree\t{}\nkernel_release\t{kernel}\narchitecture\taarch64\nbase_dtb_sha256\t{}\ncapability\t{REQUIRED_DRIVER_CAPABILITY}\nmodule_file\thyperpixel2r_kms.ko\nmodule_sha256\t{}\nmodule_vermagic\t{kernel} SMP preempt mod_unload modversions aarch64\noverlay_file\t{overlay}\noverlay_sha256\t{}\napplied_dtb_file\thyperpixel2r-kms-applied.dtb\napplied_dtb_sha256\t{}\nbacklight_rule_file\t{BACKLIGHT_RULE_FILE}\nbacklight_rule_sha256\t{}\n",
                 driver.version,
                 driver.source_commit,
                 release_fixture::SOURCE_TREE,
+                "a".repeat(64),
                 self.sha256(artifact.join("hyperpixel2r_kms.ko")),
                 self.sha256(artifact.join(&overlay)),
                 self.sha256(artifact.join("hyperpixel2r-kms-applied.dtb")),
+                self.sha256(artifact.join(BACKLIGHT_RULE_FILE)),
             ),
         )
         .map_err(|_| BackendFailure::OperationFailed)?;
@@ -582,6 +658,12 @@ impl DriverActions<FixtureSystem> for FixtureSystem {
         fs::create_dir_all(target_overlay.parent().expect("overlay parent"))
             .map_err(|_| BackendFailure::OperationFailed)?;
         fs::write(target_overlay, overlay_bytes).map_err(|_| BackendFailure::OperationFailed)?;
+        let target_rule = self.path(format!("/etc/udev/rules.d/{BACKLIGHT_RULE_FILE}"));
+        fs::create_dir_all(target_rule.parent().expect("rule parent"))
+            .map_err(|_| BackendFailure::OperationFailed)?;
+        fs::write(target_rule, BACKLIGHT_RULE).map_err(|_| BackendFailure::OperationFailed)?;
+        fs::write(artifact.join("dkms-prior-state"), b"fixture-dkms\n")
+            .map_err(|_| BackendFailure::OperationFailed)?;
         fs::write(
             self.path("/var/lib/planeradar-installer/driver-manifest.sha256"),
             format!("{}\n", driver.sha256),
@@ -589,14 +671,32 @@ impl DriverActions<FixtureSystem> for FixtureSystem {
         .map_err(|_| BackendFailure::OperationFailed)?;
         fs::create_dir_all(self.path("/var/lib/hyperpixel2r-kms"))
             .map_err(|_| BackendFailure::OperationFailed)?;
+        let normal_config = self.path("/boot/firmware/config.txt");
+        let normal_config_bytes =
+            fs::read(&normal_config).map_err(|_| BackendFailure::OperationFailed)?;
         fs::write(
-            self.path("/var/lib/hyperpixel2r-kms/tryboot-state"),
-            "schema_version=1\n",
+            self.path("/var/lib/hyperpixel2r-kms/accepted-stock-config.txt"),
+            &normal_config_bytes,
         )
         .map_err(|_| BackendFailure::OperationFailed)?;
+        let candidate_config = self.path("/boot/firmware/tryboot.txt");
+        fs::write(&candidate_config, format!("[all]\ndtoverlay={overlay}\n"))
+            .map_err(|_| BackendFailure::OperationFailed)?;
         fs::write(
-            self.path("/boot/firmware/tryboot.txt"),
-            format!("[all]\ndtoverlay={overlay}\n"),
+            self.path("/var/lib/hyperpixel2r-kms/tryboot-state"),
+            format!(
+                "schema_version=4\ndriver_version={}\nsource_revision={}\nsource_tree={}\nkernel_release={kernel}\nmodule_file=hyperpixel2r_kms.ko\nmodule_sha256={}\noverlay_file={overlay}\noverlay_sha256={}\napplied_dtb_file=hyperpixel2r-kms-applied.dtb\napplied_dtb_sha256={}\nnormal_config_sha256={}\ncandidate_config_sha256={}\ntryboot_existed=false\nprior_tryboot_sha256=none\nreplaced_overlay=vc4-kms-dpi-hyperpixel2r\nmodule_existed=false\noverlay_existed=false\nprior_dkms_inventory_sha256={}\nbacklight_rule_file={BACKLIGHT_RULE_FILE}\nbacklight_rule_sha256={}\nprior_backlight_rule_existed=false\nprior_backlight_rule_sha256=none\n",
+                driver.version,
+                driver.source_commit,
+                release_fixture::SOURCE_TREE,
+                self.sha256(artifact.join("hyperpixel2r_kms.ko")),
+                self.sha256(artifact.join(&overlay)),
+                self.sha256(artifact.join("hyperpixel2r-kms-applied.dtb")),
+                self.sha256(&normal_config),
+                self.sha256(&candidate_config),
+                self.sha256(artifact.join("dkms-prior-state")),
+                self.sha256(artifact.join(BACKLIGHT_RULE_FILE)),
+            ),
         )
         .map_err(|_| BackendFailure::OperationFailed)
     }
@@ -654,14 +754,31 @@ impl DriverActions<FixtureSystem> for FixtureSystem {
             return Err(BackendFailure::OperationFailed);
         }
         let accepted = self.accepted_identity()?;
+        let postconditions = self.postconditions()?;
+        let root = self.path("/var/lib/hyperpixel2r-kms");
+        let artifact = self.path(format!(
+            "/usr/lib/hyperpixel2r-kms/{}/{}/{}",
+            postconditions.driver_version,
+            postconditions.source_revision,
+            postconditions.kernel_release
+        ));
         fs::write(
-            self.path("/var/lib/hyperpixel2r-kms/accepted-state"),
+            root.join("accepted-state"),
             format!(
-                "driver_version={}\nsource_revision={}\nkernel_release={}\noverlay_file={}\n",
+                "schema_version=3\ndriver_version={}\nsource_revision={}\nkernel_release={}\nmanifest_sha256={}\nmodule_file={}\nmodule_sha256={}\noverlay_file={}\noverlay_sha256={}\nnormal_config_sha256={}\nstock_config_sha256={}\nprior_dkms_inventory_sha256={}\nbacklight_rule_file={}\nbacklight_rule_sha256={}\nprior_backlight_rule_existed=false\nprior_backlight_rule_sha256=none\n",
                 accepted.driver_version,
                 accepted.source_revision,
                 accepted.kernel_release,
+                postconditions.manifest_sha256,
+                postconditions.module_file,
+                postconditions.module_sha256,
                 accepted.overlay_file,
+                postconditions.overlay_sha256,
+                self.sha256(self.path("/boot/firmware/config.txt")),
+                self.sha256(root.join("accepted-stock-config.txt")),
+                self.sha256(artifact.join("dkms-prior-state")),
+                accepted.backlight_rule_file,
+                postconditions.backlight_rule_sha256,
             ),
         )
         .map_err(|_| BackendFailure::OperationFailed)?;
@@ -777,15 +894,17 @@ impl Transport for FixtureSystem {
             let accepted =
                 fs::read_to_string(self.path("/var/lib/hyperpixel2r-kms/accepted-state"))
                     .unwrap_or_default();
-            let exact = arguments.len() == 10
+            let exact = arguments.len() == 12
                 && [
                     format!("driver_version={}", arguments[5]),
                     format!("source_revision={}", arguments[6]),
                     format!("kernel_release={}", arguments[7]),
                     format!("overlay_file={}", arguments[8]),
+                    format!("backlight_rule_file={}", arguments[10]),
                 ]
                 .iter()
-                .all(|row| accepted.lines().any(|line| line == row));
+                .all(|row| accepted.lines().any(|line| line == row))
+                && arguments[9] == REQUIRED_DRIVER_CAPABILITY;
             let artifact = self.path(format!(
                 "/usr/lib/hyperpixel2r-kms/{}/{}/{}",
                 arguments[5], arguments[6], arguments[7]
@@ -1820,7 +1939,7 @@ fn controller_install_reuses_an_exact_healthy_accepted_driver_without_tryboot_mu
     fs::write(
         root.join("var/lib/hyperpixel2r-kms/accepted-state"),
         format!(
-            "schema_version=2\ndriver_version={}\nsource_revision={}\nkernel_release={}\nmanifest_sha256={}\nmodule_file={}\nmodule_sha256={}\noverlay_file={}\noverlay_sha256={}\nnormal_config_sha256={}\nstock_config_sha256={}\nprior_dkms_inventory_sha256={}\n",
+            "schema_version=3\ndriver_version={}\nsource_revision={}\nkernel_release={}\nmanifest_sha256={}\nmodule_file={}\nmodule_sha256={}\noverlay_file={}\noverlay_sha256={}\nnormal_config_sha256={}\nstock_config_sha256={}\nprior_dkms_inventory_sha256={}\nbacklight_rule_file={}\nbacklight_rule_sha256={}\nprior_backlight_rule_existed=false\nprior_backlight_rule_sha256=none\n",
             postconditions.driver_version,
             postconditions.source_revision,
             postconditions.kernel_release,
@@ -1832,6 +1951,8 @@ fn controller_install_reuses_an_exact_healthy_accepted_driver_without_tryboot_mu
             fixture.sha256(root.join("boot/firmware/config.txt")),
             "b".repeat(64),
             "c".repeat(64),
+            postconditions.backlight_rule_file,
+            postconditions.backlight_rule_sha256,
         ),
     )
     .expect("accepted driver receipt");
@@ -1912,6 +2033,8 @@ fn accepted_driver_receipt_check_keeps_postconditions_out_of_the_shell_program()
         source_revision: hostile_revision.into(),
         kernel_release: "6.18.34+rpt-rpi-v8".into(),
         overlay_file: "hyperpixel2r-kms-224cc7ab7817.dtbo".into(),
+        required_capability: REQUIRED_DRIVER_CAPABILITY.into(),
+        backlight_rule_file: BACKLIGHT_RULE_FILE.into(),
     };
     let command = accepted_driver_receipt_command(&expected).expect("accepted receipt command");
     let arguments = command.arguments();
@@ -1936,7 +2059,7 @@ fn accepted_driver_receipt_check_keeps_postconditions_out_of_the_shell_program()
             .success(),
         "accepted receipt shell program is not syntactically valid"
     );
-    assert!(program.contains("12:0"));
+    assert!(program.contains("16:0"));
     assert!(program.contains("%u:%g:%a:%h"));
     assert!(
         program.contains("prior_tryboot=$artifact/prior-tryboot.txt"),

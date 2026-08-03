@@ -17,7 +17,7 @@ use tempfile::NamedTempFile;
 use thiserror::Error;
 
 use crate::{
-    config::{DRIVER_REPOSITORY, DriverLock},
+    config::{DRIVER_REPOSITORY, DriverLock, REQUIRED_DRIVER_CAPABILITY},
     release::{ReleaseSourceError, StreamingCommandRunner, SystemStreamingCommandRunner},
     transport::{CommandOutput, CommandRunner, Invocation, RunnerError, SystemCommandRunner},
 };
@@ -25,6 +25,8 @@ use crate::{
 const DRIVER_MANIFEST_NAME: &str = "driver-manifest.json";
 const DRIVER_SOURCE_NAME: &str = "hyperpixel2r-kms-source.tar.zst";
 const DRIVER_SBOM_NAME: &str = "SBOM.spdx.json";
+const BACKLIGHT_RULE_NAME: &str = "70-planeradar-backlight.rules";
+const BACKLIGHT_RULE_BYTES: &[u8] = b"SUBSYSTEM==\"backlight\", KERNEL==\"planeradar-backlight\", RUN+=\"/usr/bin/chgrp video /sys%p/brightness\", RUN+=\"/usr/bin/chmod 0660 /sys%p/brightness\"\n";
 const MAX_DRIVER_MANIFEST_BYTES: usize = 64 * 1024;
 const MAX_DRIVER_ARTIFACT_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_ARCHIVE_ENTRY_BYTES: u64 = 8 * 1024 * 1024;
@@ -372,6 +374,7 @@ impl<S: DriverReleaseSource, V: DriverReleaseVerifier> DriverManager<S, V> {
             version: version.clone(),
             commit: manifest.source.commit.clone(),
             manifest_sha256: manifest_digest.clone(),
+            required_capability: manifest.capabilities[0].clone(),
         };
         lock.validate().map_err(|_| DriverError::InvalidLock)?;
 
@@ -492,10 +495,15 @@ impl<S: DriverReleaseSource, V: DriverReleaseVerifier> DriverManager<S, V> {
             )?;
             let identity = validate_prebuilt(
                 &extracted,
-                kernel_release,
-                &acquired.lock.commit,
-                vermagic,
-                bundle_manifest_sha256,
+                &ExpectedPrebuiltIdentity {
+                    driver_version: &driver_version,
+                    kernel_release,
+                    source_revision: &acquired.lock.commit,
+                    source_tree: &acquired.manifest.source.tree,
+                    vermagic,
+                    bundle_manifest_sha256,
+                    required_capability: &acquired.lock.required_capability,
+                },
             )?;
             prebuilt.push(PrebuiltBundle::verified(
                 extracted,
@@ -552,6 +560,7 @@ impl SyncedDriver {
             context,
             self.driver_version.clone(),
             self.lock.commit.clone(),
+            self.lock.required_capability.clone(),
         )
     }
 }
@@ -567,6 +576,7 @@ struct AcquiredDriver {
 struct DriverManifest {
     schema_version: u32,
     driver_version: String,
+    capabilities: Vec<String>,
     source: DriverSourceIdentity,
     supported: DriverSupported,
     reproducibility: DriverReproducibility,
@@ -582,7 +592,7 @@ impl DriverManifest {
             serde_json::from_slice(bytes).map_err(|_| DriverError::InvalidManifest)?;
         let driver_version =
             Version::parse(&manifest.driver_version).map_err(|_| DriverError::InvalidManifest)?;
-        if manifest.schema_version != 1
+        if manifest.schema_version != 2
             || driver_version.to_string() != manifest.driver_version
             || driver_version.major != release_version.major
             || driver_version.minor != release_version.minor
@@ -601,6 +611,7 @@ impl DriverManifest {
             || manifest.reproducibility.owner != 0
             || manifest.reproducibility.group != 0
             || manifest.reproducibility.mode_policy != "git-executable-or-regular"
+            || manifest.capabilities.as_slice() != [REQUIRED_DRIVER_CAPABILITY]
         {
             return Err(DriverError::InvalidManifest);
         }
@@ -1259,12 +1270,140 @@ struct PrebuiltIdentity {
     bundle_manifest_sha256: String,
 }
 
+struct ExactArtifactManifest {
+    fields: BTreeMap<String, String>,
+}
+
+impl ExactArtifactManifest {
+    fn parse(bytes: &[u8], required_capability: &str) -> Result<Self, DriverError> {
+        let contents =
+            std::str::from_utf8(bytes).map_err(|_| DriverError::InvalidPrebuiltIdentity)?;
+        let mut fields = BTreeMap::new();
+        for line in contents.lines() {
+            let (key, value) = line
+                .split_once('\t')
+                .ok_or(DriverError::InvalidPrebuiltIdentity)?;
+            if key.is_empty()
+                || value.is_empty()
+                || fields.insert(key.to_owned(), value.to_owned()).is_some()
+            {
+                return Err(DriverError::InvalidPrebuiltIdentity);
+            }
+        }
+        const KEYS: [&str; 17] = [
+            "schema_version",
+            "driver_version",
+            "source_revision",
+            "source_tree",
+            "kernel_release",
+            "architecture",
+            "base_dtb_sha256",
+            "capability",
+            "module_file",
+            "module_sha256",
+            "module_vermagic",
+            "overlay_file",
+            "overlay_sha256",
+            "applied_dtb_file",
+            "applied_dtb_sha256",
+            "backlight_rule_file",
+            "backlight_rule_sha256",
+        ];
+        if fields.len() != KEYS.len()
+            || KEYS.iter().any(|key| !fields.contains_key(*key))
+            || fields.get("schema_version").map(String::as_str) != Some("2")
+            || fields.get("capability").map(String::as_str) != Some(required_capability)
+            || fields.get("architecture").map(String::as_str) != Some("aarch64")
+            || fields.get("module_file").map(String::as_str) != Some("hyperpixel2r_kms.ko")
+            || fields.get("applied_dtb_file").map(String::as_str)
+                != Some("hyperpixel2r-kms-applied.dtb")
+            || fields.get("backlight_rule_file").map(String::as_str) != Some(BACKLIGHT_RULE_NAME)
+        {
+            return Err(DriverError::InvalidPrebuiltIdentity);
+        }
+        for key in ["source_revision", "source_tree"] {
+            if !is_lower_hex(
+                fields
+                    .get(key)
+                    .ok_or(DriverError::InvalidPrebuiltIdentity)?,
+                40,
+            ) {
+                return Err(DriverError::InvalidPrebuiltIdentity);
+            }
+        }
+        for key in [
+            "base_dtb_sha256",
+            "module_sha256",
+            "overlay_sha256",
+            "applied_dtb_sha256",
+            "backlight_rule_sha256",
+        ] {
+            if !is_lower_hex(
+                fields
+                    .get(key)
+                    .ok_or(DriverError::InvalidPrebuiltIdentity)?,
+                64,
+            ) {
+                return Err(DriverError::InvalidPrebuiltIdentity);
+            }
+        }
+        let driver_version = fields
+            .get("driver_version")
+            .ok_or(DriverError::InvalidPrebuiltIdentity)?;
+        if Version::parse(driver_version)
+            .ok()
+            .is_none_or(|version| !version.pre.is_empty() || version.to_string() != *driver_version)
+        {
+            return Err(DriverError::InvalidPrebuiltIdentity);
+        }
+        let kernel_release = fields
+            .get("kernel_release")
+            .ok_or(DriverError::InvalidPrebuiltIdentity)?;
+        validate_kernel_release(kernel_release)?;
+        validate_vermagic(
+            fields
+                .get("module_vermagic")
+                .ok_or(DriverError::InvalidPrebuiltIdentity)?,
+            kernel_release,
+        )?;
+        for key in [
+            "module_file",
+            "overlay_file",
+            "applied_dtb_file",
+            "backlight_rule_file",
+        ] {
+            if !safe_name(
+                fields
+                    .get(key)
+                    .ok_or(DriverError::InvalidPrebuiltIdentity)?,
+            ) {
+                return Err(DriverError::InvalidPrebuiltIdentity);
+            }
+        }
+        Ok(Self { fields })
+    }
+
+    fn get(&self, key: &str) -> Result<&str, DriverError> {
+        self.fields
+            .get(key)
+            .map(String::as_str)
+            .ok_or(DriverError::InvalidPrebuiltIdentity)
+    }
+}
+
+struct ExpectedPrebuiltIdentity<'a> {
+    driver_version: &'a str,
+    kernel_release: &'a str,
+    source_revision: &'a str,
+    source_tree: &'a str,
+    vermagic: &'a str,
+    bundle_manifest_sha256: &'a str,
+    required_capability: &'a str,
+}
+
 fn validate_prebuilt(
     root: &Path,
-    expected_kernel: &str,
-    expected_commit: &str,
-    expected_vermagic: &str,
-    expected_bundle_manifest_sha256: &str,
+    expected: &ExpectedPrebuiltIdentity<'_>,
 ) -> Result<PrebuiltIdentity, DriverError> {
     let manifest_path = root.join("manifest.txt");
     let manifest_metadata = manifest_path.symlink_metadata().map_err(DriverError::Io)?;
@@ -1277,50 +1416,39 @@ fn validate_prebuilt(
     }
     let manifest_bytes = fs::read(&manifest_path).map_err(DriverError::Io)?;
     let bundle_manifest_sha256 = sha256_bytes(&manifest_bytes);
-    if bundle_manifest_sha256 != expected_bundle_manifest_sha256 {
+    if bundle_manifest_sha256 != expected.bundle_manifest_sha256 {
         return Err(DriverError::InvalidPrebuiltIdentity);
     }
-    let contents =
-        std::str::from_utf8(&manifest_bytes).map_err(|_| DriverError::InvalidPrebuiltIdentity)?;
-    let mut fields = BTreeMap::new();
-    for line in contents.lines() {
-        let (key, value) = line
-            .split_once('\t')
-            .ok_or(DriverError::InvalidPrebuiltIdentity)?;
-        if key.is_empty() || value.is_empty() || fields.insert(key, value).is_some() {
-            return Err(DriverError::InvalidPrebuiltIdentity);
-        }
-    }
-    let kernel_release = fields
-        .get("kernel_release")
-        .ok_or(DriverError::InvalidPrebuiltIdentity)?;
-    let source_revision = fields
-        .get("source_revision")
-        .ok_or(DriverError::InvalidPrebuiltIdentity)?;
-    let module_file = fields
-        .get("module_file")
-        .ok_or(DriverError::InvalidPrebuiltIdentity)?;
-    let module_sha256 = fields
-        .get("module_sha256")
-        .ok_or(DriverError::InvalidPrebuiltIdentity)?;
-    let vermagic = fields
-        .get("module_vermagic")
-        .ok_or(DriverError::InvalidPrebuiltIdentity)?;
-    if *kernel_release != expected_kernel
-        || *source_revision != expected_commit
-        || !safe_name(module_file)
-        || !is_lower_hex(module_sha256, 64)
-        || *vermagic != expected_vermagic
-        || validate_vermagic(vermagic, expected_kernel).is_err()
+    let manifest = ExactArtifactManifest::parse(&manifest_bytes, expected.required_capability)?;
+    let kernel_release = manifest.get("kernel_release")?;
+    let vermagic = manifest.get("module_vermagic")?;
+    if manifest.get("driver_version")? != expected.driver_version
+        || kernel_release != expected.kernel_release
+        || manifest.get("source_revision")? != expected.source_revision
+        || manifest.get("source_tree")? != expected.source_tree
+        || manifest.get("overlay_file")?
+            != format!("hyperpixel2r-kms-{}.dtbo", &expected.source_revision[..12])
+        || vermagic != expected.vermagic
+        || validate_vermagic(vermagic, expected.kernel_release).is_err()
     {
         return Err(DriverError::InvalidPrebuiltIdentity);
     }
-    let module = root.join(module_file);
-    let size = module.symlink_metadata().map_err(DriverError::Io)?.len();
-    validate_regular_digest(&module, size, module_sha256, false)?;
+    for (name_key, digest_key) in [
+        ("module_file", "module_sha256"),
+        ("overlay_file", "overlay_sha256"),
+        ("applied_dtb_file", "applied_dtb_sha256"),
+        ("backlight_rule_file", "backlight_rule_sha256"),
+    ] {
+        let path = root.join(manifest.get(name_key)?);
+        let size = path.symlink_metadata().map_err(DriverError::Io)?.len();
+        validate_regular_digest(&path, size, manifest.get(digest_key)?, false)?;
+    }
+    if fs::read(root.join(BACKLIGHT_RULE_NAME)).map_err(DriverError::Io)? != BACKLIGHT_RULE_BYTES {
+        return Err(DriverError::InvalidPrebuiltIdentity);
+    }
     Ok(PrebuiltIdentity {
-        kernel_release: (*kernel_release).to_owned(),
-        vermagic: (*vermagic).to_owned(),
+        kernel_release: kernel_release.to_owned(),
+        vermagic: vermagic.to_owned(),
         bundle_manifest_sha256,
     })
 }
@@ -1331,11 +1459,12 @@ fn atomic_write_lock(path: &Path, lock: &DriverLock) -> Result<(), DriverError> 
         return Err(DriverError::InvalidPath);
     }
     let contents = format!(
-        "repository = \"{}\"\nversion = \"{}\"\ncommit = \"{}\"\nmanifest_sha256 = \"{}\"\nlifecycle_protocol = \"{}\"\n",
+        "repository = \"{}\"\nversion = \"{}\"\ncommit = \"{}\"\nmanifest_sha256 = \"{}\"\nrequired_capability = \"{}\"\nlifecycle_protocol = \"{}\"\n",
         lock.repository,
         lock.version,
         lock.commit,
         lock.manifest_sha256,
+        lock.required_capability,
         crate::config::DRIVER_LIFECYCLE_PROTOCOL
     );
     let mut temporary = NamedTempFile::new_in(parent).map_err(DriverError::Io)?;
@@ -1413,6 +1542,7 @@ pub struct DriverTool<R> {
     context: DriverContext,
     driver_version: String,
     source_revision: String,
+    required_capability: String,
     expected_overlay_file: String,
 }
 
@@ -1422,6 +1552,7 @@ pub struct DriverPostconditions {
     pub source_revision: String,
     pub source_tree: String,
     pub kernel_release: String,
+    pub capability: String,
     pub module_vermagic: String,
     pub manifest_sha256: String,
     pub module_file: String,
@@ -1430,6 +1561,8 @@ pub struct DriverPostconditions {
     pub overlay_sha256: String,
     pub applied_dtb_file: String,
     pub applied_dtb_sha256: String,
+    pub backlight_rule_file: String,
+    pub backlight_rule_sha256: String,
     pub replaced_overlay: String,
 }
 
@@ -1441,6 +1574,7 @@ impl<R> DriverTool<R> {
         context: DriverContext,
         driver_version: String,
         source_revision: String,
+        required_capability: String,
     ) -> Result<Self, DriverError> {
         if !source.is_absolute()
             || !context.kernel_export.is_absolute()
@@ -1452,6 +1586,7 @@ impl<R> DriverTool<R> {
                 !version.pre.is_empty() || version.to_string() != driver_version
             })
             || !is_lower_hex(&source_revision, 40)
+            || required_capability != REQUIRED_DRIVER_CAPABILITY
         {
             return Err(DriverError::InvalidContext);
         }
@@ -1476,6 +1611,7 @@ impl<R> DriverTool<R> {
             context,
             driver_version,
             source_revision,
+            required_capability,
             expected_overlay_file,
         })
     }
@@ -1496,6 +1632,14 @@ impl<R> DriverTool<R> {
         &self.expected_overlay_file
     }
 
+    pub fn required_capability(&self) -> &str {
+        &self.required_capability
+    }
+
+    pub fn expected_backlight_rule_file(&self) -> &'static str {
+        BACKLIGHT_RULE_NAME
+    }
+
     pub fn postconditions(&self) -> Result<DriverPostconditions, DriverError> {
         let artifact_dir = match &self.plan {
             DriverPlan::Prebuilt { archive } => archive.clone(),
@@ -1509,50 +1653,14 @@ impl<R> DriverTool<R> {
             return Err(DriverError::InvalidPrebuiltIdentity);
         }
         let manifest = fs::read(&manifest_path).map_err(DriverError::Io)?;
-        let text =
-            std::str::from_utf8(&manifest).map_err(|_| DriverError::InvalidPrebuiltIdentity)?;
-        let mut fields = BTreeMap::<String, String>::new();
-        for line in text.lines() {
-            let (key, value) = line
-                .split_once('\t')
-                .ok_or(DriverError::InvalidPrebuiltIdentity)?;
-            if key.is_empty()
-                || value.is_empty()
-                || fields.insert(key.to_owned(), value.to_owned()).is_some()
-            {
-                return Err(DriverError::InvalidPrebuiltIdentity);
-            }
-        }
-        const KEYS: [&str; 14] = [
-            "schema_version",
-            "driver_version",
-            "source_revision",
-            "source_tree",
-            "kernel_release",
-            "architecture",
-            "base_dtb_sha256",
-            "module_file",
-            "module_sha256",
-            "module_vermagic",
-            "overlay_file",
-            "overlay_sha256",
-            "applied_dtb_file",
-            "applied_dtb_sha256",
-        ];
-        if fields.len() != KEYS.len() || KEYS.iter().any(|key| !fields.contains_key(*key)) {
-            return Err(DriverError::InvalidPrebuiltIdentity);
-        }
-        let get = |key: &str| {
-            fields
-                .get(key)
-                .cloned()
-                .ok_or(DriverError::InvalidPrebuiltIdentity)
-        };
+        let parsed = ExactArtifactManifest::parse(&manifest, &self.required_capability)?;
+        let get = |key: &str| parsed.get(key).map(str::to_owned);
         let result = DriverPostconditions {
             driver_version: get("driver_version")?,
             source_revision: get("source_revision")?,
             source_tree: get("source_tree")?,
             kernel_release: get("kernel_release")?,
+            capability: get("capability")?,
             module_vermagic: get("module_vermagic")?,
             manifest_sha256: sha256_bytes(&manifest),
             module_file: get("module_file")?,
@@ -1561,23 +1669,15 @@ impl<R> DriverTool<R> {
             overlay_sha256: get("overlay_sha256")?,
             applied_dtb_file: get("applied_dtb_file")?,
             applied_dtb_sha256: get("applied_dtb_sha256")?,
+            backlight_rule_file: get("backlight_rule_file")?,
+            backlight_rule_sha256: get("backlight_rule_sha256")?,
             replaced_overlay: self.context.replace_overlay.clone(),
         };
-        if fields.get("schema_version").map(String::as_str) != Some("1")
-            || fields.get("architecture").map(String::as_str) != Some("aarch64")
-            || result.driver_version != self.driver_version
+        if result.driver_version != self.driver_version
             || result.source_revision != self.source_revision
             || result.kernel_release != self.context.kernel_release
-            || !is_lower_hex(&result.source_tree, 40)
-            || !is_lower_hex(
-                fields
-                    .get("base_dtb_sha256")
-                    .ok_or(DriverError::InvalidPrebuiltIdentity)?,
-                64,
-            )
-            || result.module_file != "hyperpixel2r_kms.ko"
+            || result.capability != self.required_capability
             || result.overlay_file != self.expected_overlay_file
-            || result.applied_dtb_file != "hyperpixel2r-kms-applied.dtb"
             || validate_vermagic(&result.module_vermagic, &result.kernel_release).is_err()
         {
             return Err(DriverError::InvalidPrebuiltIdentity);
@@ -1586,6 +1686,7 @@ impl<R> DriverTool<R> {
             (&result.module_file, &result.module_sha256),
             (&result.overlay_file, &result.overlay_sha256),
             (&result.applied_dtb_file, &result.applied_dtb_sha256),
+            (&result.backlight_rule_file, &result.backlight_rule_sha256),
         ] {
             if !safe_name(name) || !is_lower_hex(digest, 64) {
                 return Err(DriverError::InvalidPrebuiltIdentity);
@@ -1598,6 +1699,11 @@ impl<R> DriverTool<R> {
             {
                 return Err(DriverError::InvalidPrebuiltIdentity);
             }
+        }
+        if fs::read(artifact_dir.join(&result.backlight_rule_file)).map_err(DriverError::Io)?
+            != BACKLIGHT_RULE_BYTES
+        {
+            return Err(DriverError::InvalidPrebuiltIdentity);
         }
         Ok(result)
     }
@@ -1683,6 +1789,9 @@ impl<R: CommandRunner> DriverTool<R> {
             || !is_lower_hex(&candidate.manifest_sha256, 64)
             || !is_lower_hex(&candidate.module_sha256, 64)
             || !is_lower_hex(&candidate.overlay_sha256, 64)
+            || candidate.capability != self.required_capability
+            || candidate.backlight_rule_file != BACKLIGHT_RULE_NAME
+            || !is_lower_hex(&candidate.backlight_rule_sha256, 64)
             || candidate.overlay_file
                 != format!("hyperpixel2r-kms-{}.dtbo", &candidate.source_revision[..12])
         {
@@ -1713,6 +1822,10 @@ impl<R: CommandRunner> DriverTool<R> {
             candidate.overlay_file.clone(),
             "--overlay-sha256".into(),
             candidate.overlay_sha256.clone(),
+            "--backlight-rule-file".into(),
+            candidate.backlight_rule_file.clone(),
+            "--backlight-rule-sha256".into(),
+            candidate.backlight_rule_sha256.clone(),
         ];
         self.execute(DriverAction::PrepareAccepted, arguments)?;
         Ok(())

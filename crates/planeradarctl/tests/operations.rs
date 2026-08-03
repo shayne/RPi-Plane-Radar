@@ -1461,6 +1461,14 @@ fn production_backend_collects_strict_fixed_diagnostics_without_mutating_target(
             .iter()
             .any(|argument| argument == "planeradar-diagnostics")
     );
+    assert!(
+        std::process::Command::new("sh")
+            .args(["-n", "-c", &commands[1][6]])
+            .status()
+            .expect("validate diagnostic shell syntax")
+            .success(),
+        "diagnostic command is not syntactically valid"
+    );
     let flattened = commands.concat().join(" ");
     assert!(!flattened.contains("latitude"));
     assert!(!flattened.contains("longitude"));
