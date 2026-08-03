@@ -5,6 +5,7 @@ use qrcode::QrCode;
 use qrcode::types::{Color, EcLevel};
 use tiny_skia::Pixmap;
 
+use planeradar::model::FrameColorMode;
 use planeradar::render::setup::{
     CANONICAL_LOCAL_URL, SetupRenderer, fixture_required, fixture_settings,
 };
@@ -376,6 +377,40 @@ fn configured_fixture_matches_golden() {
     fixture_settings()
         .expect("configured settings fixture")
         .assert_matches_golden("settings");
+}
+
+#[test]
+fn red_setup_fixture_matches_golden() {
+    let mut fixture = fixture_required().expect("required setup fixture");
+    fixture.apply_color_mode(FrameColorMode::RedOnly);
+    assert_red_only(&fixture);
+    fixture.assert_matches_golden("setup-red");
+}
+
+#[test]
+fn red_waiting_fixture_matches_golden() {
+    let mut fixture = render(CANONICAL_LOCAL_URL, None, true, "WAITING FOR NETWORK");
+    fixture.apply_color_mode(FrameColorMode::RedOnly);
+    assert_red_only(&fixture);
+    fixture.assert_matches_golden("waiting-red");
+}
+
+#[test]
+fn red_settings_fixture_matches_golden() {
+    let mut fixture = fixture_settings().expect("configured settings fixture");
+    fixture.apply_color_mode(FrameColorMode::RedOnly);
+    assert_red_only(&fixture);
+    fixture.assert_matches_golden("settings-red");
+}
+
+fn assert_red_only(frame: &Frame) {
+    assert!(
+        frame
+            .pixels()
+            .chunks_exact(4)
+            .all(|pixel| pixel[1] == 0 && pixel[2] == 0),
+        "red-only frame contains green or blue output"
+    );
 }
 
 fn inside_safe_circle(x: i32, y: i32) -> bool {

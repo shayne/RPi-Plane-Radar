@@ -3,17 +3,19 @@ use std::io::BufReader;
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 use planeradar::app::{AppRuntime, PlaneRadarApp};
+use planeradar::backlight::{Backlight, BacklightError};
 use planeradar::display::{DisplayHandler, InputEvent};
 use planeradar::model::{
-    Aircraft, AppState, EnvironmentReading, Location, RadarSettings, TimeZone,
+    Aircraft, AppState, BacklightAvailability, EnvironmentReading, FrameColorMode, Location,
+    RadarSettings, TimeZone,
 };
 use planeradar::range::next_range_index;
 use planeradar::render::FontAsset;
@@ -21,6 +23,7 @@ use planeradar::render::radar::RadarRenderer;
 use planeradar::render::setup::{CANONICAL_LOCAL_URL, SetupRenderer};
 use planeradar::runtime::{RuntimeError, RuntimeHealthSource, RuntimeModel, RuntimeSnapshot};
 use planeradar::settings::SettingsStore;
+use planeradar::solar::{SolarDay, SolarSchedule};
 use planeradar::touch::Gesture;
 use planeradar::web::HealthSource;
 use qrcode::QrCode;
@@ -65,8 +68,58 @@ impl AppRuntime for FakeRuntime {
         self.control.stop.load(Ordering::Acquire)
     }
 
+    fn record_backlight_availability(&self, availability: BacklightAvailability) {
+        self.control
+            .model
+            .record_backlight_availability(availability);
+    }
+
     fn shutdown(self: Box<Self>) -> Result<(), RuntimeError> {
         self.control.shutdown.store(true, Ordering::Release);
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+struct RecordingBacklight {
+    availability: BacklightAvailability,
+    current: Arc<AtomicU64>,
+    max_level: u32,
+    writes: Arc<Mutex<Vec<u32>>>,
+}
+
+impl RecordingBacklight {
+    fn available(current: u32, max_level: u32) -> Self {
+        Self {
+            availability: BacklightAvailability::Available,
+            current: Arc::new(AtomicU64::new(u64::from(current))),
+            max_level,
+            writes: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    fn writes(&self) -> Vec<u32> {
+        self.writes.lock().expect("recording backlight").clone()
+    }
+}
+
+impl Backlight for RecordingBacklight {
+    fn availability(&self) -> BacklightAvailability {
+        self.availability
+    }
+
+    fn current_level(&mut self) -> Result<u32, BacklightError> {
+        u32::try_from(self.current.load(Ordering::Acquire))
+            .map_err(|_| BacklightError::InvalidValue)
+    }
+
+    fn max_level(&self) -> u32 {
+        self.max_level
+    }
+
+    fn write_level(&mut self, level: u32) -> Result<(), BacklightError> {
+        self.current.store(u64::from(level), Ordering::Release);
+        self.writes.lock().expect("recording backlight").push(level);
         Ok(())
     }
 }
@@ -102,6 +155,20 @@ fn app_fixture(
     settings: RadarSettings,
     fetched_at: Option<Duration>,
     debug_path: PathBuf,
+) -> (PlaneRadarApp, FakeControl, Arc<AtomicBool>) {
+    app_fixture_with_backlight(
+        settings,
+        fetched_at,
+        debug_path,
+        Box::new(RecordingBacklight::available(100, 100)),
+    )
+}
+
+fn app_fixture_with_backlight(
+    settings: RadarSettings,
+    fetched_at: Option<Duration>,
+    debug_path: PathBuf,
+    backlight: Box<dyn Backlight>,
 ) -> (PlaneRadarApp, FakeControl, Arc<AtomicBool>) {
     let settings_parent = debug_path
         .ancestors()
@@ -143,8 +210,64 @@ fn app_fixture(
         Vec::new(),
         debug_path,
         debug_requested.clone(),
+        backlight,
     );
     (app, control, debug_requested)
+}
+
+fn unix(value: &str) -> u64 {
+    value
+        .parse::<jiff::Timestamp>()
+        .expect("UTC timestamp")
+        .as_second()
+        .try_into()
+        .expect("positive timestamp")
+}
+
+fn solar_schedule(location: &Location) -> SolarSchedule {
+    let zone = jiff::tz::TimeZone::get("America/New_York").expect("fixture zone");
+    let mut date = "2026-07-28"
+        .parse::<jiff::civil::Date>()
+        .expect("fixture date");
+    let mut days = Vec::with_capacity(17);
+    for _ in 0..17 {
+        days.push(SolarDay {
+            date: date.to_string(),
+            sunrise_unix: Some(
+                zone.to_timestamp(date.at(6, 0, 0, 0))
+                    .expect("fixture sunrise")
+                    .as_second(),
+            ),
+        });
+        date = date.tomorrow().expect("next fixture day");
+    }
+    SolarSchedule {
+        schema_version: 1,
+        latitude: location.latitude,
+        longitude: location.longitude,
+        time_zone: "America/New_York".to_owned(),
+        fetched_at_unix: 0,
+        days,
+    }
+}
+
+fn red_night_settings() -> RadarSettings {
+    let mut settings = configured();
+    settings.brightness.night.enabled = true;
+    settings.brightness.night.brightness_percent = 30;
+    settings.brightness.night.start_hour = 20;
+    settings.brightness.night.start_minute = 0;
+    settings.brightness.night.red_mode = true;
+    settings
+}
+
+fn decode_png(path: &std::path::Path) -> Vec<u8> {
+    let decoder = png::Decoder::new(BufReader::new(fs::File::open(path).expect("debug PNG")));
+    let mut reader = decoder.read_info().expect("debug PNG header");
+    let mut bytes = vec![0; reader.output_buffer_size().expect("PNG buffer size")];
+    let info = reader.next_frame(&mut bytes).expect("debug PNG frame");
+    bytes.truncate(info.buffer_size());
+    bytes
 }
 
 #[test]
@@ -462,6 +585,152 @@ fn selected_weather_redraws_at_the_monotonic_forty_five_minute_boundary() {
     control.now_ms.store(2_700_000, Ordering::Release);
     assert!(app.step(&[], Instant::now()).frame.is_some());
     assert!(app.step(&[], Instant::now()).frame.is_none());
+}
+
+#[test]
+fn active_night_transforms_the_uploaded_and_debug_frame_exactly_once() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let debug_path = directory.path().join("debug.png");
+    let night_settings = red_night_settings();
+    let (mut night_app, night_control, debug_requested) = app_fixture_with_backlight(
+        night_settings,
+        Some(Duration::ZERO),
+        debug_path.clone(),
+        Box::new(RecordingBacklight::available(5, 100)),
+    );
+    let location = night_control
+        .model
+        .snapshot()
+        .settings
+        .location
+        .expect("location");
+    night_control
+        .model
+        .record_solar_schedule_if_current(&location, Arc::new(solar_schedule(&location)))
+        .expect("solar generation");
+    night_control
+        .unix_seconds
+        .store(unix("2026-08-03T01:00:00Z"), Ordering::Release);
+    debug_requested.store(true, Ordering::Release);
+    let red = night_app
+        .step(&[], Instant::now())
+        .frame
+        .expect("active-night frame");
+
+    assert!(
+        red.chunks_exact(4)
+            .all(|pixel| pixel[1] == 0 && pixel[2] == 0),
+        "physical red frame must contain no green or blue output"
+    );
+    assert_eq!(decode_png(&debug_path), red);
+
+    let (mut full_app, full_control, _) = app_fixture(
+        configured(),
+        Some(Duration::ZERO),
+        directory.path().join("full.png"),
+    );
+    full_control
+        .unix_seconds
+        .store(unix("2026-08-03T01:00:00Z"), Ordering::Release);
+    let full = full_app
+        .step(&[], Instant::now())
+        .frame
+        .expect("full-color frame");
+    let mut expected = planeradar::render::Frame::new(480, 480, full).expect("expected frame");
+    expected.apply_color_mode(FrameColorMode::RedOnly);
+    assert_eq!(red, expected.pixels());
+
+    let mut twice = expected.clone();
+    twice.apply_color_mode(FrameColorMode::RedOnly);
+    assert_ne!(
+        red,
+        twice.pixels(),
+        "application pipeline applied the red transform more than once"
+    );
+}
+
+#[test]
+fn wall_minute_transition_ticks_brightness_without_rerender_until_color_changes() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let backlight = RecordingBacklight::available(100, 100);
+    let probe = backlight.clone();
+    let (mut app, control, _) = app_fixture_with_backlight(
+        red_night_settings(),
+        Some(Duration::ZERO),
+        directory.path().join("debug.png"),
+        Box::new(backlight),
+    );
+    let location = control
+        .model
+        .snapshot()
+        .settings
+        .location
+        .expect("location");
+    control
+        .model
+        .record_solar_schedule_if_current(&location, Arc::new(solar_schedule(&location)))
+        .expect("solar generation");
+
+    control
+        .unix_seconds
+        .store(unix("2026-08-03T23:59:59Z"), Ordering::Release);
+    assert!(app.step(&[], Instant::now()).frame.is_some());
+    assert_eq!(
+        control.model.snapshot().backlight_availability,
+        BacklightAvailability::Available
+    );
+
+    control.now_ms.store(1_000, Ordering::Release);
+    control
+        .unix_seconds
+        .store(unix("2026-08-04T00:00:00Z"), Ordering::Release);
+    assert!(
+        app.step(&[], Instant::now()).frame.is_none(),
+        "entering night must keep the existing full-color frame while dimming"
+    );
+    control.now_ms.store(2_000, Ordering::Release);
+    assert!(app.step(&[], Instant::now()).frame.is_none());
+    control.now_ms.store(3_000, Ordering::Release);
+    let red = app
+        .step(&[], Instant::now())
+        .frame
+        .expect("red transition frame");
+    assert!(red.chunks_exact(4).all(|pixel| pixel[1..3] == [0, 0]));
+    assert!(app.step(&[], Instant::now()).frame.is_none());
+    assert_eq!(probe.writes(), [65, 30]);
+}
+
+#[test]
+fn settings_location_and_solar_generations_invalidate_the_display_policy_key() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let settings = red_night_settings();
+    let (mut app, control, _) = app_fixture(
+        settings.clone(),
+        Some(Duration::ZERO),
+        directory.path().join("debug.png"),
+    );
+    control
+        .unix_seconds
+        .store(unix("2026-08-03T12:00:00Z"), Ordering::Release);
+    assert!(app.step(&[], Instant::now()).frame.is_some());
+    assert!(app.step(&[], Instant::now()).frame.is_none());
+
+    let mut changed_settings = settings;
+    changed_settings.brightness.day_percent = 95;
+    control.model.replace_settings(changed_settings.clone());
+    assert!(app.step(&[], Instant::now()).frame.is_some());
+
+    let mut moved = changed_settings;
+    moved.location.as_mut().expect("location").label = "moved".to_owned();
+    control.model.replace_settings(moved.clone());
+    assert!(app.step(&[], Instant::now()).frame.is_some());
+
+    let location = moved.location.expect("location");
+    control
+        .model
+        .record_solar_schedule_if_current(&location, Arc::new(solar_schedule(&location)))
+        .expect("solar generation");
+    assert!(app.step(&[], Instant::now()).frame.is_some());
 }
 
 #[test]

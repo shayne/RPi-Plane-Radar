@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use clap::Parser;
 use planeradar::app::PlaneRadarApp;
+use planeradar::backlight::{Backlight, NoopBacklight, SysfsBacklight};
 use planeradar::capture::{
     CapturePaths, capture_metadata, capture_snapshot_protocol, metadata_json, parse_metadata_json,
     parse_snapshot_protocol,
@@ -29,6 +30,8 @@ use planeradar::render::radar::{run_radar_demo, write_fixtures};
 use planeradar::render::setup::SetupRenderer;
 use planeradar::render::setup::{run_setup_demo, write_fixtures as write_setup_fixtures};
 use planeradar::runtime::{RuntimeConfig, RuntimeCoordinator};
+
+const BACKLIGHT_CLASS_DEVICE: &str = "/sys/class/backlight/planeradar-backlight";
 
 fn main() {
     if let Err(error) = logging::init() {
@@ -75,10 +78,19 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 handle.shutdown()?;
             } else {
                 let font = FontAsset::embedded()?;
+                let backlight: Box<dyn Backlight> =
+                    match SysfsBacklight::open(std::path::PathBuf::from(BACKLIGHT_CLASS_DEVICE)) {
+                        Ok(backlight) => Box::new(backlight),
+                        Err(_) => {
+                            log::warn!("display backlight is unavailable");
+                            Box::new(NoopBacklight)
+                        }
+                    };
                 let mut app = PlaneRadarApp::new(
                     handle,
                     RadarRenderer::new(font.clone()),
                     SetupRenderer::new(font),
+                    backlight,
                 );
                 app.install_debug_signal(debug_frame)?;
                 let display_result = run_display(DisplayConfig::default(), &mut app);

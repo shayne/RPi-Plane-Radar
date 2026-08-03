@@ -4,6 +4,8 @@ use std::path::Path;
 use fontdue::{Font, FontSettings};
 use thiserror::Error;
 
+use crate::model::FrameColorMode;
+
 pub mod footer;
 pub mod radar;
 pub mod setup;
@@ -72,6 +74,22 @@ impl Frame {
 
     pub fn pixels(&self) -> &[u8] {
         &self.rgba
+    }
+
+    pub fn apply_color_mode(&mut self, color_mode: FrameColorMode) {
+        if color_mode == FrameColorMode::FullColor {
+            return;
+        }
+        for pixel in self.rgba.chunks_exact_mut(4) {
+            let luma = (54_u16 * u16::from(pixel[0])
+                + 183_u16 * u16::from(pixel[1])
+                + 19_u16 * u16::from(pixel[2])
+                + 128)
+                / 256;
+            pixel[0] = u8::try_from(luma).expect("weighted u8 luma fits u8");
+            pixel[1] = 0;
+            pixel[2] = 0;
+        }
     }
 
     pub fn save_png(&self, path: &Path) -> Result<(), RenderError> {

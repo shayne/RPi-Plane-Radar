@@ -9,8 +9,8 @@ use fontdue::{Font, FontSettings};
 use planeradar::flight_data::AircraftEnrichment;
 use planeradar::geometry::offset_km;
 use planeradar::model::{
-    Aircraft, Airport, EnvironmentReading, GeoPoint, Location, RadarSettings, RadarSnapshot,
-    Runway, Units,
+    Aircraft, Airport, EnvironmentReading, FrameColorMode, GeoPoint, Location, RadarSettings,
+    RadarSnapshot, Runway, Units,
 };
 use planeradar::range::{format_range_label, range_preset};
 use planeradar::render::footer::{FooterLayout, draw_footer, layout_footer};
@@ -1414,6 +1414,47 @@ fn png_failure_does_not_replace_or_remove_the_destination() {
 }
 
 #[test]
+fn final_frame_red_transform_preserves_alpha_and_uses_exact_integer_luma() {
+    let theme_colors = [
+        BACKGROUND,
+        GRID,
+        LABEL,
+        AIRCRAFT,
+        TRACK,
+        TAG_TYPE,
+        TAG_ALTITUDE,
+        RUNWAY,
+        planeradar::render::theme::RUNWAY_LABEL,
+        STALE,
+        FOOTER_BACKGROUND,
+        FOOTER_BORDER,
+    ];
+    let mut source = vec![
+        [17, 31, 47, 0],
+        [0, 0, 0, 255],
+        [255, 255, 255, 255],
+        [255, 0, 0, 255],
+        [0, 255, 0, 255],
+        [0, 0, 255, 255],
+    ];
+    source.extend(theme_colors);
+    let bytes: Vec<_> = source.iter().flatten().copied().collect();
+
+    let mut full_color = Frame::new(source.len() as u32, 1, bytes.clone()).expect("frame");
+    full_color.apply_color_mode(FrameColorMode::FullColor);
+    assert_eq!(full_color.pixels(), bytes);
+
+    let mut red = Frame::new(source.len() as u32, 1, bytes).expect("frame");
+    red.apply_color_mode(FrameColorMode::RedOnly);
+    for (actual, original) in red.pixels().chunks_exact(4).zip(source) {
+        let [r, g, b, alpha] = original;
+        let luma =
+            (54_u16 * u16::from(r) + 183_u16 * u16::from(g) + 19_u16 * u16::from(b) + 128) / 256;
+        assert_eq!(actual, [luma as u8, 0, 0, alpha]);
+    }
+}
+
+#[test]
 fn empty_fixture_matches_golden() {
     let fixture = planeradar::render::radar::fixture_empty().expect("empty fixture");
     fixture.assert_matches_golden("radar-empty");
@@ -1448,4 +1489,32 @@ fn large_stale_footer_fixture_matches_golden() {
     let fixture = planeradar::render::radar::fixture_footer_large_stale()
         .expect("large stale footer fixture");
     fixture.assert_matches_golden("radar-footer-large-stale");
+}
+
+#[test]
+fn red_radar_fixture_matches_golden() {
+    let settings = footer_settings();
+    let snapshot = snapshot_with_footer(
+        vec![aircraft_at(4.0, -9.0, 45.0)],
+        footer_reading(Duration::ZERO),
+        Some(Duration::ZERO),
+    );
+    let mut fixture = test_renderer()
+        .render(
+            &snapshot,
+            &settings,
+            &[],
+            Duration::from_secs(5),
+            1_783_768_260,
+        )
+        .expect("radar fixture");
+    fixture.apply_color_mode(FrameColorMode::RedOnly);
+    assert!(
+        fixture
+            .pixels()
+            .chunks_exact(4)
+            .all(|pixel| pixel[1] == 0 && pixel[2] == 0),
+        "red-only radar contains green or blue output"
+    );
+    fixture.assert_matches_golden("radar-red");
 }

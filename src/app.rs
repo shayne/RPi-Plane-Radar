@@ -7,8 +7,12 @@ use signal_hook::consts::signal::SIGUSR1;
 use thiserror::Error;
 
 use crate::airports::{airports_within, load_embedded};
+use crate::backlight::{Backlight, BacklightController};
 use crate::display::{DisplayHandler, DisplayUpdate, InputEvent};
-use crate::model::{Airport, AppState, RadarSettings, RadarSnapshot};
+use crate::model::{
+    Airport, AppState, BacklightAvailability, FrameColorMode, RadarSettings, RadarSnapshot,
+};
+use crate::night_mode::display_policy;
 use crate::range::range_preset;
 use crate::render::radar::{BackgroundKey, RadarRenderer};
 use crate::render::setup::SetupRenderer;
@@ -29,6 +33,7 @@ pub trait AppRuntime: Send {
     fn cycle_range(&self) -> Result<RadarSettings, RuntimeError>;
     fn monotonic(&self) -> Duration;
     fn unix_seconds(&self) -> u64;
+    fn record_backlight_availability(&self, availability: BacklightAvailability);
     fn stop_requested(&self) -> bool;
     fn shutdown(self: Box<Self>) -> Result<(), RuntimeError>;
 }
@@ -48,6 +53,10 @@ impl AppRuntime for RuntimeHandle {
 
     fn unix_seconds(&self) -> u64 {
         RuntimeHandle::unix_seconds(self)
+    }
+
+    fn record_backlight_availability(&self, availability: BacklightAvailability) {
+        self.model.record_backlight_availability(availability);
     }
 
     fn stop_requested(&self) -> bool {
@@ -78,6 +87,7 @@ struct RenderKey {
     stale: bool,
     minute: Option<u64>,
     environment_stale: bool,
+    color_mode: FrameColorMode,
 }
 
 pub struct PlaneRadarApp {
@@ -94,10 +104,16 @@ pub struct PlaneRadarApp {
     current_frame: Option<Frame>,
     debug_path: PathBuf,
     debug_requested: Arc<AtomicBool>,
+    backlight: BacklightController,
 }
 
 impl PlaneRadarApp {
-    pub fn new(runtime: RuntimeHandle, radar: RadarRenderer, setup: SetupRenderer) -> Self {
+    pub fn new(
+        runtime: RuntimeHandle,
+        radar: RadarRenderer,
+        setup: SetupRenderer,
+        backlight: Box<dyn Backlight>,
+    ) -> Self {
         let airports = match load_embedded() {
             Ok(airports) => airports,
             Err(_) => {
@@ -112,6 +128,7 @@ impl PlaneRadarApp {
             airports,
             PathBuf::from(DEFAULT_DEBUG_FRAME),
             Arc::new(AtomicBool::new(false)),
+            backlight,
         )
     }
 
@@ -122,6 +139,7 @@ impl PlaneRadarApp {
         airports: Vec<Airport>,
         debug_path: PathBuf,
         debug_requested: Arc<AtomicBool>,
+        backlight: Box<dyn Backlight>,
     ) -> Self {
         let snapshot = runtime.snapshot();
         Self {
@@ -138,6 +156,7 @@ impl PlaneRadarApp {
             current_frame: None,
             debug_path,
             debug_requested,
+            backlight: BacklightController::new(backlight),
         }
     }
 
@@ -197,7 +216,12 @@ impl PlaneRadarApp {
         Ok(())
     }
 
-    fn render_key(&self, monotonic_now: Duration, unix_seconds: u64) -> RenderKey {
+    fn render_key(
+        &self,
+        monotonic_now: Duration,
+        unix_seconds: u64,
+        color_mode: FrameColorMode,
+    ) -> RenderKey {
         let state = self.state();
         let minute = (state == AppState::Radar
             && (self.snapshot.settings.footer.show_time
@@ -212,6 +236,7 @@ impl PlaneRadarApp {
             stale: is_stale(&self.snapshot, monotonic_now),
             minute,
             environment_stale,
+            color_mode,
         }
     }
 
@@ -332,12 +357,32 @@ impl DisplayHandler for PlaneRadarApp {
             exit = true;
         }
 
+        let policy = display_policy(
+            &self.snapshot.settings,
+            self.snapshot.solar_schedule.as_deref(),
+            unix_seconds,
+        );
+        let backlight = self.backlight.update(&policy, monotonic_now);
+        if backlight.should_report_failure {
+            log::warn!("display backlight is unavailable");
+        }
+        if self.snapshot.backlight_availability != backlight.availability {
+            if let Some(runtime) = self.runtime.as_deref() {
+                runtime.record_backlight_availability(backlight.availability);
+            }
+            if self.runtime.is_some() && self.refresh_snapshot().is_err() {
+                log::error!("runtime backlight status update failed");
+                exit = true;
+            }
+        }
+
         let mut frame = None;
         if !exit {
-            let key = self.render_key(monotonic_now, unix_seconds);
+            let key = self.render_key(monotonic_now, unix_seconds, backlight.color_mode);
             if self.last_render_key != Some(key) {
                 match self.render_frame(monotonic_now, unix_seconds) {
-                    Ok(rendered) => {
+                    Ok(mut rendered) => {
+                        rendered.apply_color_mode(backlight.color_mode);
                         frame = Some(rendered.pixels().to_vec());
                         self.current_frame = Some(rendered);
                         self.last_render_key = Some(key);
