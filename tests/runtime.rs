@@ -455,6 +455,39 @@ fn settings_replacement_is_broadcast_to_four_independent_workers() {
     }
 }
 
+#[test]
+fn settings_replacement_notifies_every_live_worker_before_reporting_a_disconnection() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let store = Arc::new(SettingsStore::new(directory.path().join("settings.json")));
+    let model = RuntimeModel::new(
+        RadarSettings::default(),
+        "http://planeradar.local".to_owned(),
+    );
+    let (adsb_sender, adsb_receiver) = mpsc::channel();
+    drop(adsb_receiver);
+    let (flight_sender, flight_receiver) = mpsc::channel();
+    let (weather_sender, weather_receiver) = mpsc::channel();
+    let (solar_sender, solar_receiver) = mpsc::channel();
+    let service = RuntimeSettingsService::new(
+        model,
+        store,
+        vec![adsb_sender, flight_sender, weather_sender, solar_sender],
+    );
+
+    assert!(matches!(
+        service.replace(configured()),
+        Err(planeradar::web::WebError::WorkerUnavailable)
+    ));
+
+    for receiver in [flight_receiver, weather_receiver, solar_receiver] {
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(WorkerCommand::SettingsChanged(settings)) if settings == configured()
+        ));
+        assert!(receiver.try_recv().is_err(), "worker must be notified once");
+    }
+}
+
 fn solar_schedule(location: &Location) -> SolarSchedule {
     let days = (2..=18)
         .map(|day| SolarDay {

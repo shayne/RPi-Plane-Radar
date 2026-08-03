@@ -312,6 +312,72 @@ fn successful_refresh_runs_at_most_once_per_radar_local_day() {
 }
 
 #[test]
+fn clock_rollback_does_not_refetch_a_previously_successful_local_day() {
+    let temporary = tempfile::tempdir().expect("state directory");
+    let model = RuntimeModel::new(
+        enabled(Some(fixture_location())),
+        "http://planeradar.local".to_owned(),
+    );
+    let clock = FakeClock::default();
+    let next_day_clock = clock.clone();
+    let previous_day_clock = clock.clone();
+    let (waiter, waits) = ScriptedWaiter::new(
+        clock.clone(),
+        [
+            WaitOutcome::Action(Box::new(move || {
+                next_day_clock.set_unix(START_UNIX + 24 * 60 * 60);
+            })),
+            WaitOutcome::Action(Box::new(move || {
+                previous_day_clock.set_unix(START_UNIX);
+            })),
+            WaitOutcome::Stop,
+        ],
+    );
+    let (http, requests) = FakeHttp::new([solar_response(), solar_response()]);
+
+    run_worker(
+        http,
+        temporary.path().join("solar.json"),
+        model,
+        clock,
+        waiter,
+    );
+
+    assert_eq!(requests.lock().expect("requests").len(), 2);
+    assert_eq!(
+        *waits.lock().expect("waits"),
+        [Duration::from_secs(15 * 60); 3]
+    );
+}
+
+#[test]
+fn successful_fetch_at_an_unrepresentable_wall_time_uses_the_bounded_success_wait() {
+    let temporary = tempfile::tempdir().expect("state directory");
+    let model = RuntimeModel::new(
+        enabled(Some(fixture_location())),
+        "http://planeradar.local".to_owned(),
+    );
+    let clock = FakeClock::default();
+    clock.set_unix(u64::MAX);
+    let (waiter, waits) = ScriptedWaiter::new(clock.clone(), [WaitOutcome::Stop]);
+    let (http, requests) = FakeHttp::new([solar_response()]);
+
+    run_worker(
+        http,
+        temporary.path().join("solar.json"),
+        model,
+        clock,
+        waiter,
+    );
+
+    assert_eq!(requests.lock().expect("requests").len(), 1);
+    assert_eq!(
+        *waits.lock().expect("waits"),
+        [Duration::from_secs(15 * 60)]
+    );
+}
+
+#[test]
 fn failures_publish_sanitized_status_and_follow_the_capped_retry_schedule() {
     let temporary = tempfile::tempdir().expect("state directory");
     let model = RuntimeModel::new(
@@ -495,6 +561,53 @@ fn disabling_solar_clears_only_solar_state_and_interrupts_the_wait() {
     assert_eq!(
         *waits.lock().expect("waits"),
         [Duration::from_secs(15 * 60), Duration::from_secs(30)]
+    );
+}
+
+#[test]
+fn disable_and_reenable_at_the_same_coordinates_does_not_refetch_that_local_day() {
+    let temporary = tempfile::tempdir().expect("state directory");
+    let location = fixture_location();
+    let model = RuntimeModel::new(
+        enabled(Some(location.clone())),
+        "http://planeradar.local".to_owned(),
+    );
+    let disable_model = model.clone();
+    let mut disabled = enabled(Some(location.clone()));
+    disabled.brightness.night.enabled = false;
+    let enable_model = model.clone();
+    let reenabled = enabled(Some(location));
+    let clock = FakeClock::default();
+    let (waiter, waits) = ScriptedWaiter::new(
+        clock.clone(),
+        [
+            WaitOutcome::Action(Box::new(move || {
+                disable_model.replace_settings(disabled);
+            })),
+            WaitOutcome::Action(Box::new(move || {
+                enable_model.replace_settings(reenabled);
+            })),
+            WaitOutcome::Stop,
+        ],
+    );
+    let (http, requests) = FakeHttp::new([solar_response()]);
+
+    run_worker(
+        http,
+        temporary.path().join("solar.json"),
+        model,
+        clock,
+        waiter,
+    );
+
+    assert_eq!(requests.lock().expect("requests").len(), 1);
+    assert_eq!(
+        *waits.lock().expect("waits"),
+        [
+            Duration::from_secs(15 * 60),
+            Duration::from_secs(30),
+            Duration::from_secs(15 * 60),
+        ]
     );
 }
 

@@ -282,12 +282,16 @@ struct ChannelSettingsNotifier {
 
 impl SettingsNotifier for ChannelSettingsNotifier {
     fn settings_changed(&self, settings: RadarSettings) -> Result<(), ()> {
+        let mut unavailable = false;
         for sender in &self.senders {
-            sender
+            if sender
                 .send(WorkerCommand::SettingsChanged(settings.clone()))
-                .map_err(|_| ())?;
+                .is_err()
+            {
+                unavailable = true;
+            }
         }
-        Ok(())
+        if unavailable { Err(()) } else { Ok(()) }
     }
 }
 

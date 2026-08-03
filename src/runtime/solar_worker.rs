@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -45,7 +46,7 @@ impl<C: HttpClient, K: Clock, W: Waiter> SolarWorker<C, K, W> {
 
     pub fn run(&self, commands: Receiver<WorkerCommand>, stop: Arc<AtomicBool>) {
         let mut active_location: Option<Location> = None;
-        let mut last_successful_local_day: Option<Date> = None;
+        let mut successful_local_days = HashSet::<Date>::new();
         let mut failures = 0_u32;
 
         loop {
@@ -58,53 +59,49 @@ impl<C: HttpClient, K: Clock, W: Waiter> SolarWorker<C, K, W> {
             let snapshot = self.model.snapshot();
             let Some(location) = snapshot.settings.location.clone() else {
                 active_location = None;
-                last_successful_local_day = None;
+                successful_local_days.clear();
                 failures = 0;
                 if !wait_for_command(&self.waiter, &commands, &stop, IDLE_INTERVAL) {
                     return;
                 }
                 continue;
             };
+            if !active_location
+                .as_ref()
+                .is_some_and(|active| same_coordinates(active, &location))
+            {
+                active_location = Some(location.clone());
+                successful_local_days.clear();
+                failures = 0;
+            }
             if !snapshot.settings.brightness.night.enabled {
-                active_location = None;
-                last_successful_local_day = None;
                 failures = 0;
                 if !wait_for_command(&self.waiter, &commands, &stop, IDLE_INTERVAL) {
                     return;
                 }
                 continue;
             }
-
-            if !active_location
-                .as_ref()
-                .is_some_and(|active| same_coordinates(active, &location))
+            if snapshot.solar_schedule.is_none()
+                && let Some(cached) = load_cache(&self.cache_path, &location)
             {
-                active_location = Some(location.clone());
-                last_successful_local_day = None;
-                failures = 0;
-                if snapshot.solar_schedule.is_none()
-                    && let Some(cached) = load_cache(&self.cache_path, &location)
-                {
-                    let _ = self
-                        .model
-                        .record_solar_schedule_if_current(&location, Arc::new(cached));
-                }
+                let _ = self
+                    .model
+                    .record_solar_schedule_if_current(&location, Arc::new(cached));
             }
 
-            if let Some(successful_day) = last_successful_local_day {
-                let schedule = self.model.snapshot().solar_schedule;
-                if local_day(
-                    self.clock.unix_seconds(),
-                    schedule
-                        .as_deref()
-                        .map(|schedule| schedule.time_zone.as_str()),
-                ) == Some(successful_day)
-                {
-                    if !wait_for_command(&self.waiter, &commands, &stop, SUCCESS_CHECK_INTERVAL) {
-                        return;
-                    }
-                    continue;
+            let schedule = self.model.snapshot().solar_schedule;
+            if local_day(
+                self.clock.unix_seconds(),
+                schedule
+                    .as_deref()
+                    .map(|schedule| schedule.time_zone.as_str()),
+            )
+            .is_some_and(|day| successful_local_days.contains(&day))
+            {
+                if !wait_for_command(&self.waiter, &commands, &stop, SUCCESS_CHECK_INTERVAL) {
+                    return;
                 }
+                continue;
             }
 
             let result = self.client.fetch(&location, self.clock.unix_seconds());
@@ -121,7 +118,16 @@ impl<C: HttpClient, K: Clock, W: Waiter> SolarWorker<C, K, W> {
                     match accepted {
                         Ok(true) => {
                             failures = 0;
-                            last_successful_local_day = successful_day;
+                            if let Some(successful_day) = successful_day {
+                                successful_local_days.insert(successful_day);
+                            } else if !wait_for_command(
+                                &self.waiter,
+                                &commands,
+                                &stop,
+                                SUCCESS_CHECK_INTERVAL,
+                            ) {
+                                return;
+                            }
                         }
                         Ok(false) => continue,
                         Err(failure) => {
