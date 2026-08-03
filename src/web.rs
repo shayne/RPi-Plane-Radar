@@ -1506,7 +1506,12 @@ h3 {{ font-size: 1rem; font-weight: 700; line-height: 1.25; }}
   text-decoration: none;
 }}
 .settings-navigation a span {{ color: inherit; font-size: 0.875rem; font-weight: 700; }}
-.settings-navigation a small {{ color: var(--text-faint); font-size: 0.6875rem; }}
+.settings-navigation a small {{
+  min-width: 0;
+  overflow-wrap: anywhere;
+  color: var(--text-faint);
+  font-size: 0.6875rem;
+}}
 .rail-label {{
   color: var(--text-faint);
   font-size: 0.6875rem;
@@ -1801,7 +1806,7 @@ fieldset > p {{ margin-top: calc(var(--space-sm) * -1); }}
   .settings-navigation {{ overflow: visible; }}
   .settings-navigation ul {{ display: grid; width: auto; }}
   .settings-navigation a {{
-    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 6rem);
     gap: var(--space-sm);
   }}
   .settings-navigation a small {{ text-align: right; }}

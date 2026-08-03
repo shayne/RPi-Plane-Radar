@@ -598,6 +598,29 @@ fn settings_navigation_escapes_saved_location_summary() {
 }
 
 #[test]
+fn settings_navigation_wraps_long_unbroken_location_summary() {
+    let mut settings = optional_settings_enabled();
+    let label = "x".repeat(512);
+    settings.location.as_mut().unwrap().label = label.clone();
+
+    let response = TestServer::new(settings, Vec::new()).get("/");
+
+    assert!(
+        response.body.contains(&format!("<small>{label}</small>")),
+        "navigation should preserve the saved location summary"
+    );
+    for expected in [
+        ".settings-navigation a small {\n  min-width: 0;\n  overflow-wrap: anywhere;",
+        "grid-template-columns: minmax(0, 1fr) minmax(0, 6rem);",
+    ] {
+        assert!(
+            response.body.contains(expected),
+            "navigation omitted overflow contract {expected:?}"
+        );
+    }
+}
+
+#[test]
 fn unconfigured_page_prioritizes_setup_and_exposes_semantic_controls() {
     let server = TestServer::new(RadarSettings::default(), Vec::new());
 
