@@ -1,7 +1,7 @@
 use std::collections::HashSet;
-use std::fs::{self, File};
-use std::io::{self, Write};
-use std::os::unix::fs::PermissionsExt;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read, Write};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 use std::time::Duration;
 
@@ -149,8 +149,11 @@ impl<C: HttpClient> SolarClient<C> {
         let request = HttpRequest {
             url: self.provider_base.clone(),
             query: vec![
-                ("latitude".to_owned(), format!("{:.4}", location.latitude)),
-                ("longitude".to_owned(), format!("{:.4}", location.longitude)),
+                ("latitude".to_owned(), format_coordinate(location.latitude)),
+                (
+                    "longitude".to_owned(),
+                    format_coordinate(location.longitude),
+                ),
                 ("daily".to_owned(), "sunrise".to_owned()),
                 ("timezone".to_owned(), "auto".to_owned()),
                 ("timeformat".to_owned(), "unixtime".to_owned()),
@@ -299,6 +302,20 @@ fn valid_coordinate(value: f64, minimum: f64, maximum: f64) -> bool {
     value.is_finite() && (minimum..=maximum).contains(&value)
 }
 
+fn format_coordinate(value: f64) -> String {
+    let mut formatted = value.to_string();
+    match formatted.find('.') {
+        Some(decimal) => {
+            let fractional_digits = formatted.len() - decimal - 1;
+            if fractional_digits < 4 {
+                formatted.extend(std::iter::repeat_n('0', 4 - fractional_digits));
+            }
+        }
+        None => formatted.push_str(".0000"),
+    }
+    formatted
+}
+
 fn validate_provider_base(provider_base: &str) -> Result<(), SolarError> {
     let url = Url::parse(provider_base).map_err(|_| SolarError::InvalidProvider)?;
     if url.scheme() != "https"
@@ -317,7 +334,11 @@ fn load_time_zone(name: &str) -> Result<TimeZone, SolarError> {
     if !valid_time_zone_name(name) {
         return Err(SolarError::Schema("time zone"));
     }
-    TimeZone::get(name).map_err(|_| SolarError::Schema("time zone"))
+    let zone = TimeZone::get(name).map_err(|_| SolarError::Schema("time zone"))?;
+    if zone.is_unknown() || zone.iana_name().is_none() {
+        return Err(SolarError::Schema("time zone"));
+    }
+    Ok(zone)
 }
 
 fn valid_time_zone_name(name: &str) -> bool {
@@ -361,11 +382,7 @@ fn validate_schedule(schedule: &SolarSchedule) -> Result<(), SolarError> {
 
 pub fn load_cache(path: &Path, location: &Location) -> Option<SolarSchedule> {
     validate_location(location).ok()?;
-    let metadata = fs::symlink_metadata(path).ok()?;
-    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
-        return None;
-    }
-    let bytes = fs::read(path).ok()?;
+    let bytes = read_regular_nofollow(path).ok().flatten()?;
     let value: Value = serde_json::from_slice(&bytes).ok()?;
     let schedule: SolarSchedule = serde_json::from_value(value).ok()?;
     validate_schedule(&schedule).ok()?;
@@ -373,6 +390,28 @@ pub fn load_cache(path: &Path, location: &Location) -> Option<SolarSchedule> {
         return None;
     }
     Some(schedule)
+}
+
+fn read_regular_nofollow(path: &Path) -> io::Result<Option<Vec<u8>>> {
+    read_regular_nofollow_with(path, || {})
+}
+
+fn read_regular_nofollow_with(
+    path: &Path,
+    after_open: impl FnOnce(),
+) -> io::Result<Option<Vec<u8>>> {
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Ok(None);
+    }
+    after_open();
+    let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0));
+    file.read_to_end(&mut bytes)?;
+    Ok(Some(bytes))
 }
 
 pub fn save_cache(path: &Path, schedule: &SolarSchedule) -> Result<(), SolarError> {
@@ -406,4 +445,44 @@ fn create_parent_if_missing(parent: &Path) -> Result<(), SolarError> {
     fs::create_dir_all(parent)?;
     fs::set_permissions(parent, fs::Permissions::from_mode(0o750))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::fs::symlink;
+
+    use super::*;
+
+    #[test]
+    fn cache_reader_rejects_a_symlink_at_the_single_open() {
+        let temporary = tempfile::tempdir().expect("cache directory");
+        let target = temporary.path().join("target.json");
+        let linked = temporary.path().join("cache.json");
+        fs::write(&target, b"target bytes").expect("target");
+        symlink(&target, &linked).expect("symlink");
+
+        assert!(read_regular_nofollow_with(&linked, || {}).is_err());
+    }
+
+    #[test]
+    fn cache_reader_keeps_reading_the_open_descriptor_after_path_replacement() {
+        let temporary = tempfile::tempdir().expect("cache directory");
+        let cache = temporary.path().join("cache.json");
+        let replacement = temporary.path().join("replacement.json");
+        fs::write(&cache, b"opened cache bytes").expect("cache");
+        fs::write(&replacement, b"replacement bytes").expect("replacement");
+
+        let bytes = read_regular_nofollow_with(&cache, || {
+            fs::remove_file(&cache).expect("unlink opened cache");
+            symlink(&replacement, &cache).expect("replacement symlink");
+        })
+        .expect("descriptor read")
+        .expect("regular file");
+
+        assert_eq!(bytes, b"opened cache bytes");
+        assert_eq!(
+            fs::read(&cache).expect("path now follows replacement"),
+            b"replacement bytes"
+        );
+    }
 }

@@ -177,6 +177,36 @@ fn fetch_emits_only_the_bounded_https_solar_request() {
 }
 
 #[test]
+fn fetch_preserves_distinct_sub_fourth_decimal_coordinate_identities() {
+    let mut query_values = Vec::new();
+    for latitude in [40.77691, 40.77694] {
+        let (client, http) = client(response(&fixture_value()));
+        let mut configured = location();
+        configured.latitude = latitude;
+
+        client
+            .fetch(&configured, FETCHED_AT)
+            .expect("solar schedule");
+
+        let request = http.requests().pop().expect("recorded request");
+        let serialized = request
+            .query
+            .iter()
+            .find(|(name, _)| name == "latitude")
+            .expect("latitude query")
+            .1
+            .clone();
+        assert_eq!(
+            serialized.parse::<f64>().expect("query coordinate"),
+            latitude
+        );
+        query_values.push(serialized);
+    }
+
+    assert_eq!(query_values, ["40.77691", "40.77694"]);
+}
+
+#[test]
 fn invalid_request_coordinates_are_rejected_before_network_access() {
     let invalid = [
         (f64::NAN, -73.8740),
@@ -273,6 +303,9 @@ fn time_zone_must_be_bounded_iana_syntax_with_available_system_zoneinfo() {
         "America/../New_York",
         "Etc/GMT 4",
         "A/this_zone_does_not_exist",
+        "Etc/Unknown",
+        "etc/unknown",
+        "ETC/UNKNOWN",
     ] {
         let mut fixture = fixture_value();
         fixture["timezone"] = json!(zone);
