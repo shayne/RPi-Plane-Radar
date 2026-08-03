@@ -334,17 +334,17 @@ fn architecture_describes_independent_optional_workers_and_snapshot_flow() {
         .collect::<Vec<_>>()
         .join(" ");
     for required in [
-        "three independent workers",
+        "four independent workers",
         "ADS-B worker",
         "ADSBDB enrichment worker",
         "Open-Meteo environment worker",
-        "three settings wake channels",
+        "four settings wake channels",
         "failure isolation",
         "six hours",
         "ten minutes",
         "15 minutes",
-        "schema version 1",
-        "immutable enrichment and environment fields",
+        "schema versions 1 and 2",
+        "enrichment, environment, and solar fields",
         "minute-based clock redraws",
         "service errors do not set `DATA STALE`",
         "`WX --`",

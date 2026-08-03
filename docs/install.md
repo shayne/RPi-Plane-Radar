@@ -99,7 +99,8 @@ Before mutation, every source install verifies:
 - the application manifest, checksums, full source commit, architecture, SPDX
   metadata, repository, workflow, tag, and release identity; and
 - the external driver repository, version, full commit, manifest digest,
-  kernel release, vermagic, overlay, and artifact hashes.
+  required `pwm-backlight-v1` capability, kernel release, vermagic, overlay,
+  backlight udev rule, and artifact hashes.
 
 The source controller keeps a stable-only attestation policy. A local stable
 draft verifies each runnable artifact against the exact repository, workflow,
@@ -141,6 +142,52 @@ Mac closes, the network drops, or a reboot takes too long, rerun the exact same
 install command. Do not delete state to force progress; see
 [Recovery](recovery.md).
 
+## Brightness driver boundary
+
+Plane Radar supports brightness only through the standard
+`/sys/class/backlight/planeradar-backlight` device. The locked driver must
+advertise `pwm-backlight-v1`, and the installer rejects missing or malformed
+capability data and a driver manifest that does not match its backlight rule.
+The currently published locked driver identity predates that capability and is
+intentionally insufficient for a production install. A compatible driver must
+be explicitly published and pinned before a public Plane Radar release can
+include this feature.
+
+The driver installs
+`/etc/udev/rules.d/70-planeradar-backlight.rules` as `root:root` mode `0644`.
+Its exact rule is:
+
+```udev
+SUBSYSTEM=="backlight", KERNEL=="planeradar-backlight", RUN+="/usr/bin/chgrp video /sys%p/brightness", RUN+="/usr/bin/chmod 0660 /sys%p/brightness"
+```
+
+That makes only the named device's `brightness` control `root:video` mode
+`0660`; the unprivileged `planeradar` service receives access through its
+`video` group. The application never needs root and does not take over GPIO or
+PWM directly.
+
+If the settings page reports `Display brightness unavailable`, start with
+`mise run doctor -- user@host`. These target-side commands are also safe,
+read-only checks:
+
+```sh
+cat /sys/class/backlight/planeradar-backlight/max_brightness
+cat /sys/class/backlight/planeradar-backlight/brightness
+stat -Lc '%U:%G %a %n' /sys/class/backlight/planeradar-backlight/brightness
+cat /etc/udev/rules.d/70-planeradar-backlight.rules
+id planeradar
+udevadm info --query=all --path=/sys/class/backlight/planeradar-backlight
+```
+
+Preserve the evidence and repair or install a verified compatible driver if
+the device, group, mode, rule, or capability is wrong. Do not work around the
+boundary with `chmod`, recursive permission changes, a root application
+service, manual sysfs writes, or direct GPIO/PWM access.
+
+Maintainer physical staging may use a source candidate to validate the driver
+and application together. That local, reversible step does not create a tag,
+push, GitHub release, public package, or stable driver selection.
+
 ## First-run setup
 
 With no saved location, the display stays on the setup QR screen. It shows:
@@ -156,9 +203,15 @@ or normal logs. Location, range, and runway visibility remain the complete
 default setup path; existing installations keep their current display until an
 owner enables an optional feature.
 
-Radar text size changes radar typography from 80% through 130%. Three native
+Radar text size changes radar typography from 80% through 130%. Four native
 expandable groups hold the opt-in controls:
 
+- **Brightness:** day brightness ranges from 5% through 100% in 5% steps and
+  defaults to 100%. Night mode defaults off, with saved defaults of 30% at
+  20:00 and red-only off. Its start uses the configured radar location's IANA
+  local time; it ends at the first valid sunrise after that start, or at 07:00
+  the next day in the same zone when no later forecast sunrise is available.
+  Red-only affects every physical screen, but never the browser settings page.
 - **Aircraft labels:** **Show callsign** defaults on. **Show origin and
   destination** and **Show expanded aircraft model** default off.
 - **Footer:** separately select **Weather condition**, temperature, humidity,
@@ -171,9 +224,12 @@ expandable groups hold the opt-in controls:
 Provider-backed enrichment and environment data are off by default; all new
 provider features are optional. Routes send the aircraft callsign to ADSBDB;
 expanded models send the aircraft identifier. When both are selected, those
-values may share one request. Weather and radar-local time send the configured
-coordinates to Open-Meteo. Zulu-only time and date send nothing to Open-Meteo.
-The settings page explains these boundaries beside the affected controls.
+values may share one request. Weather, radar-local time, and enabled night mode
+send the configured coordinates to Open-Meteo. Night mode requests only the
+sunrise and time-zone data needed for its schedule. Its isolated worker uses a
+cache first and refreshes independently; provider response and error bodies
+are never displayed. Zulu-only time and date send nothing to Open-Meteo. The
+settings page explains these boundaries beside the affected controls.
 
 ## Verified release bootstrap
 

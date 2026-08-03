@@ -64,8 +64,11 @@ the complete default path; upgrades keep the same display and make no new
 provider requests until you enable an optional feature.
 
 Radar text size scales radar typography from 80% through 130%. The remaining
-optional controls are organized in three expandable groups:
+optional controls are organized in four expandable groups:
 
+- **Brightness:** set day brightness from 5% through 100% in 5% steps. You can
+  also enable a scheduled night brightness and an optional red-only physical
+  display.
 - **Aircraft labels:** **Show callsign** stays on by default. **Show origin and
   destination** and **Show expanded aircraft model** are off by default.
 - **Footer:** independently show **Weather condition**, temperature, humidity,
@@ -77,12 +80,22 @@ optional controls are organized in three expandable groups:
   aircraft remain visible with no bound; while either bound is active,
   unknown-altitude aircraft are hidden.
 
+Day brightness defaults to 100%. Night mode defaults off, with saved night
+defaults of 30% at 20:00 and red-only off, so an upgrade retains the current
+100% full-color display until you opt in. The night start uses the configured
+radar location's IANA local time, not the browser or Pi host time zone. Night
+ends at the first valid sunrise after that start, or at 07:00 the next day in
+the same radar-local time zone when no later forecast sunrise is available.
+Red-only mode applies to every physical setup, waiting, settings, and radar
+frame. It never recolors the browser settings page.
+
 Provider-backed enrichment and environment data are off by default; all new
 provider features are optional. For the exact privacy boundary, routes send the
 aircraft callsign to ADSBDB and models send the aircraft identifier; enabling
-both means those values may share one request. Weather and radar-local time
-send the configured coordinates to Open-Meteo. Zulu-only time and date send
-nothing to Open-Meteo.
+both means those values may share one request. Weather, radar-local time, and
+enabled night mode send the configured coordinates to Open-Meteo. Night mode
+does so only while it needs radar-local sunrise data. Zulu-only time and date
+send nothing to Open-Meteo.
 
 ADSBDB route records are static candidates, not live flight plans. Plane Radar
 uses the returned airport coordinates and each aircraft's live position to hide

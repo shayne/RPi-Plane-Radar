@@ -59,7 +59,7 @@ of what already happened.
 | Management helpers and captures | `/var/lib/planeradar-installer/helpers/` and `/var/lib/planeradar-installer/captures/` | Transactional or diagnostic | root, private directories |
 | Accepted application payloads | `/opt/planeradar/releases/<version>/<sha256>/planeradar` | Current plus previous accepted pairs | root |
 | Active application | `/opt/planeradar/bin/planeradar` plus `REVISION` and `SHA256` | Until upgrade or uninstall | root |
-| Settings and geocode cache | `/var/lib/planeradar/settings.json` and `geocode-cache.json` | Preserved by default | `planeradar` service |
+| Settings and local caches | `/var/lib/planeradar/settings.json`, `geocode-cache.json`, and `solar-schedule.json` | Settings preserved by default; caches replaceable | `planeradar` service |
 | Debug frame | `/var/lib/planeradar/debug.png` | Replaced on request | `planeradar` service |
 | Driver acceptance state | `/var/lib/hyperpixel2r-kms/` and `/usr/lib/hyperpixel2r-kms/` | Kernel and driver-version specific | root |
 | Temporary uploads | `/var/tmp/planeradar-upload.*` | Disposable | SSH user creates staging; sudo consumes it |
@@ -82,50 +82,54 @@ flowchart LR
     settings --> adsb_wake["ADS-B settings wake"]
     settings --> enrichment_wake["Enrichment settings wake"]
     settings --> environment_wake["Environment settings wake"]
+    settings --> solar_wake["Solar settings wake"]
     adsb_wake --> adsb["ADS-B worker"]
     enrichment_wake --> enrichment["ADSBDB enrichment worker"]
     environment_wake --> environment["Open-Meteo environment worker"]
+    solar_wake --> solar["Open-Meteo solar worker<br/>coordinate-bound cache"]
     adsb --> base["Base aircraft"]
     enrichment --> optional_aircraft["Routes and models"]
     environment --> optional_environment["Weather and location time"]
+    solar --> optional_solar["Sunrise schedule"]
     base --> model
     optional_aircraft --> model
     optional_environment --> model
+    optional_solar --> model
     model --> main
     model --> web
 ```
 
 The main thread owns SDL, rendering, gesture recognition, and visible
 application state. SDL objects never cross a thread boundary. A web accept
-thread serves settings and health. The runtime uses three independent workers
-to fetch primary traffic, optional aircraft data, and optional environment
-data: the ADS-B worker, ADSBDB enrichment worker, and Open-Meteo environment
-worker. Their three settings wake channels let each worker react immediately
-without sharing network deadlines. This failure isolation means a blocked or
-failed optional provider cannot delay the three-second primary ADS-B
-publication cadence. Web requests are bounded to 16 workers. Nominatim access
-is serialized because its rate clock and cache have one owner.
+thread serves settings and health. The runtime uses four independent workers:
+the ADS-B worker, ADSBDB enrichment worker, Open-Meteo environment worker, and
+Open-Meteo solar worker. Their four settings wake channels let each worker
+react immediately without sharing network deadlines. This failure isolation
+means a blocked or failed optional provider cannot delay the three-second
+primary ADS-B publication cadence. Web requests are bounded to 16 workers.
+Nominatim access is serialized because its rate clock and cache have one owner.
 
 `RuntimeModel` publishes a complete immutable snapshot behind an
 `Arc<RwLock<_>>`. Each snapshot contains settings, base aircraft, immutable
-enrichment and environment fields, timestamps, URLs, service status, and a
-generation number. A renderer sees one point in time instead of half of one
-update and half of the next. Late enrichment is joined only to a still-current
-aircraft identity, while environment results are accepted only for the current
-location and enabled settings.
+enrichment, environment, and solar fields, backlight availability, timestamps,
+URLs, service status, and a generation number. A renderer sees one point in
+time instead of half of one update and half of the next. Late enrichment is
+joined only to a still-current aircraft identity, while environment and solar
+results are accepted only for the current location and enabled settings.
 
-Settings schema version 1 migrates in memory to schema version 2. Existing
-location, units, runway visibility, and range are preserved; optional display
-and provider features receive compatibility defaults. Loading does not write
-the migrated value at startup. The next successful settings change uses the
-normal atomic version-2 write.
+Settings schema versions 1 and 2 migrate in memory to strict schema version 3.
+Existing location, units, runway visibility, and range are preserved; optional
+display and provider features receive compatibility defaults. Day brightness
+defaults to 100%. Night mode defaults off, while its saved defaults are 30% at
+20:00 with red-only off. Loading does not write the migrated value at startup.
+The next successful settings change uses the normal atomic version-3 write.
 
 All browser and touch settings changes use one transaction:
 
 1. derive a candidate from the current snapshot;
 2. validate and atomically write it;
 3. publish the new snapshot; and
-4. notify all three settings wake channels.
+4. notify all four settings wake channels.
 
 Old aircraft replies are discarded when their location or range no longer
 matches. The enrichment cache keeps structured ADSBDB route candidates and
@@ -136,6 +140,30 @@ implausible candidates publish no route, while valid midpoints remain visible
 in the compact label. The environment worker refreshes required weather or
 radar-local time data no more than once every 15 minutes after success.
 Zulu-only time and date need no Open-Meteo request.
+
+Enabled night mode uses the configured location's coordinates only while it
+needs sunrise data. The solar worker loads its coordinate-bound cache first,
+then refreshes independently; failures leave every other worker and the last
+usable schedule intact. Provider failures publish only sanitized categories
+and retry on a bounded, rate-limited backoff. Open-Meteo response and error
+bodies never enter the display, browser status, or normal logs. The runtime
+data flow is:
+
+```text
+settings + location -> isolated solar worker/cache -> immutable snapshot
+snapshot + wall time -> pure radar-local policy
+policy + monotonic time -> backlight controller/ramp
+normal renderer -> one final frame transform -> debug/upload/physical display
+```
+
+The pure schedule policy uses the configured radar location's IANA time zone,
+never the browser or Pi host civil time. A night interval is `[start, end)`,
+where `end` is the first valid sunrise strictly after its configured start. If
+the cached forecast has no such sunrise, the policy uses 07:00 the next day in
+that same radar-local zone. The display loop re-evaluates policy on every step;
+snapshot generation, wall-clock minute, and effective color-mode changes are
+render invalidations. The web handler renders one immutable snapshot and does
+not perform provider or sysfs I/O on the request path.
 
 Primary position age alone controls `DATA STALE`; service errors do not set
 `DATA STALE`. When the primary feed stops, the last good frame remains visible
@@ -150,8 +178,10 @@ outage without redrawing each second.
 
 The external
 [hyperpixel2r-kms](https://github.com/shayne/hyperpixel2r-kms) platform driver
-owns the panel GPIO lifecycle and creates the FT5x06 input child. User space
-does not toggle panel GPIO or open raw I2C.
+owns the panel GPIO and PWM-backed backlight lifecycle, exposes the named
+standard backlight device, and creates the FT5x06 input child. The application
+uses only `/sys/class/backlight/planeradar-backlight`; it does not toggle panel
+GPIO, program PWM, or open raw I2C.
 
 SDL uses `kmsdrm` with the `opengles2` renderer and uploads a native 480×480
 RGBA frame. Static radar geometry is cached. Aircraft and text are drawn from
@@ -160,6 +190,19 @@ the range label. Integer pixel metrics keep the round display sharp. The
 `tests/goldens/settings.png` fixture is the physical QR settings screen and
 must remain unchanged. The browser settings UX is verified through HTML
 contracts and viewport inspection rather than that device golden.
+
+Brightness transitions are nonblocking ramps driven by monotonic time over two
+seconds. Entering red night mode dims the full-color frame before applying red;
+leaving it restores full color before brightening. Startup in an already-active
+red interval renders red immediately. Backlight absence and write failures are
+nonfatal; the application exposes sanitized availability and rate-limits
+hardware failure reporting to once per 30 seconds.
+
+Red-only mode is one integer-luma final transform after normal rendering and
+before the current frame is saved or uploaded. It therefore covers every
+physical setup, waiting, settings, and radar frame without duplicating color
+logic inside individual renderers. The browser settings page remains full
+color because it is outside the physical frame pipeline.
 
 A tap advances range. Motion beyond 18 pixels cancels the tap. A continuous
 three-second hold opens settings, and its release is consumed so the range
@@ -202,6 +245,16 @@ bootstrap verifies attestations for release candidates too.
 The kernel driver lives in its own GPL-2.0-only repository. Plane Radar does
 not vendor it or use a submodule. `driver.lock.toml` pins the repository,
 semantic version, full commit, release-manifest digest, and lifecycle protocol.
+It also requires the `pwm-backlight-v1` capability and verifies the driver's
+backlight rule as part of its identity. The currently published locked driver
+manifest predates that capability and is intentionally insufficient; a
+compatible driver must be explicitly published and pinned before a public
+Plane Radar release can use brightness.
+
+Local physical staging may install a reversible source candidate to test the
+driver and application together. It does not create or select a stable driver,
+and it produces no push, tag, GitHub release, or public package.
+
 An exact-kernel prebuilt archive is preferred; Docker cross-builds against the
 target kernel context when no matching archive exists. A failed refresh may
 fall back to a byte-valid earlier build for that exact kernel; the target-side
