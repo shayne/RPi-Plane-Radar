@@ -84,8 +84,9 @@ Day brightness defaults to 100%. Night mode defaults off, with saved night
 defaults of 30% at 20:00 and red-only off, so an upgrade retains the current
 100% full-color display until you opt in. The night start uses the configured
 radar location's IANA local time, not the browser or Pi host time zone. Night
-ends at the first valid sunrise after that start, or at 07:00 the next day in
-the same radar-local time zone when no later forecast sunrise is available.
+ends at the first valid sunrise after that start, or at the next 07:00
+radar-local time strictly after the configured start when no later forecast
+sunrise is available.
 Red-only mode applies to every physical setup, waiting, settings, and radar
 frame. It never recolors the browser settings page.
 

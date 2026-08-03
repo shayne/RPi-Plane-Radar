@@ -159,8 +159,9 @@ normal renderer -> one final frame transform -> debug/upload/physical display
 The pure schedule policy uses the configured radar location's IANA time zone,
 never the browser or Pi host civil time. A night interval is `[start, end)`,
 where `end` is the first valid sunrise strictly after its configured start. If
-the cached forecast has no such sunrise, the policy uses 07:00 the next day in
-that same radar-local zone. The display loop re-evaluates policy on every step;
+the cached forecast has no such sunrise, the policy uses the next 07:00 in that
+radar-local zone strictly after the configured start. The display loop
+re-evaluates policy on every step;
 snapshot generation, wall-clock minute, and effective color-mode changes are
 render invalidations. The web handler renders one immutable snapshot and does
 not perform provider or sysfs I/O on the request path.

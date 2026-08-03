@@ -209,8 +209,9 @@ expandable groups hold the opt-in controls:
 - **Brightness:** day brightness ranges from 5% through 100% in 5% steps and
   defaults to 100%. Night mode defaults off, with saved defaults of 30% at
   20:00 and red-only off. Its start uses the configured radar location's IANA
-  local time; it ends at the first valid sunrise after that start, or at 07:00
-  the next day in the same zone when no later forecast sunrise is available.
+  local time; it ends at the first valid sunrise after that start, or at the
+  next 07:00 radar-local time strictly after the configured start when no later
+  forecast sunrise is available.
   Red-only affects every physical screen, but never the browser settings page.
 - **Aircraft labels:** **Show callsign** defaults on. **Show origin and
   destination** and **Show expanded aircraft model** default off.
