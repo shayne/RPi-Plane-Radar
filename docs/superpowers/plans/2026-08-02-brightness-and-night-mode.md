@@ -204,9 +204,9 @@ backlight = <&planeradar_backlight>
 
 The compiled DT checks must prove the named PWM backlight, GPIO19 Alt5 pinctrl,
 1 MHz PWM clock, panel `backlight` phandle, and the absence of
-`backlight-gpios`. Use the repository's existing module build and artifact
-checks to require a valid `hyperpixel2r_kms.ko` plus its generated build
-metadata (`module.readelf.txt`, `module.modinfo.txt`, checksum, and manifest).
+`backlight-gpios`. Use the repository's existing local build contract to
+validate the in-progress packaging rules. The immutable module/artifact proof
+belongs in Step 8, after the exact Task 1 source is committed.
 `tests/gpio_test.c` must behaviorally prove that quiesce deasserts CS, releases
 SDA/SCL, and preserves the first error; it must not infer that behavior from C
 source tokens. The contract's automated evidence is restricted to compiled
@@ -221,14 +221,13 @@ Run:
 ```bash
 mise run test-backlight-contract
 mise run test-gpio
-mise run build-driver
-mise run check-artifacts
+mise run test-build-contract
 ```
 
 Expected: the new compiled-overlay contract fails on the current GPIO-backed
-artifact, while the existing GPIO test and module/artifact build verification
-establish the safe helper and packaging baselines. The final physical-panel
-acceptance remains required in Task 12.
+artifact, while the existing GPIO test and local build contract establish the
+safe helper and packaging baselines. The final physical-panel acceptance
+remains required in Task 12.
 
 - [ ] **Step 4: Define the PWM backlight in the overlay**
 
@@ -277,16 +276,15 @@ Run:
 mise run test-gpio
 mise run test-backlight-contract
 mise run test-build-contract
-mise run build-driver
-mise run check-artifacts
 mise run verify
 ```
 
 Expected: all tests pass; the compiled overlay proves the PWM backlight,
 GPIO19 Alt5 pinctrl, clock, panel phandle, and absence of `backlight-gpios`;
-module/build verification proves the packaged module artifacts; and the GPIO
-test proves quiesce and first-error behavior. Complete the final physical-panel
-acceptance in Task 12 before claiming the driver accepted.
+the local build contract validates the in-progress packaging rules; and the
+GPIO test proves quiesce and first-error behavior. Complete the immutable
+artifact proof in Step 8 and final physical-panel acceptance in Task 12 before
+claiming the driver accepted.
 
 - [ ] **Step 7: Commit only Task 1 files**
 
@@ -306,6 +304,23 @@ but status
 ```
 
 Expected: one focused driver commit; no other workspace changes are included.
+
+- [ ] **Step 8: Prove immutable module artifacts from the committed source**
+
+With the Task 1 commit applied and the driver source clean, run:
+
+```bash
+HP2R_TARGET=user@radar.local mise run build-driver
+HP2R_TARGET=user@radar.local mise run check-artifacts
+```
+
+Expected: the committed source passes the build scripts' target and
+clean-source requirements; the build emits a valid `hyperpixel2r_kms.ko` and
+its `module.readelf.txt`, `module.modinfo.txt`, checksum, and manifest; and
+the artifact check validates that exact bundle. If this proof fails, correct
+the implementation, commit the correction, and rerun the focused verification
+and this immutable artifact proof before review. Task 12 still performs final
+physical-panel acceptance.
 
 ---
 
