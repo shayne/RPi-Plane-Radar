@@ -579,6 +579,37 @@ fn settings_page_renders_labelled_section_navigation_and_associated_actions() {
 }
 
 #[test]
+fn settings_layout_uses_one_sticky_desktop_rail_and_section_local_grids() {
+    let response = TestServer::new(optional_settings_enabled(), Vec::new()).get("/");
+
+    for expected in [
+        "class=\"radar-basics-grid\"",
+        "class=\"switch-grid\"",
+        "class=\"footer-switch-grid\"",
+        "class=\"footer-format-grid\"",
+        ".switch-grid, .footer-switch-grid {",
+        "grid-template-columns: repeat(3, minmax(0, 1fr));",
+    ] {
+        assert!(
+            response.body.contains(expected),
+            "page omitted scalable layout contract {expected:?}"
+        );
+    }
+    for forbidden in [
+        "grid-area: location",
+        "grid-area: manual",
+        "grid-area: preferences",
+        "\"location preferences\"",
+        "\"manual preferences\"",
+    ] {
+        assert!(
+            !response.body.contains(forbidden),
+            "page retained coupled layout contract {forbidden:?}"
+        );
+    }
+}
+
+#[test]
 fn settings_navigation_escapes_saved_location_summary() {
     let mut settings = optional_settings_enabled();
     settings.location.as_mut().unwrap().label = "<script>alert('rail')</script>".to_owned();

@@ -1627,6 +1627,14 @@ input:hover, select:hover {{ border-color: var(--text-muted); }}
   padding: var(--space-xl) 0 0;
 }}
 
+.radar-basics-grid, .switch-grid, .footer-switch-grid, .footer-format-grid {{
+  display: grid;
+  gap: var(--space-lg);
+  min-width: 0;
+}}
+
+.radar-basics-grid {{ gap: var(--space-xl); }}
+
 fieldset {{ display: grid; gap: var(--space-md); min-width: 0; margin: 0; padding: 0; border: 0; }}
 legend {{ margin-bottom: var(--space-md); padding: 0; }}
 fieldset > p {{ margin-top: calc(var(--space-sm) * -1); }}
@@ -1682,6 +1690,7 @@ fieldset > p {{ margin-top: calc(var(--space-sm) * -1); }}
   grid-template-columns: auto minmax(0, 1fr);
   gap: var(--space-md);
   align-items: center;
+  min-width: 0;
   cursor: pointer;
 }}
 
@@ -1712,9 +1721,10 @@ fieldset > p {{ margin-top: calc(var(--space-sm) * -1); }}
 .switch input:checked + .switch-track::after {{ background: var(--accent-ink); transform: translateX(1.2rem); }}
 .switch input:focus-visible + .switch-track {{ outline: 3px solid var(--focus); outline-offset: 3px; }}
 
-.switch-copy {{ display: grid; gap: 0.125rem; }}
+.switch-copy {{ display: grid; gap: 0.125rem; min-width: 0; }}
 .switch-copy strong {{ font-size: 0.875rem; }}
 .switch-copy small {{ color: var(--text-muted); font-size: 0.8125rem; font-weight: 400; line-height: 1.45; }}
+.switch-copy strong, .switch-copy small {{ overflow-wrap: anywhere; }}
 
 .option-groups {{
   display: grid;
@@ -1780,6 +1790,13 @@ fieldset > p {{ margin-top: calc(var(--space-sm) * -1); }}
   .paired-fields {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
   .field--wide {{ grid-column: 1 / -1; }}
   .segmented--range {{ grid-template-columns: repeat(4, minmax(0, 1fr)); }}
+  .switch-grid, .footer-switch-grid {{
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }}
+  .footer-format-grid {{
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }}
+  .footer-format-grid > :last-child {{ grid-column: 1 / -1; }}
 }}
 
 @media (min-width: 64rem) {{
@@ -1812,6 +1829,11 @@ fieldset > p {{ margin-top: calc(var(--space-sm) * -1); }}
   .settings-navigation a small {{ text-align: right; }}
   .button-rail {{ display: block; }}
   .button-content {{ display: none; }}
+  .radar-basics-grid {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
+  .radar-basics-grid > :nth-child(2) {{ grid-column: 1 / -1; }}
+  .switch-grid {{ grid-template-columns: repeat(3, minmax(0, 1fr)); }}
+  .footer-format-grid {{ grid-template-columns: repeat(3, minmax(0, 1fr)); }}
+  .footer-format-grid > :last-child {{ grid-column: auto; }}
 }}
 
 @media (prefers-reduced-motion: reduce) {{
@@ -1874,6 +1896,7 @@ fieldset > p {{ margin-top: calc(var(--space-sm) * -1); }}
 </details>
 <section class="preferences" id="radar-basics" aria-labelledby="preferences-title">
 <h2 id="preferences-title">Radar display</h2>
+<div class="radar-basics-grid">
 <fieldset>
 <legend>Units</legend>
 {units}
@@ -1900,11 +1923,13 @@ Radar text size
 <span class="switch-track" aria-hidden="true"></span>
 <span class="switch-copy"><strong>Show runways</strong><small>Include nearby airport runways on the radar.</small></span>
 </label>
+</div>
 <div class="option-groups">
 <details class="option-group" id="aircraft-labels" data-section="aircraft"{aircraft_open}>
 <summary>Aircraft labels</summary>
 <div class="option-content">
 <p class="disclosure-copy">Route lookups send the flight callsign to ADSBDB. Expanded model lookups send the aircraft identifier. Enabling both may combine them in one request.</p>
+<div class="switch-grid">
 <input type="hidden" name="show_callsign_present" value="true">
 <label class="switch">
 <input type="checkbox" name="show_callsign" value="true"{show_callsign_checked}>
@@ -1924,11 +1949,13 @@ Radar text size
 <span class="switch-copy"><strong>Show expanded aircraft model</strong><small>Use a longer aircraft model name when available.</small></span>
 </label>
 </div>
+</div>
 </details>
 <details class="option-group" id="footer" data-section="footer"{footer_open}>
 <summary>{footer_summary}</summary>
 <div class="option-content">
 <p class="disclosure-copy">Weather fields and radar-local time send the configured radar coordinates to Open-Meteo. When only Zulu time or date is enabled, no weather request is made.</p>
+<div class="footer-switch-grid">
 <input type="hidden" name="footer_show_condition_present" value="true">
 <label class="switch">
 <input type="checkbox" name="footer_show_condition" value="true"{footer_condition_checked}>
@@ -1959,6 +1986,8 @@ Radar text size
 <span class="switch-track" aria-hidden="true"></span>
 <span class="switch-copy"><strong>Date</strong><small>Show the date in the footer.</small></span>
 </label>
+</div>
+<div class="footer-format-grid">
 <fieldset class="compact-fieldset">
 <legend>Temperature unit</legend>
 <div class="segmented segmented--units">
@@ -1980,6 +2009,7 @@ Radar text size
 <label class="segment"><input type="radio" name="clock_format" value="twenty_four"{twenty_four_checked}><span>24-hour</span></label>
 </div>
 </fieldset>
+</div>
 </div>
 </details>
 <details class="option-group" id="traffic-filter" data-section="traffic"{traffic_open}>
