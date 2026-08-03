@@ -19,7 +19,7 @@
 - Reuse the existing OKLCH palette, spacing tokens, system font stack, focus ring, control states, and reduced-motion behavior.
 - Preserve CSRF, host, Origin or Referer, body-size, session, worker-bound, no-store, escaping, and POST-redirect-GET behavior.
 - The fully expanded page must have no cross-column displacement or horizontal document overflow at 1440 by 900, 1024 by 768, 768 by 1024, and 390 by 844.
-- Install the verified local prerelease on `shayne@planeradar.local` through the supported local release-directory application-only path before any release is cut.
+- Install the verified local prerelease on `user@radar.local` through the supported local release-directory application-only path before any release is cut.
 - Use GitButler branch `codex/optional-radar-features`; do not create a worktree or commit generated visual-companion state.
 
 ---
@@ -624,8 +624,8 @@ release.
 Run:
 
 ```bash
-ssh shayne@planeradar.local 'sudo sha256sum /var/lib/planeradar/settings.json; systemctl show planeradar --property=ActiveState,SubState,NRestarts --no-pager'
-mise run status -- shayne@planeradar.local
+ssh user@radar.local 'sudo sha256sum /var/lib/planeradar/settings.json; systemctl show planeradar --property=ActiveState,SubState,NRestarts --no-pager'
+mise run status -- user@radar.local
 ```
 
 Expected: settings hash is recorded, the service is active and running, and
@@ -636,7 +636,7 @@ the currently accepted release is reported.
 Run:
 
 ```bash
-mise run upgrade -- shayne@planeradar.local --release-dir /Users/shayne/code/RPi-Plane-Radar/dist/release
+mise run upgrade -- user@radar.local --release-dir /Users/shayne/code/RPi-Plane-Radar/dist/release
 ```
 
 Expected: the controller accepts the local manifest, recognizes the unchanged
@@ -648,10 +648,10 @@ reboot.
 Run:
 
 ```bash
-mise run status -- shayne@planeradar.local
-mise run doctor -- shayne@planeradar.local
-mise run smoke-pi -- shayne@planeradar.local
-ssh shayne@planeradar.local 'sudo sha256sum /var/lib/planeradar/settings.json; systemctl show planeradar --property=ActiveState,SubState,NRestarts --no-pager; journalctl -u planeradar -n 80 --no-pager'
+mise run status -- user@radar.local
+mise run doctor -- user@radar.local
+mise run smoke-pi -- user@radar.local
+ssh user@radar.local 'sudo sha256sum /var/lib/planeradar/settings.json; systemctl show planeradar --property=ActiveState,SubState,NRestarts --no-pager; journalctl -u planeradar -n 80 --no-pager'
 curl --fail --silent --show-error http://planeradar.local/healthz
 ```
 
@@ -666,13 +666,13 @@ Use the `agent-browser` skill. Resolve the current Pi address without assuming
 the prior DHCP lease:
 
 ```bash
-ssh shayne@planeradar.local 'hostname -I'
+ssh user@radar.local 'hostname -I'
 ```
 
 Save the first address in a task-specific shell variable and open it in Chrome:
 
 ```bash
-planeradar_test_ip="$(ssh shayne@planeradar.local 'hostname -I' | awk '{print $1}')"
+planeradar_test_ip="$(ssh user@radar.local 'hostname -I' | awk '{print $1}')"
 printf '%s\n' "http://${planeradar_test_ip}/"
 ```
 

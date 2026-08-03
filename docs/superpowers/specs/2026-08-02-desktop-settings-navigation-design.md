@@ -247,7 +247,7 @@ than the intended section spacing. The page has no horizontal document
 overflow at any acceptance viewport.
 
 After automated and browser verification, install the resulting local
-prerelease on `shayne@planeradar.local` through the existing supported local
+prerelease on `user@radar.local` through the existing supported local
 release-directory application-only path. Confirm the service, health endpoint,
 mDNS page, settings preservation, and fully expanded desktop layout before any
 release is cut.
