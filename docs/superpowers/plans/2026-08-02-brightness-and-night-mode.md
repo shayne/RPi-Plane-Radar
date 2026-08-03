@@ -24,7 +24,7 @@
 - The display driver boots at 5%, owns GPIO19/PWM/panel ordering, and exposes only `/sys/class/backlight/planeradar-backlight` to the application.
 - Brightness changes ramp for two seconds; entering night dims before red, leaving night restores full color before brightening, and active-night startup never flashes full color.
 - Rust remains `#![forbid(unsafe_code)]`, compatible with Rust 1.97.1, and passes the existing dependency policy.
-- No release tag, push, or public publication is authorized. Physical testing ends with a local prerelease installed on `shayne@planeradar.local` for owner acceptance.
+- No release tag, push, or public publication is authorized. Physical testing ends with a local prerelease installed on `user@radar.local` for owner acceptance.
 
 ---
 
@@ -1290,8 +1290,8 @@ From the driver repository, run:
 
 ```bash
 mise run verify
-HP2R_TARGET=shayne@planeradar.local mise run build-driver
-HP2R_TARGET=shayne@planeradar.local mise run check-artifacts
+HP2R_TARGET=user@radar.local mise run build-driver
+HP2R_TARGET=user@radar.local mise run check-artifacts
 ```
 
 Export the exact driver branch commit into a temporary packaging clone so the
@@ -1323,7 +1323,7 @@ every asset digest before transfer.
 Run:
 
 ```bash
-ssh shayne@planeradar.local 'uname -r; id planeradar; command -v chgrp chmod udevadm; systemctl is-active planeradar; cat /etc/os-release'
+ssh user@radar.local 'uname -r; id planeradar; command -v chgrp chmod udevadm; systemctl is-active planeradar; cat /etc/os-release'
 ```
 
 Expected: supported Raspberry Pi OS/kernel, `planeradar` includes `video`, the
@@ -1336,8 +1336,8 @@ exists before staging.
 Resolve the artifact directory from the host kernel and stage it exactly:
 
 ```bash
-kernel_release="$(ssh shayne@planeradar.local uname -r)"
-HP2R_TARGET=shayne@planeradar.local mise run stage-tryboot -- \
+kernel_release="$(ssh user@radar.local uname -r)"
+HP2R_TARGET=user@radar.local mise run stage-tryboot -- \
   --artifact-dir "/Users/shayne/code/hyperpixel2r-kms/dist/artifacts/$kernel_release"
 ```
 
@@ -1365,7 +1365,7 @@ Use the same rounded mapping as the app and restore the saved level after the
 visual check:
 
 ```bash
-ssh shayne@planeradar.local '
+ssh user@radar.local '
 set -eu
 path=/sys/class/backlight/planeradar-backlight
 max=$(cat "$path/max_brightness")
@@ -1382,9 +1382,9 @@ sudo -u planeradar sh -c "printf %s $saved > $path/brightness"
 Before accepting, exercise the candidate rollback once:
 
 ```bash
-HP2R_TARGET=shayne@planeradar.local mise run rollback-boot
-kernel_release="$(ssh shayne@planeradar.local uname -r)"
-HP2R_TARGET=shayne@planeradar.local mise run stage-tryboot -- \
+HP2R_TARGET=user@radar.local mise run rollback-boot
+kernel_release="$(ssh user@radar.local uname -r)"
+HP2R_TARGET=user@radar.local mise run stage-tryboot -- \
   --artifact-dir "/Users/shayne/code/hyperpixel2r-kms/dist/artifacts/$kernel_release"
 ```
 
@@ -1398,7 +1398,7 @@ check before continuing.
 Commit and accept the restaged tryboot candidate only after Step 5:
 
 ```bash
-HP2R_TARGET=shayne@planeradar.local mise run commit-boot
+HP2R_TARGET=user@radar.local mise run commit-boot
 ```
 
 After the normal-boot reconnect and accepted-state verification, export the exact app
@@ -1414,11 +1414,11 @@ git -C "$app_build_source/repo" checkout --detach "$app_commit"
 (
   cd "$app_build_source/repo"
   mise run build-pi
-  ./scripts/deploy-pi.sh shayne@planeradar.local
+  ./scripts/deploy-pi.sh user@radar.local
 )
 stage="$(cat "$app_build_source/repo/dist/last-stage-path")"
 app_sha="$(awk '{print $1}' "$app_build_source/repo/dist/planeradar.sha256")"
-ssh shayne@planeradar.local "
+ssh user@radar.local "
 set -eu
 candidate=/opt/planeradar/candidates/$app_commit
 dropin=/etc/systemd/system/planeradar.service.d/90-brightness-candidate.conf

@@ -472,7 +472,7 @@ Unit and integration tests cover:
 ### Physical acceptance
 
 Before any public release, stage the brightness-capable driver through the
-existing tryboot workflow on `shayne@planeradar.local`. Verify:
+existing tryboot workflow on `user@radar.local`. Verify:
 
 1. the expected `planeradar-backlight` device and unprivileged write access;
 2. stable, visibly distinct 5%, 30%, and 100% levels without flicker;
