@@ -19,6 +19,7 @@ pub mod render;
 mod route_confidence;
 pub mod runtime;
 pub mod settings;
+pub mod solar;
 pub mod time;
 pub mod touch;
 pub mod weather;
