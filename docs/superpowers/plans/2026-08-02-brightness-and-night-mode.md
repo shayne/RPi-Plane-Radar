@@ -1371,15 +1371,30 @@ systemctl is-active ssh planeradar
 cat /etc/os-release
 sudo test ! -e /var/lib/hyperpixel2r-kms/tryboot-state
 sudo test ! -e /var/lib/hyperpixel2r-kms/rollback-state
+sudo test -f /var/lib/hyperpixel2r-kms/accepted-state
+sudo test ! -e /var/lib/hyperpixel2r-kms/accepted-transition
+sudo test ! -e /var/lib/hyperpixel2r-kms/accepted-transition-prior-config.txt
 "
+prior_receipt="$(ssh user@radar.local \
+  sudo cat /var/lib/hyperpixel2r-kms/accepted-state)"
+receipt_value() {
+  printf '%s\n' "$prior_receipt" |
+    awk -F= -v wanted="$1" '$1 == wanted { print $2 }'
+}
+prior_driver_version="$(receipt_value driver_version)"
+prior_source_revision="$(receipt_value source_revision)"
+prior_kernel_release="$(receipt_value kernel_release)"
+prior_overlay_file="$(receipt_value overlay_file)"
+test "$prior_kernel_release" = 6.18.34+rpt-rpi-v8
 ```
 
 Record the installed package versions, current accepted driver identity,
-normal boot-config digest, accepted receipt, and exact recovery path back to
-6.18.34. Confirm the existing normal boot selection is already the installed
-6.18.39 kernel, the Pi is on stable power, and SSH recovery does not depend on
-the display or touch stack. This is a hard staging checkpoint: if the next
-normal boot release or independent SSH recovery cannot be proven, stop without
+normal boot-config digest, accepted receipt, exact recovery commands that
+select 6.18.34 for a normal boot, and exact forward commands that reselect the
+installed 6.18.39 kernel. Confirm the existing normal boot selection is already
+6.18.39, the Pi is on stable power, and SSH recovery does not depend on the
+display or touch stack. This is a hard staging checkpoint: if either normal
+kernel selection or independent SSH recovery cannot be proven, stop without
 rebooting. Do not invent an exporter flag or weaken signed APT provenance.
 
 Only after that checkpoint, request the already-configured normal reboot, wait
@@ -1428,6 +1443,24 @@ module and overlay to the durable branch commit; and `check-artifacts` proves
 the exact module, applied DT, rule, capability, manifests, and digests. Any
 failure stops the transition before tryboot staging.
 
+Derive every lifecycle identity from that checked internal artifact manifest:
+
+```bash
+artifact_dir="$driver_repo/dist/artifacts/$kernel_release"
+artifact_manifest="$artifact_dir/manifest.txt"
+source "$driver_repo/scripts/common.sh"
+candidate_driver_version="$(hp2r_manifest_value "$artifact_manifest" driver_version)"
+candidate_revision="$(hp2r_manifest_value "$artifact_manifest" source_revision)"
+candidate_release="$(hp2r_manifest_value "$artifact_manifest" kernel_release)"
+candidate_manifest_sha="$(hp2r_sha256 "$artifact_manifest")"
+candidate_module_file="$(hp2r_manifest_value "$artifact_manifest" module_file)"
+candidate_module_sha="$(hp2r_manifest_value "$artifact_manifest" module_sha256)"
+candidate_overlay_file="$(hp2r_manifest_value "$artifact_manifest" overlay_file)"
+candidate_overlay_sha="$(hp2r_manifest_value "$artifact_manifest" overlay_sha256)"
+test "$candidate_revision" = "$driver_commit"
+test "$candidate_release" = "$kernel_release"
+```
+
 Export the exact driver branch commit into a temporary packaging clone so the
 manifest never names the synthetic GitButler workspace commit:
 
@@ -1452,18 +1485,41 @@ every asset digest before transfer.
 
 - [ ] **Step 5: Stage the driver through tryboot**
 
-Resolve the artifact directory from the host kernel and stage it exactly:
+Because the host has an accepted receipt, first publish the exact prepared
+replacement transition. `stage-tryboot` rejects an accepted replacement that
+does not already have this identity-bound journal:
 
 ```bash
 kernel_release="$(ssh user@radar.local uname -r)"
+test "$kernel_release" = "$candidate_release"
+HP2R_TARGET=user@radar.local \
+  "$driver_repo/scripts/accepted-lifecycle.sh" \
+    --action prepare-new \
+    --driver-version "$candidate_driver_version" \
+    --source-revision "$candidate_revision" \
+    --kernel-release "$candidate_release" \
+    --manifest-sha256 "$candidate_manifest_sha" \
+    --module-file "$candidate_module_file" \
+    --module-sha256 "$candidate_module_sha" \
+    --overlay-file "$candidate_overlay_file" \
+    --overlay-sha256 "$candidate_overlay_sha"
 HP2R_TARGET=user@radar.local mise run stage-tryboot -- \
-  --artifact-dir "/Users/shayne/code/hyperpixel2r-kms/dist/artifacts/$kernel_release"
+  --artifact-dir "$artifact_dir"
 ```
 
 Follow the repository's printed
 identity-bound reconnect command. Reboot only through the staged workflow.
-After reconnect, run `verify-boot`, inspect the class device, and do not accept
-until all automated health/provenance checks pass.
+After reconnect, verify the exact candidate before inspecting the class device:
+
+```bash
+HP2R_TARGET=user@radar.local mise run verify-boot -- \
+  --expect-tryboot \
+  --expect-driver-version "$candidate_driver_version" \
+  --expect-overlay-file "$candidate_overlay_file" \
+  --json
+```
+
+Do not continue until every automated health and provenance check passes.
 
 - [ ] **Step 6: Verify sysfs identity, permission, and visible levels**
 
@@ -1501,28 +1557,136 @@ sudo -u planeradar sh -c "printf %s $saved > $path/brightness"
 Before accepting, exercise the candidate rollback once:
 
 ```bash
-HP2R_TARGET=user@radar.local mise run rollback-boot
-kernel_release="$(ssh user@radar.local uname -r)"
-HP2R_TARGET=user@radar.local mise run stage-tryboot -- \
-  --artifact-dir "/Users/shayne/code/hyperpixel2r-kms/dist/artifacts/$kernel_release"
+HP2R_TARGET=user@radar.local \
+  "$driver_repo/scripts/accepted-lifecycle.sh" --action recover
 ```
 
-After each commanded reboot, follow the identity-bound reconnect output. Prove
-the rollback restored the prior module, overlay, boot config, and udev rule;
-then re-stage, re-run `verify-boot`, and repeat the named-device permission
-check before continuing.
+Do not call plain `rollback-boot`: the accepted recovery action owns both the
+tryboot rollback and accepted-transition cleanup. Apply the exact 6.18.34
+normal-boot recovery commands recorded at the Step 3 checkpoint, then perform
+the required normal reboot and verify the prior accepted identity:
+
+```bash
+set +e
+ssh user@radar.local sudo reboot
+reboot_status=$?
+set -e
+case "$reboot_status" in 0|255) ;; *) exit "$reboot_status" ;; esac
+for attempt in {1..90}; do
+  ssh -o BatchMode=yes -o ConnectTimeout=5 user@radar.local true \
+    >/dev/null 2>&1 && break
+  sleep 2
+done
+test "$(ssh user@radar.local uname -r)" = "$prior_kernel_release"
+HP2R_TARGET=user@radar.local mise run verify-boot -- \
+  --expect-normal \
+  --expect-driver-version "$prior_driver_version" \
+  --expect-overlay-file "$prior_overlay_file" \
+  --json
+ssh user@radar.local "
+set -eu
+sudo grep -Fxq 'source_revision=$prior_source_revision' \
+  /var/lib/hyperpixel2r-kms/accepted-state
+sudo test ! -e /var/lib/hyperpixel2r-kms/tryboot-state
+sudo test ! -e /var/lib/hyperpixel2r-kms/rollback-state
+sudo test ! -e /var/lib/hyperpixel2r-kms/accepted-transition
+sudo test ! -e /var/lib/hyperpixel2r-kms/accepted-transition-prior-config.txt
+sudo test ! -e \
+  /usr/lib/hyperpixel2r-kms/$candidate_driver_version/$candidate_revision/$candidate_release
+"
+```
+
+After the prior normal boot and cleanup proof pass, apply the exact 6.18.39
+normal-boot selection already proven in Step 3, reboot normally, reconnect, and
+require `uname -r` to equal `$candidate_release`. The display may again remain
+unavailable until tryboot. Prepare a fresh accepted transition before the
+second stage:
+
+```bash
+set +e
+ssh user@radar.local sudo reboot
+reboot_status=$?
+set -e
+case "$reboot_status" in 0|255) ;; *) exit "$reboot_status" ;; esac
+for attempt in {1..90}; do
+  ssh -o BatchMode=yes -o ConnectTimeout=5 user@radar.local true \
+    >/dev/null 2>&1 && break
+  sleep 2
+done
+test "$(ssh user@radar.local uname -r)" = "$candidate_release"
+HP2R_TARGET=user@radar.local \
+  "$driver_repo/scripts/accepted-lifecycle.sh" \
+    --action prepare-new \
+    --driver-version "$candidate_driver_version" \
+    --source-revision "$candidate_revision" \
+    --kernel-release "$candidate_release" \
+    --manifest-sha256 "$candidate_manifest_sha" \
+    --module-file "$candidate_module_file" \
+    --module-sha256 "$candidate_module_sha" \
+    --overlay-file "$candidate_overlay_file" \
+    --overlay-sha256 "$candidate_overlay_sha"
+HP2R_TARGET=user@radar.local mise run stage-tryboot -- \
+  --artifact-dir "$artifact_dir"
+HP2R_TARGET=user@radar.local mise run verify-boot -- \
+  --expect-tryboot \
+  --expect-driver-version "$candidate_driver_version" \
+  --expect-overlay-file "$candidate_overlay_file" \
+  --json
+```
+
+After each commanded reboot, follow the identity-bound reconnect output.
+Repeat the named-device permission and visible-level check against the restaged
+candidate before continuing.
 
 - [ ] **Step 7: Accept the driver candidate and deploy Plane Radar locally**
 
-Commit and accept the restaged tryboot candidate only after Step 6:
+Promote the restaged tryboot config, then advance the accepted transition to
+`committed`. Neither command performs the required normal reboot:
 
 ```bash
 HP2R_TARGET=user@radar.local mise run commit-boot
+HP2R_TARGET=user@radar.local \
+  "$driver_repo/scripts/accepted-lifecycle.sh" --action mark-committed
+set +e
+ssh user@radar.local sudo reboot
+reboot_status=$?
+set -e
+case "$reboot_status" in 0|255) ;; *) exit "$reboot_status" ;; esac
+for attempt in {1..90}; do
+  ssh -o BatchMode=yes -o ConnectTimeout=5 user@radar.local true \
+    >/dev/null 2>&1 && break
+  sleep 2
+done
+test "$(ssh user@radar.local uname -r)" = "$candidate_release"
+HP2R_TARGET=user@radar.local mise run verify-boot -- \
+  --expect-normal \
+  --expect-driver-version "$candidate_driver_version" \
+  --expect-overlay-file "$candidate_overlay_file" \
+  --json
+HP2R_TARGET=user@radar.local \
+  "$driver_repo/scripts/accepted-lifecycle.sh" --action mark-verified
+HP2R_TARGET=user@radar.local \
+  "$driver_repo/scripts/accepted-lifecycle.sh" --action finalize
+ssh user@radar.local "
+set -eu
+sudo grep -Fxq 'driver_version=$candidate_driver_version' \
+  /var/lib/hyperpixel2r-kms/accepted-state
+sudo grep -Fxq 'source_revision=$candidate_revision' \
+  /var/lib/hyperpixel2r-kms/accepted-state
+sudo grep -Fxq 'kernel_release=$candidate_release' \
+  /var/lib/hyperpixel2r-kms/accepted-state
+sudo test ! -e /var/lib/hyperpixel2r-kms/tryboot-state
+sudo test ! -e /var/lib/hyperpixel2r-kms/rollback-state
+sudo test ! -e /var/lib/hyperpixel2r-kms/accepted-transition
+sudo test ! -e /var/lib/hyperpixel2r-kms/accepted-transition-prior-config.txt
+sudo test ! -e /boot/firmware/tryboot.txt
+"
 ```
 
-After the normal-boot reconnect and accepted-state verification, export the exact app
-branch commit into a temporary build clone so the embedded revision is the
-durable GitButler branch commit rather than the synthetic workspace commit:
+Only after the normal boot is verified and `finalize` rotates the exact accepted
+receipt and retires the transition journal, export the exact app branch commit
+into a temporary build clone so the embedded revision is the durable GitButler
+branch commit rather than the synthetic workspace commit:
 
 ```bash
 app_repo=/Users/shayne/code/RPi-Plane-Radar
