@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::flight_data::{AircraftEnrichment, EnrichmentNeeds};
 
-pub const SETTINGS_SCHEMA_VERSION: u32 = 2;
+pub const SETTINGS_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -74,6 +74,44 @@ impl FooterSettings {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BrightnessSettings {
+    pub day_percent: u8,
+    pub night: NightModeSettings,
+}
+
+impl Default for BrightnessSettings {
+    fn default() -> Self {
+        Self {
+            day_percent: 100,
+            night: NightModeSettings::default(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NightModeSettings {
+    pub enabled: bool,
+    pub brightness_percent: u8,
+    pub start_hour: u8,
+    pub start_minute: u8,
+    pub red_mode: bool,
+}
+
+impl Default for NightModeSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            brightness_percent: 30,
+            start_hour: 20,
+            start_minute: 0,
+            red_mode: false,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RadarSettings {
@@ -89,6 +127,7 @@ pub struct RadarSettings {
     pub minimum_altitude_feet: Option<i32>,
     pub maximum_altitude_feet: Option<i32>,
     pub footer: FooterSettings,
+    pub brightness: BrightnessSettings,
 }
 
 impl Default for RadarSettings {
@@ -106,6 +145,7 @@ impl Default for RadarSettings {
             minimum_altitude_feet: None,
             maximum_altitude_feet: None,
             footer: FooterSettings::default(),
+            brightness: BrightnessSettings::default(),
         }
     }
 }

@@ -1,0 +1,27 @@
+{
+  "schema_version": 2,
+  "location": {
+    "latitude": 40.7128,
+    "longitude": -74.006,
+    "label": "New York, NY"
+  },
+  "units": "mi",
+  "show_runways": true,
+  "range_index": 3,
+  "show_callsign": true,
+  "show_route": true,
+  "show_expanded_model": true,
+  "radar_text_scale_percent": 130,
+  "minimum_altitude_feet": 1000,
+  "maximum_altitude_feet": 45000,
+  "footer": {
+    "show_condition": true,
+    "show_temperature": true,
+    "show_humidity": true,
+    "show_time": true,
+    "show_date": true,
+    "temperature_unit": "fahrenheit",
+    "time_zone": "zulu",
+    "clock_format": "twelve"
+  }
+}

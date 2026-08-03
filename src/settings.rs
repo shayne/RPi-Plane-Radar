@@ -7,7 +7,9 @@ use serde::Deserialize;
 use serde_json::Value;
 use thiserror::Error;
 
-use crate::model::{Location, RadarSettings, SETTINGS_SCHEMA_VERSION, Units};
+use crate::model::{
+    BrightnessSettings, FooterSettings, Location, RadarSettings, SETTINGS_SCHEMA_VERSION, Units,
+};
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -26,7 +28,45 @@ impl From<LegacyRadarSettingsV1> for RadarSettings {
             units: legacy.units,
             show_runways: legacy.show_runways,
             range_index: legacy.range_index,
+            brightness: BrightnessSettings::default(),
             ..RadarSettings::default()
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyRadarSettingsV2 {
+    schema_version: u32,
+    location: Option<Location>,
+    units: Units,
+    show_runways: bool,
+    range_index: u8,
+    show_callsign: bool,
+    show_route: bool,
+    show_expanded_model: bool,
+    radar_text_scale_percent: u8,
+    minimum_altitude_feet: Option<i32>,
+    maximum_altitude_feet: Option<i32>,
+    footer: FooterSettings,
+}
+
+impl From<LegacyRadarSettingsV2> for RadarSettings {
+    fn from(legacy: LegacyRadarSettingsV2) -> Self {
+        Self {
+            schema_version: SETTINGS_SCHEMA_VERSION,
+            location: legacy.location,
+            units: legacy.units,
+            show_runways: legacy.show_runways,
+            range_index: legacy.range_index,
+            show_callsign: legacy.show_callsign,
+            show_route: legacy.show_route,
+            show_expanded_model: legacy.show_expanded_model,
+            radar_text_scale_percent: legacy.radar_text_scale_percent,
+            minimum_altitude_feet: legacy.minimum_altitude_feet,
+            maximum_altitude_feet: legacy.maximum_altitude_feet,
+            footer: legacy.footer,
+            brightness: BrightnessSettings::default(),
         }
     }
 }
@@ -55,6 +95,13 @@ pub fn validate_settings(value: Value) -> Result<RadarSettings, SettingsError> {
         1 => {
             let legacy: LegacyRadarSettingsV1 = serde_json::from_value(value)?;
             if legacy.schema_version != 1 {
+                return Err(SettingsError::Invalid("unsupported schema version"));
+            }
+            legacy.into()
+        }
+        2 => {
+            let legacy: LegacyRadarSettingsV2 = serde_json::from_value(value)?;
+            if legacy.schema_version != 2 {
                 return Err(SettingsError::Invalid("unsupported schema version"));
             }
             legacy.into()
@@ -145,7 +192,29 @@ fn validate_radar_settings(settings: &RadarSettings) -> Result<(), SettingsError
             "minimum altitude must not exceed maximum altitude",
         ));
     }
+    if !valid_percent(settings.brightness.day_percent)
+        || !valid_percent(settings.brightness.night.brightness_percent)
+    {
+        return Err(SettingsError::Invalid(
+            "brightness must be between 5 and 100 percent in 5 percent steps",
+        ));
+    }
+    if settings.brightness.night.start_hour > 23 {
+        return Err(SettingsError::Invalid(
+            "night mode start hour must be between 0 and 23",
+        ));
+    }
+    if settings.brightness.night.start_minute > 59 {
+        return Err(SettingsError::Invalid(
+            "night mode start minute must be between 0 and 59",
+        ));
+    }
     Ok(())
+}
+
+#[allow(clippy::manual_is_multiple_of)]
+fn valid_percent(value: u8) -> bool {
+    (5..=100).contains(&value) && value % 5 == 0
 }
 
 fn validate_location(location: &Location) -> Result<(), SettingsError> {

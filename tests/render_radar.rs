@@ -1263,7 +1263,7 @@ fn invalid_or_unconfigured_settings_return_errors_without_rendering() {
     let snapshot = empty_snapshot(None);
     let mut cases = vec![RadarSettings::default()];
     let mut bad_schema = configured_settings();
-    bad_schema.schema_version = 3;
+    bad_schema.schema_version = 4;
     cases.push(bad_schema);
     let mut bad_range = configured_settings();
     bad_range.range_index = u8::MAX;

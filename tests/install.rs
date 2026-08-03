@@ -402,7 +402,7 @@ fn installer_verifies_then_installs_once_and_is_idempotent() {
 }
 
 #[test]
-fn installer_seeds_version_two_settings() {
+fn installer_seeds_version_three_settings_without_changing_the_ownership_marker_schema() {
     let fixture = Fixture::new("[all]\n");
     let runner = RecordingRunner::for_root(&fixture.root);
 
@@ -414,10 +414,26 @@ fn installer_seeds_version_two_settings() {
         &fs::read(fixture.root.join("var/lib/planeradar/settings.json")).expect("seeded settings"),
     )
     .expect("seeded settings JSON");
+    assert_eq!(seeded["schema_version"], 3);
     assert_eq!(seeded["schema_version"], SETTINGS_SCHEMA_VERSION);
+    assert_eq!(seeded["brightness"]["day_percent"], 100);
+    assert_eq!(seeded["brightness"]["night"]["enabled"], false);
+    assert_eq!(seeded["brightness"]["night"]["brightness_percent"], 30);
+    assert_eq!(seeded["brightness"]["night"]["start_hour"], 20);
+    assert_eq!(seeded["brightness"]["night"]["start_minute"], 0);
+    assert_eq!(seeded["brightness"]["night"]["red_mode"], false);
     assert_eq!(
         validate_settings(seeded).expect("valid seeded settings"),
         RadarSettings::default()
+    );
+    assert_eq!(
+        fs::read(
+            fixture
+                .root
+                .join("var/lib/planeradar-installer/settings-owned-v1")
+        )
+        .expect("settings ownership marker"),
+        b"schema_version=1\npath=/var/lib/planeradar/settings.json\n"
     );
 }
 
@@ -468,7 +484,7 @@ fn installer_preserves_the_versioned_external_driver_overlay_and_requests_no_reb
 }
 
 #[test]
-fn installer_preserves_inline_calibration_and_existing_private_settings() {
+fn installer_upgrade_preserves_inline_calibration_and_existing_private_settings() {
     let source = "[all]\ndtoverlay=vc4-kms-dpi-hyperpixel2r,rotate=180\n";
     let fixture = Fixture::new(source);
     let state = fixture.root.join("var/lib/planeradar");

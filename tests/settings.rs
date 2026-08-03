@@ -2,7 +2,8 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 
 use planeradar::model::{
-    FooterSettings, Location, RadarSettings, SETTINGS_SCHEMA_VERSION, TimeZone, Units,
+    BrightnessSettings, FooterSettings, Location, NightModeSettings, RadarSettings,
+    SETTINGS_SCHEMA_VERSION, TimeZone, Units,
 };
 use planeradar::settings::{SettingsStore, validate_settings};
 use serde_json::{Value, json};
@@ -23,7 +24,7 @@ fn configured_settings() -> RadarSettings {
 
 fn valid_json() -> Value {
     json!({
-        "schema_version": 2,
+        "schema_version": 3,
         "location": {
             "latitude": 40.7128,
             "longitude": -74.0060,
@@ -47,6 +48,16 @@ fn valid_json() -> Value {
             "temperature_unit": "celsius",
             "time_zone": "radar_local",
             "clock_format": "twenty_four"
+        },
+        "brightness": {
+            "day_percent": 100,
+            "night": {
+                "enabled": false,
+                "brightness_percent": 30,
+                "start_hour": 20,
+                "start_minute": 0,
+                "red_mode": false
+            }
         }
     })
 }
@@ -60,6 +71,19 @@ fn assert_compatibility_defaults(settings: &RadarSettings) {
     assert_eq!(settings.minimum_altitude_feet, None);
     assert_eq!(settings.maximum_altitude_feet, None);
     assert_eq!(settings.footer, FooterSettings::default());
+    assert_eq!(
+        settings.brightness,
+        BrightnessSettings {
+            day_percent: 100,
+            night: NightModeSettings {
+                enabled: false,
+                brightness_percent: 30,
+                start_hour: 20,
+                start_minute: 0,
+                red_mode: false,
+            },
+        }
+    );
 }
 
 #[test]
@@ -107,7 +131,7 @@ fn save_writes_deterministic_pretty_json() {
         fs::read_to_string(path).expect("saved JSON"),
         concat!(
             "{\n",
-            "  \"schema_version\": 2,\n",
+            "  \"schema_version\": 3,\n",
             "  \"location\": {\n",
             "    \"latitude\": 40.7128,\n",
             "    \"longitude\": -74.006,\n",
@@ -131,6 +155,16 @@ fn save_writes_deterministic_pretty_json() {
             "    \"temperature_unit\": \"celsius\",\n",
             "    \"time_zone\": \"radar_local\",\n",
             "    \"clock_format\": \"twenty_four\"\n",
+            "  },\n",
+            "  \"brightness\": {\n",
+            "    \"day_percent\": 100,\n",
+            "    \"night\": {\n",
+            "      \"enabled\": false,\n",
+            "      \"brightness_percent\": 30,\n",
+            "      \"start_hour\": 20,\n",
+            "      \"start_minute\": 0,\n",
+            "      \"red_mode\": false\n",
+            "    }\n",
             "  }\n",
             "}\n",
         )
@@ -155,19 +189,63 @@ fn loading_version_one_does_not_write_until_the_next_mutation() {
     let path = directory.path().join("settings.json");
     let legacy = include_bytes!("fixtures/settings/v1.json");
     fs::write(&path, legacy).expect("write v1 fixture");
+    let modified_before = fs::metadata(&path)
+        .expect("v1 metadata before load")
+        .modified()
+        .expect("v1 modification time before load");
     let store = SettingsStore::new(path.clone());
 
     let migrated = store.load().expect("load v1 settings");
 
     assert_eq!(fs::read(&path).expect("unchanged v1 bytes"), legacy);
+    assert_eq!(
+        fs::metadata(&path)
+            .expect("v1 metadata after load")
+            .modified()
+            .expect("v1 modification time after load"),
+        modified_before
+    );
     assert_compatibility_defaults(&migrated);
 
     store.save(&migrated).expect("save migrated settings");
     let persisted_value: Value =
-        serde_json::from_slice(&fs::read(&path).expect("persisted v2 bytes")).expect("v2 JSON");
+        serde_json::from_slice(&fs::read(&path).expect("persisted v3 bytes")).expect("v3 JSON");
     assert_eq!(persisted_value["schema_version"], SETTINGS_SCHEMA_VERSION);
-    let persisted = validate_settings(persisted_value).expect("persisted v2 settings");
+    let persisted = validate_settings(persisted_value).expect("persisted v3 settings");
     assert_compatibility_defaults(&persisted);
+}
+
+#[test]
+fn loading_version_two_migrates_in_memory_without_rewriting_the_file() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let path = directory.path().join("settings.json");
+    let legacy = include_bytes!("fixtures/settings/v2.json");
+    fs::write(&path, legacy).expect("write v2 fixture");
+    let modified_before = fs::metadata(&path)
+        .expect("v2 metadata before load")
+        .modified()
+        .expect("v2 modification time before load");
+    let store = SettingsStore::new(path.clone());
+
+    let migrated = store.load().expect("load v2 settings");
+
+    assert_eq!(migrated.schema_version, 3);
+    assert_eq!(migrated.units, Units::Miles);
+    assert_eq!(migrated.range_index, 3);
+    assert!(migrated.show_route);
+    assert!(migrated.show_expanded_model);
+    assert_eq!(migrated.radar_text_scale_percent, 130);
+    assert_eq!(migrated.minimum_altitude_feet, Some(1000));
+    assert_eq!(migrated.maximum_altitude_feet, Some(45_000));
+    assert_eq!(migrated.brightness, BrightnessSettings::default());
+    assert_eq!(fs::read(&path).expect("unchanged v2 bytes"), legacy);
+    assert_eq!(
+        fs::metadata(&path)
+            .expect("v2 metadata after load")
+            .modified()
+            .expect("v2 modification time after load"),
+        modified_before
+    );
 }
 
 #[test]
@@ -245,14 +323,14 @@ fn validation_rejects_each_invalid_document_shape() {
 }
 
 #[test]
-fn validation_rejects_invalid_v2_display_options_and_schema_versions() {
+fn validation_rejects_invalid_display_options_and_schema_versions() {
     let mut cases = Vec::new();
     for scale in [79, 81, 140] {
         let mut value = valid_json();
         value["radar_text_scale_percent"] = json!(scale);
         cases.push((format!("text scale {scale}"), value));
     }
-    for schema_version in [0, 3] {
+    for schema_version in [0, 4] {
         let mut value = valid_json();
         value["schema_version"] = json!(schema_version);
         cases.push((format!("schema version {schema_version}"), value));
@@ -275,9 +353,69 @@ fn validation_rejects_invalid_v2_display_options_and_schema_versions() {
     unknown_footer_field["footer"]["unexpected"] = json!(true);
     cases.push(("unknown footer field".to_owned(), unknown_footer_field));
 
+    let mut unknown_brightness_field = valid_json();
+    unknown_brightness_field["brightness"]["unexpected"] = json!(true);
+    cases.push((
+        "unknown brightness field".to_owned(),
+        unknown_brightness_field,
+    ));
+
+    let mut unknown_night_field = valid_json();
+    unknown_night_field["brightness"]["night"]["unexpected"] = json!(true);
+    cases.push(("unknown night field".to_owned(), unknown_night_field));
+
     for (name, value) in cases {
         assert!(validate_settings(value).is_err(), "{name} must be rejected");
     }
+}
+
+#[test]
+fn validation_accepts_brightness_percent_boundaries_and_five_percent_steps() {
+    for percent in [5, 10, 95, 100] {
+        let mut day = valid_json();
+        day["brightness"]["day_percent"] = json!(percent);
+        assert!(
+            validate_settings(day).is_ok(),
+            "day brightness {percent} must be accepted"
+        );
+
+        let mut night = valid_json();
+        night["brightness"]["night"]["brightness_percent"] = json!(percent);
+        assert!(
+            validate_settings(night).is_ok(),
+            "night brightness {percent} must be accepted"
+        );
+    }
+}
+
+#[test]
+fn validation_rejects_brightness_outside_bounds_or_five_percent_steps() {
+    for percent in [0, 1, 6, 101] {
+        let mut day = valid_json();
+        day["brightness"]["day_percent"] = json!(percent);
+        assert!(
+            validate_settings(day).is_err(),
+            "day brightness {percent} must be rejected"
+        );
+
+        let mut night = valid_json();
+        night["brightness"]["night"]["brightness_percent"] = json!(percent);
+        assert!(
+            validate_settings(night).is_err(),
+            "night brightness {percent} must be rejected"
+        );
+    }
+}
+
+#[test]
+fn validation_rejects_night_start_outside_civil_time_bounds() {
+    let mut invalid_hour = valid_json();
+    invalid_hour["brightness"]["night"]["start_hour"] = json!(24);
+    assert!(validate_settings(invalid_hour).is_err());
+
+    let mut invalid_minute = valid_json();
+    invalid_minute["brightness"]["night"]["start_minute"] = json!(60);
+    assert!(validate_settings(invalid_minute).is_err());
 }
 
 #[test]
