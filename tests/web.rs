@@ -492,9 +492,9 @@ fn page_exposes_local_settings_without_wifi_or_browser_geolocation() {
         "--surface: oklch(",
         "min-height: 44px",
         ":focus-visible",
-        "@media (min-width: 52rem)",
-        "grid-template-areas:",
-        "align-content: start",
+        "@media (min-width: 64rem)",
+        "grid-template-columns: 13.5rem minmax(0, 1fr);",
+        ".settings-navigation { min-width: 0; overflow-x: auto; }",
         "prefers-reduced-motion: reduce",
     ] {
         assert!(
@@ -532,6 +532,65 @@ fn page_exposes_local_settings_without_wifi_or_browser_geolocation() {
     assert!(!page.contains("wifi"));
     assert!(!page.contains("navigator.geolocation"));
     assert!(!page.contains("getcurrentposition"));
+}
+
+#[test]
+fn settings_page_renders_labelled_section_navigation_and_associated_actions() {
+    let response = TestServer::new(optional_settings_enabled(), Vec::new()).get("/");
+
+    assert_eq!(response.status, 200);
+    assert!(
+        response
+            .body
+            .contains("<nav class=\"settings-navigation\" aria-label=\"Settings sections\">")
+    );
+    for (target, label) in [
+        ("location", "Location"),
+        ("radar-basics", "Radar basics"),
+        ("aircraft-labels", "Aircraft labels"),
+        ("footer", "Footer"),
+        ("traffic-filter", "Traffic filter"),
+    ] {
+        assert!(
+            response.body.contains(&format!("href=\"#{target}\"")),
+            "missing navigation target {target:?}"
+        );
+        assert!(
+            response.body.contains(&format!("id=\"{target}\"")),
+            "missing section id for {label:?}"
+        );
+    }
+    assert!(
+        response
+            .body
+            .contains("<form id=\"settings-form\" class=\"settings-form\"")
+    );
+    assert!(
+        response.body.contains(
+            "class=\"button-primary button-rail\" type=\"submit\" form=\"settings-form\""
+        )
+    );
+    assert!(
+        response
+            .body
+            .contains("class=\"button-primary button-content\" type=\"submit\"")
+    );
+    assert!(!response.body.contains("<script"));
+}
+
+#[test]
+fn settings_navigation_escapes_saved_location_summary() {
+    let mut settings = optional_settings_enabled();
+    settings.location.as_mut().unwrap().label = "<script>alert('rail')</script>".to_owned();
+
+    let response = TestServer::new(settings, Vec::new()).get("/");
+
+    assert!(!response.body.contains("<script>alert"));
+    assert!(
+        response
+            .body
+            .contains("&lt;script&gt;alert(&#39;rail&#39;)&lt;/script&gt;")
+    );
 }
 
 #[test]
@@ -587,10 +646,14 @@ fn optional_settings_page_exposes_semantic_progressive_disclosure_controls() {
     }
     assert!(!response.body.contains("<script"));
     assert!(response.body.contains(".switch {\n  min-height: 44px;"));
-    for section in ["aircraft", "footer", "traffic"] {
+    for (section, id) in [
+        ("aircraft", "aircraft-labels"),
+        ("footer", "footer"),
+        ("traffic", "traffic-filter"),
+    ] {
         assert!(
             response.body.contains(&format!(
-                "<details class=\"option-group\" data-section=\"{section}\""
+                "<details class=\"option-group\" id=\"{id}\" data-section=\"{section}\""
             )),
             "missing {section:?} disclosure"
         );

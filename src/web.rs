@@ -1063,6 +1063,57 @@ fn footer_summary(footer: &FooterSettings) -> String {
     summary
 }
 
+fn render_settings_navigation(settings: &RadarSettings) -> String {
+    let location = settings.location.as_ref().map_or_else(
+        || "Not set".to_owned(),
+        |location| {
+            if location.label.trim().is_empty() {
+                format!("{:.3}, {:.3}", location.latitude, location.longitude)
+            } else {
+                location.label.clone()
+            }
+        },
+    );
+    let aircraft_count = usize::from(settings.show_callsign)
+        + usize::from(settings.show_route)
+        + usize::from(settings.show_expanded_model);
+    let footer_count = [
+        settings.footer.show_condition,
+        settings.footer.show_temperature,
+        settings.footer.show_humidity,
+        settings.footer.show_time,
+        settings.footer.show_date,
+    ]
+    .into_iter()
+    .filter(|enabled| *enabled)
+    .count();
+    let traffic = match (
+        settings.minimum_altitude_feet,
+        settings.maximum_altitude_feet,
+    ) {
+        (None, None) => "All altitudes".to_owned(),
+        (Some(minimum), None) => format!("{minimum}+ ft"),
+        (None, Some(maximum)) => format!("Up to {maximum} ft"),
+        (Some(minimum), Some(maximum)) => format!("{minimum}-{maximum} ft"),
+    };
+    let location = escape_html(&location);
+    let traffic = escape_html(&traffic);
+
+    format!(
+        r##"<nav class="settings-navigation" aria-label="Settings sections">
+<p class="rail-label">Settings</p>
+<ul>
+<li><a href="#location"><span>Location</span><small>{location}</small></a></li>
+<li><a href="#radar-basics"><span>Radar basics</span><small>{}%</small></a></li>
+<li><a href="#aircraft-labels"><span>Aircraft labels</span><small>{aircraft_count} on</small></a></li>
+<li><a href="#footer"><span>Footer</span><small>{footer_count} on</small></a></li>
+<li><a href="#traffic-filter"><span>Traffic filter</span><small>{traffic}</small></a></li>
+</ul>
+</nav>"##,
+        settings.radar_text_scale_percent
+    )
+}
+
 fn render_page(
     settings: &RadarSettings,
     local_url: &str,
@@ -1153,6 +1204,7 @@ fn render_page(
         ""
     };
     let status = render_status(settings);
+    let settings_navigation = render_settings_navigation(settings);
     let notice = render_notice(notice);
     let search_results = render_search_results(settings, &csrf, search);
     let units = render_units(settings);
@@ -1416,16 +1468,58 @@ h3 {{ font-size: 1rem; font-weight: 700; line-height: 1.25; }}
 .notice--success {{ color: var(--accent); background: var(--success-surface); }}
 .notice--success::before {{ content: "✓"; }}
 
-.console-grid {{
+.control-layout {{ display: grid; }}
+
+.control-rail {{
   display: grid;
-  grid-template-areas:
-    "location"
-    "manual"
-    "preferences";
+  gap: var(--space-lg);
+  min-width: 0;
+}}
+
+.settings-content {{
+  width: min(100%, 54rem);
+  min-width: 0;
+  margin: 0 auto;
+}}
+
+.settings-title {{ padding: var(--space-xl) 0 0; }}
+.settings-form {{ display: grid; min-width: 0; }}
+.button-rail {{ display: none; }}
+.button-content {{ display: block; }}
+
+.settings-navigation {{ min-width: 0; overflow-x: auto; }}
+.settings-navigation ul {{
+  display: flex;
+  width: max-content;
+  min-width: 100%;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}}
+.settings-navigation a {{
+  display: grid;
+  min-height: 44px;
+  align-content: center;
+  padding: var(--space-sm) var(--space-md);
+  border-radius: var(--radius-sm);
+  color: var(--text-muted);
+  text-decoration: none;
+}}
+.settings-navigation a span {{ color: inherit; font-size: 0.875rem; font-weight: 700; }}
+.settings-navigation a small {{ color: var(--text-faint); font-size: 0.6875rem; }}
+.rail-label {{
+  color: var(--text-faint);
+  font-size: 0.6875rem;
+  font-weight: 800;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}}
+
+#location, #radar-basics, #aircraft-labels, #footer, #traffic-filter {{
+  scroll-margin-top: var(--space-xl);
 }}
 
 .location {{
-  grid-area: location;
   display: grid;
   gap: var(--space-lg);
   margin: 0;
@@ -1499,10 +1593,7 @@ input:hover, select:hover {{ border-color: var(--text-muted); }}
 
 .empty-results span {{ color: var(--text-muted); font-size: 0.875rem; }}
 
-.settings-form {{ display: contents; }}
-
 .manual {{
-  grid-area: manual;
   align-self: start;
   border-top: 1px solid var(--border);
   border-bottom: 1px solid var(--border);
@@ -1525,10 +1616,8 @@ input:hover, select:hover {{ border-color: var(--text-muted); }}
 .field input, .field select {{ font-variant-numeric: tabular-nums; }}
 
 .preferences {{
-  grid-area: preferences;
   display: grid;
   gap: var(--space-xl);
-  align-content: start;
   margin: 0;
   padding: var(--space-xl) 0 0;
 }}
@@ -1688,25 +1777,36 @@ fieldset > p {{ margin-top: calc(var(--space-sm) * -1); }}
   .segmented--range {{ grid-template-columns: repeat(4, minmax(0, 1fr)); }}
 }}
 
-@media (min-width: 52rem) {{
+@media (min-width: 64rem) {{
   .shell {{ padding-top: var(--space-xl); }}
-  .masthead {{ grid-template-columns: auto minmax(0, 1fr) auto; }}
-  .device-url {{ grid-column: auto; justify-items: end; text-align: right; }}
-  .console-grid {{
-    grid-template-columns: minmax(0, 1.35fr) minmax(18rem, 0.85fr);
-    grid-template-areas:
-      "location preferences"
-      "manual preferences";
-    column-gap: var(--space-2xl);
+  .control-layout {{
+    grid-template-columns: 13.5rem minmax(0, 1fr);
+    gap: var(--space-2xl);
     align-items: start;
   }}
-  .location {{ padding-top: var(--space-2xl); }}
-  .manual {{ margin-bottom: var(--space-2xl); }}
-  .preferences {{
-    min-height: 100%;
-    padding: var(--space-2xl) 0 var(--space-2xl) var(--space-2xl);
-    border-left: 1px solid var(--border);
+  .control-rail {{
+    position: sticky;
+    top: var(--space-xl);
+    max-height: calc(100svh - (var(--space-xl) * 2));
+    overflow-y: auto;
+    padding-right: var(--space-lg);
+    border-right: 1px solid var(--border);
   }}
+  .control-rail .masthead {{
+    grid-template-columns: auto minmax(0, 1fr);
+    gap: var(--space-md);
+    padding-top: 0;
+  }}
+  .control-rail .device-url {{ grid-column: 1 / -1; }}
+  .settings-navigation {{ overflow: visible; }}
+  .settings-navigation ul {{ display: grid; width: auto; }}
+  .settings-navigation a {{
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: var(--space-sm);
+  }}
+  .settings-navigation a small {{ text-align: right; }}
+  .button-rail {{ display: block; }}
+  .button-content {{ display: none; }}
 }}
 
 @media (prefers-reduced-motion: reduce) {{
@@ -1719,6 +1819,8 @@ fieldset > p {{ margin-top: calc(var(--space-sm) * -1); }}
 </head>
 <body>
 <main class="shell">
+<div class="control-layout">
+<aside class="control-rail">
 <header class="masthead">
 <span class="radar-mark" aria-hidden="true"><i></i></span>
 <div class="brand-lockup">
@@ -1728,9 +1830,13 @@ fieldset > p {{ margin-top: calc(var(--space-sm) * -1); }}
 <a class="device-url" href="{local_url}"><span>Device</span>{local_url}</a>
 </header>
 {status}
+{settings_navigation}
+<button class="button-primary button-rail" type="submit" form="settings-form">Apply settings</button>
+</aside>
+<div class="settings-content">
 {notice}
-<div class="console-grid">
-<section class="location" aria-labelledby="location-title">
+<h2 class="settings-title">Settings</h2>
+<section class="location" id="location" aria-labelledby="location-title">
 <h2 id="location-title">Radar location</h2>
 <p>Search for the place this radar should watch.</p>
 <form action="/search" method="post">
@@ -1742,7 +1848,7 @@ fieldset > p {{ margin-top: calc(var(--space-sm) * -1); }}
 <p>Your submitted search text is sent to OpenStreetMap. Search data © OpenStreetMap contributors.</p>
 {search_results}
 </section>
-<form class="settings-form" action="/settings" method="post">
+<form id="settings-form" class="settings-form" action="/settings" method="post">
 <input type="hidden" name="csrf_token" value="{csrf}">
 <details class="manual"{manual_open}>
 <summary>Manual coordinates</summary>
@@ -1761,7 +1867,7 @@ fieldset > p {{ margin-top: calc(var(--space-sm) * -1); }}
 </div>
 </div>
 </details>
-<section class="preferences" aria-labelledby="preferences-title">
+<section class="preferences" id="radar-basics" aria-labelledby="preferences-title">
 <h2 id="preferences-title">Radar display</h2>
 <fieldset>
 <legend>Units</legend>
@@ -1790,7 +1896,7 @@ Radar text size
 <span class="switch-copy"><strong>Show runways</strong><small>Include nearby airport runways on the radar.</small></span>
 </label>
 <div class="option-groups">
-<details class="option-group" data-section="aircraft"{aircraft_open}>
+<details class="option-group" id="aircraft-labels" data-section="aircraft"{aircraft_open}>
 <summary>Aircraft labels</summary>
 <div class="option-content">
 <p class="disclosure-copy">Route lookups send the flight callsign to ADSBDB. Expanded model lookups send the aircraft identifier. Enabling both may combine them in one request.</p>
@@ -1814,7 +1920,7 @@ Radar text size
 </label>
 </div>
 </details>
-<details class="option-group" data-section="footer"{footer_open}>
+<details class="option-group" id="footer" data-section="footer"{footer_open}>
 <summary>{footer_summary}</summary>
 <div class="option-content">
 <p class="disclosure-copy">Weather fields and radar-local time send the configured radar coordinates to Open-Meteo. When only Zulu time or date is enabled, no weather request is made.</p>
@@ -1871,7 +1977,7 @@ Radar text size
 </fieldset>
 </div>
 </details>
-<details class="option-group" data-section="traffic"{traffic_open}>
+<details class="option-group" id="traffic-filter" data-section="traffic"{traffic_open}>
 <summary>Traffic filter</summary>
 <div class="option-content">
 <p class="disclosure-copy">Limit the radar to aircraft within an altitude range. Leave either value blank for no limit.</p>
@@ -1886,9 +1992,10 @@ Radar text size
 </div>
 </details>
 </div>
-<button class="button-primary" type="submit">Apply settings</button>
+<button class="button-primary button-content" type="submit">Apply settings</button>
 </section>
 </form>
+</div>
 </div>
 </main>
 </body>
