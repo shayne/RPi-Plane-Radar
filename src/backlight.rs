@@ -1,7 +1,7 @@
 use std::ffi::OsStr;
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -54,14 +54,13 @@ impl SysfsBacklight {
 
         let max_path = device_root.join(MAX_BRIGHTNESS_ATTRIBUTE);
         let brightness_path = device_root.join(BRIGHTNESS_ATTRIBUTE);
-        validate_attribute(&max_path, false)?;
-        validate_attribute(&brightness_path, true)?;
-
-        let max_level = read_level(&max_path)?;
+        let mut max_brightness = open_attribute(&max_path, false)?;
+        let max_level = read_level(&mut max_brightness)?;
         if max_level == 0 {
             return Err(BacklightError::InvalidValue);
         }
-        let current_level = read_level(&brightness_path)?;
+        let mut brightness = open_attribute(&brightness_path, true)?;
+        let current_level = read_level(&mut brightness)?;
         if current_level > max_level {
             return Err(BacklightError::InvalidValue);
         }
@@ -72,6 +71,25 @@ impl SysfsBacklight {
             last_successful_level: Some(current_level),
         })
     }
+
+    fn write_validated_level<W: Write + ?Sized>(
+        &mut self,
+        writer: &mut W,
+        level: u32,
+    ) -> Result<(), BacklightError> {
+        let payload = format!("{level}\n");
+        let written = writer
+            .write(payload.as_bytes())
+            .map_err(BacklightError::Io)?;
+        if written != payload.len() {
+            return Err(BacklightError::Io(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "incomplete backlight write",
+            )));
+        }
+        self.last_successful_level = Some(level);
+        Ok(())
+    }
 }
 
 impl Backlight for SysfsBacklight {
@@ -80,7 +98,8 @@ impl Backlight for SysfsBacklight {
     }
 
     fn current_level(&mut self) -> Result<u32, BacklightError> {
-        let level = read_level(&self.brightness_path)?;
+        let mut brightness = open_attribute(&self.brightness_path, true)?;
+        let level = read_level(&mut brightness)?;
         if level > self.max_level {
             return Err(BacklightError::InvalidValue);
         }
@@ -100,14 +119,8 @@ impl Backlight for SysfsBacklight {
             return Ok(());
         }
 
-        let mut brightness = OpenOptions::new()
-            .write(true)
-            .truncate(true)
-            .open(&self.brightness_path)
-            .map_err(BacklightError::Io)?;
-        writeln!(brightness, "{level}").map_err(BacklightError::Io)?;
-        self.last_successful_level = Some(level);
-        Ok(())
+        let mut brightness = open_attribute(&self.brightness_path, true)?;
+        self.write_validated_level(&mut brightness, level)
     }
 }
 
@@ -203,7 +216,7 @@ impl BacklightController {
                 && policy.color_mode == FrameColorMode::RedOnly
                 && !first_policy
             {
-                self.red_after_ramp = self.ramp.is_some();
+                self.red_after_ramp = true;
             }
         }
 
@@ -355,8 +368,21 @@ pub fn percent_to_level(percent: u8, max_level: u32) -> u32 {
     u32::try_from(rounded).unwrap_or(u32::MAX)
 }
 
-fn validate_attribute(path: &Path, writable: bool) -> Result<(), BacklightError> {
-    let metadata = fs::symlink_metadata(path).map_err(BacklightError::Io)?;
+fn open_attribute(path: &Path, writable: bool) -> Result<File, BacklightError> {
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .write(writable)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    let file = options.open(path).map_err(|error| {
+        if matches!(error.raw_os_error(), Some(code) if code == libc::ELOOP || code == libc::EISDIR)
+        {
+            BacklightError::InvalidDevice
+        } else {
+            BacklightError::Io(error)
+        }
+    })?;
+    let metadata = file.metadata().map_err(BacklightError::Io)?;
     if !metadata.file_type().is_file() {
         return Err(BacklightError::InvalidDevice);
     }
@@ -364,31 +390,124 @@ fn validate_attribute(path: &Path, writable: bool) -> Result<(), BacklightError>
     if mode & 0o444 == 0 || (writable && mode & 0o222 == 0) {
         return Err(BacklightError::InvalidDevice);
     }
-    if writable {
-        OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(path)
-            .map_err(BacklightError::Io)?;
-    } else {
-        OpenOptions::new()
-            .read(true)
-            .open(path)
-            .map_err(BacklightError::Io)?;
-    }
-    Ok(())
+    Ok(file)
 }
 
-fn read_level(path: &Path) -> Result<u32, BacklightError> {
+fn read_level<R: Read + ?Sized>(reader: &mut R) -> Result<u32, BacklightError> {
     let mut value = String::new();
-    OpenOptions::new()
-        .read(true)
-        .open(path)
-        .map_err(BacklightError::Io)?
+    reader
         .read_to_string(&mut value)
         .map_err(BacklightError::Io)?;
     value
         .trim()
         .parse::<u32>()
         .map_err(|_| BacklightError::InvalidValue)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{self, ErrorKind, Write};
+
+    use super::SysfsBacklight;
+
+    #[test]
+    fn level_payload_is_one_complete_write_and_only_then_updates_the_cache() {
+        let mut backlight = backlight_at(13);
+        let mut writer = RecordingWriter::complete();
+
+        backlight
+            .write_validated_level(&mut writer, 14)
+            .expect("complete single write");
+
+        assert_eq!(writer.calls, 1);
+        assert_eq!(writer.bytes, b"14\n");
+        assert_eq!(backlight.last_successful_level, Some(14));
+    }
+
+    #[test]
+    fn short_level_write_is_not_retried_and_does_not_update_the_cache() {
+        let mut backlight = backlight_at(13);
+        let mut writer = RecordingWriter::short();
+
+        assert!(matches!(
+            backlight.write_validated_level(&mut writer, 14),
+            Err(super::BacklightError::Io(error)) if error.kind() == ErrorKind::WriteZero
+        ));
+        assert_eq!(writer.calls, 1);
+        assert_eq!(writer.bytes, b"14\n");
+        assert_eq!(backlight.last_successful_level, Some(13));
+    }
+
+    #[test]
+    fn failed_level_write_is_not_retried_and_does_not_update_the_cache() {
+        let mut backlight = backlight_at(13);
+        let mut writer = RecordingWriter::error();
+
+        assert!(matches!(
+            backlight.write_validated_level(&mut writer, 14),
+            Err(super::BacklightError::Io(error)) if error.kind() == ErrorKind::PermissionDenied
+        ));
+        assert_eq!(writer.calls, 1);
+        assert_eq!(writer.bytes, b"14\n");
+        assert_eq!(backlight.last_successful_level, Some(13));
+    }
+
+    fn backlight_at(level: u32) -> SysfsBacklight {
+        SysfsBacklight {
+            brightness_path: Default::default(),
+            max_level: 255,
+            last_successful_level: Some(level),
+        }
+    }
+
+    enum WriteResult {
+        Complete,
+        Short,
+        Error,
+    }
+
+    struct RecordingWriter {
+        result: WriteResult,
+        calls: usize,
+        bytes: Vec<u8>,
+    }
+
+    impl RecordingWriter {
+        fn complete() -> Self {
+            Self::with_result(WriteResult::Complete)
+        }
+
+        fn short() -> Self {
+            Self::with_result(WriteResult::Short)
+        }
+
+        fn error() -> Self {
+            Self::with_result(WriteResult::Error)
+        }
+
+        fn with_result(result: WriteResult) -> Self {
+            Self {
+                result,
+                calls: 0,
+                bytes: Vec::new(),
+            }
+        }
+    }
+
+    impl Write for RecordingWriter {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            assert_eq!(self.calls, 0, "level payload must not issue a second write");
+            self.calls += 1;
+            self.bytes.extend_from_slice(buffer);
+            match self.result {
+                WriteResult::Complete => Ok(buffer.len()),
+                WriteResult::Short => Ok(buffer.len().saturating_sub(1)),
+                WriteResult::Error => Err(io::Error::from(ErrorKind::PermissionDenied)),
+            }
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
 }

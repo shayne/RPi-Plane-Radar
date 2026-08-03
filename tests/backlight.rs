@@ -1,9 +1,11 @@
-use std::fs;
-use std::os::unix::fs::{PermissionsExt, symlink};
+use std::fs::{self, OpenOptions};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt, symlink};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use nix::sys::stat::Mode;
+use nix::unistd::mkfifo;
 use planeradar::backlight::{
     Backlight, BacklightController, BacklightError, EffectiveBrightness, NoopBacklight,
     SysfsBacklight, percent_to_level,
@@ -43,6 +45,20 @@ fn opens_only_the_named_regular_readable_and_writable_class_device() {
         let fixture = SysfsFixture::new("255\n", "13\n");
         let path = fixture.device_root.join(attribute);
         fs::set_permissions(&path, fs::Permissions::from_mode(mode)).expect("set permissions");
+        assert!(SysfsBacklight::open(fixture.class_device).is_err());
+    }
+}
+
+#[test]
+fn follows_the_named_class_link_but_rejects_symlinked_attributes() {
+    for attribute in ["max_brightness", "brightness"] {
+        let fixture = SysfsFixture::new("255\n", "13\n");
+        let external = fixture.root.path().join(format!("external-{attribute}"));
+        fs::write(&external, "255\n").expect("external attribute");
+        let attribute_path = fixture.device_root.join(attribute);
+        fs::remove_file(&attribute_path).expect("remove attribute");
+        symlink(external, attribute_path).expect("symlink attribute");
+
         assert!(matches!(
             SysfsBacklight::open(fixture.class_device),
             Err(BacklightError::InvalidDevice)
@@ -51,16 +67,55 @@ fn opens_only_the_named_regular_readable_and_writable_class_device() {
 }
 
 #[test]
-fn follows_the_named_class_link_but_rejects_symlinked_attributes() {
+fn post_discovery_symlink_replacement_is_rejected_without_touching_its_target() {
     let fixture = SysfsFixture::new("255\n", "13\n");
-    let external = fixture.root.path().join("external-max");
-    fs::write(&external, "255\n").expect("external attribute");
-    let max_path = fixture.device_root.join("max_brightness");
-    fs::remove_file(&max_path).expect("remove max");
-    symlink(external, max_path).expect("symlink max");
+    let mut backlight = SysfsBacklight::open(fixture.class_device.clone()).expect("named device");
+    let brightness = fixture.device_root.join("brightness");
+    let target = fixture.root.path().join("read-target");
+    fs::write(&target, "97\n").expect("read target");
+    fs::remove_file(&brightness).expect("remove brightness");
+    symlink(&target, &brightness).expect("replacement symlink");
+    let read_result = backlight.current_level();
+    assert_eq!(
+        (
+            read_result.is_err(),
+            fs::read_to_string(&target).expect("preserved read target")
+        ),
+        (true, "97\n".to_owned())
+    );
+
+    let fixture = SysfsFixture::new("255\n", "13\n");
+    let mut backlight = SysfsBacklight::open(fixture.class_device.clone()).expect("named device");
+    let brightness = fixture.device_root.join("brightness");
+    let target = fixture.root.path().join("write-target");
+    fs::write(&target, "97\n").expect("write target");
+    fs::remove_file(&brightness).expect("remove brightness");
+    symlink(&target, &brightness).expect("replacement symlink");
+    let write_result = backlight.write_level(14);
+    assert_eq!(
+        (
+            write_result.is_err(),
+            fs::read_to_string(&target).expect("preserved write target")
+        ),
+        (true, "97\n".to_owned())
+    );
+}
+
+#[test]
+fn post_discovery_fifo_replacement_is_rejected_without_blocking() {
+    let fixture = SysfsFixture::new("255\n", "13\n");
+    let mut backlight = SysfsBacklight::open(fixture.class_device.clone()).expect("named device");
+    let brightness = fixture.device_root.join("brightness");
+    fs::remove_file(&brightness).expect("remove brightness");
+    mkfifo(&brightness, Mode::from_bits_truncate(0o660)).expect("replacement fifo");
+    let _reader = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(&brightness)
+        .expect("nonblocking fifo reader");
 
     assert!(matches!(
-        SysfsBacklight::open(fixture.class_device),
+        backlight.write_level(14),
         Err(BacklightError::InvalidDevice)
     ));
 }
@@ -167,6 +222,34 @@ fn retargets_from_the_current_interpolated_level() {
         level(&controller.update(&brighten, Duration::from_millis(3000))),
         80
     );
+}
+
+#[test]
+fn red_entry_retargeted_to_its_current_level_switches_red_immediately() {
+    let fake = RecordingBacklight::available(100, 100);
+    let mut controller = BacklightController::new(Box::new(fake));
+    let day = policy(DisplayPeriod::Day, 100, FrameColorMode::FullColor);
+    let dim_night = policy(DisplayPeriod::Night, 20, FrameColorMode::RedOnly);
+    let current_level_night = policy(DisplayPeriod::Night, 60, FrameColorMode::RedOnly);
+
+    assert_eq!(
+        controller.update(&day, Duration::ZERO).color_mode,
+        FrameColorMode::FullColor
+    );
+    assert_eq!(
+        controller.update(&dim_night, Duration::ZERO).color_mode,
+        FrameColorMode::FullColor
+    );
+    let halfway = controller.update(&dim_night, Duration::from_secs(1));
+    assert_eq!(halfway.brightness, Some(brightness(60, 60)));
+    assert_eq!(halfway.color_mode, FrameColorMode::FullColor);
+
+    let retargeted = controller.update(&current_level_night, Duration::from_secs(1));
+    assert_eq!(retargeted.brightness, Some(brightness(60, 60)));
+    assert_eq!(retargeted.color_mode, FrameColorMode::RedOnly);
+    let later = controller.update(&current_level_night, Duration::from_millis(1500));
+    assert_eq!(later.brightness, Some(brightness(60, 60)));
+    assert_eq!(later.color_mode, FrameColorMode::RedOnly);
 }
 
 #[test]
