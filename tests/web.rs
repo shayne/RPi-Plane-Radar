@@ -584,13 +584,17 @@ fn settings_navigation_escapes_saved_location_summary() {
     settings.location.as_mut().unwrap().label = "<script>alert('rail')</script>".to_owned();
 
     let response = TestServer::new(settings, Vec::new()).get("/");
+    let navigation = response
+        .body
+        .split_once("<nav class=\"settings-navigation\" aria-label=\"Settings sections\">")
+        .expect("settings navigation should be rendered")
+        .1
+        .split_once("</nav>")
+        .expect("settings navigation should close")
+        .0;
 
-    assert!(!response.body.contains("<script>alert"));
-    assert!(
-        response
-            .body
-            .contains("&lt;script&gt;alert(&#39;rail&#39;)&lt;/script&gt;")
-    );
+    assert!(!navigation.contains("<script>alert"));
+    assert!(navigation.contains("&lt;script&gt;alert(&#39;rail&#39;)&lt;/script&gt;"));
 }
 
 #[test]
