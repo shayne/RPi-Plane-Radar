@@ -41,6 +41,7 @@ const PUBLISHED_SCHEMA_ONE_MANIFEST: &[u8] =
 fn driver_context_debug_is_structural_without_target_or_identity_secrets() {
     let target = "target-sentinel.example".to_owned();
     let identity = "d".repeat(64);
+    let overlay = "overlay-redaction-sentinel".to_owned();
     let context = DriverContext {
         target: target.clone(),
         running_kernel_release: "6.18.34+rpt-rpi-v8".into(),
@@ -48,7 +49,7 @@ fn driver_context_debug_is_structural_without_target_or_identity_secrets() {
         target_identity_sha256: identity.clone(),
         kernel_export: PathBuf::from("/private/kernel-export"),
         artifacts: PathBuf::from("/private/artifacts"),
-        replace_overlay: "planeradar-hyperpixel2r-eefaf3ae40fd".into(),
+        replace_overlay: overlay.clone(),
     };
 
     let debug = format!("{context:?}");
@@ -58,6 +59,7 @@ fn driver_context_debug_is_structural_without_target_or_identity_secrets() {
     for secret in [
         target.as_str(),
         identity.as_str(),
+        overlay.as_str(),
         "/private/kernel-export",
         "/private/artifacts",
     ] {
