@@ -2232,6 +2232,8 @@ fn typed_actions_invoke_only_the_exact_external_driver_scripts_and_parse_verific
             "--target",
             "pi@raspberrypi.local",
             "--expect-tryboot",
+            "--expect-kernel-release",
+            "6.18.34+rpt-rpi-v8",
             "--expect-driver-version",
             "0.1.0",
             "--expect-overlay-file",
@@ -2239,6 +2241,76 @@ fn typed_actions_invoke_only_the_exact_external_driver_scripts_and_parse_verific
             "--json",
         ]
     );
+}
+
+#[test]
+fn inactive_accepted_driver_protocol_carries_only_candidate_authority() {
+    let runner = RecordingRunner::default();
+    let tool = DriverTool::new(
+        runner.clone(),
+        PathBuf::from("/cache/source"),
+        DriverPlan::CrossBuild {
+            source: PathBuf::from("/cache/source"),
+        },
+        DriverContext {
+            target: "pi@raspberrypi.local".into(),
+            running_kernel_release: "6.18.34+rpt-rpi-v8".into(),
+            candidate_kernel_release: "6.18.35+rpt-rpi-v8".into(),
+            target_identity_sha256: "a".repeat(64),
+            kernel_export: PathBuf::from("/cache/kernel"),
+            artifacts: PathBuf::from("/cache/artifacts"),
+            replace_overlay: "vc4-kms-dpi-hyperpixel2r".into(),
+        },
+        "0.1.0".into(),
+        DRIVER_COMMIT.into(),
+        REQUIRED_CAPABILITY.into(),
+    )
+    .expect("valid inactive driver protocol tool");
+
+    tool.prepare_accepted_protocol(&planeradarctl::driver::DriverPostconditions {
+        driver_version: "0.1.0".into(),
+        source_revision: DRIVER_COMMIT.into(),
+        source_tree: "1".repeat(40),
+        kernel_release: "6.18.35+rpt-rpi-v8".into(),
+        capability: REQUIRED_CAPABILITY.into(),
+        module_vermagic: "6.18.35+rpt-rpi-v8 SMP preempt mod_unload aarch64".into(),
+        manifest_sha256: "2".repeat(64),
+        module_file: "hyperpixel2r_kms.ko".into(),
+        module_sha256: "3".repeat(64),
+        overlay_file: format!("hyperpixel2r-kms-{}.dtbo", &DRIVER_COMMIT[..12]),
+        overlay_sha256: "4".repeat(64),
+        applied_dtb_file: "hyperpixel2r-kms-applied.dtb".into(),
+        applied_dtb_sha256: "5".repeat(64),
+        backlight_rule_file: "70-planeradar-backlight.rules".into(),
+        backlight_rule_sha256: "6".repeat(64),
+        replaced_overlay: "vc4-kms-dpi-hyperpixel2r".into(),
+    })
+    .expect("prepare inactive accepted authority");
+    tool.run(DriverAction::StageTryboot)
+        .expect("stage inactive candidate");
+
+    let invocations = runner.invocations.lock().expect("invocation lock");
+    assert_eq!(invocations.len(), 2);
+    for invocation in invocations.iter() {
+        assert!(
+            invocation
+                .arguments()
+                .windows(2)
+                .any(|pair| pair == ["--kernel-release", "6.18.35+rpt-rpi-v8"])
+        );
+        assert!(
+            invocation
+                .arguments()
+                .windows(2)
+                .any(|pair| pair == ["--target-identity-sha256", "a".repeat(64).as_str()])
+        );
+        assert!(
+            invocation
+                .arguments()
+                .windows(2)
+                .any(|pair| pair == ["--kernel-target", "/cache/kernel"])
+        );
+    }
 }
 
 #[test]
@@ -2336,6 +2408,13 @@ fn accepted_driver_protocol_actions_are_typed_exact_and_bounded() {
             .any(|pair| pair == ["--manifest-sha256", "2".repeat(64).as_str()])
     );
     assert!(
+        !invocations[10]
+            .arguments()
+            .windows(2)
+            .any(|pair| pair[0] == "--kernel-target" || pair[0] == "--target-identity-sha256"),
+        "same-kernel accepted preparation must not carry inactive authority"
+    );
+    assert!(
         tool.run_accepted_protocol(DriverAction::CommitBoot, None)
             .is_err()
     );
@@ -2383,6 +2462,8 @@ fn verify_boot_rejects_json_for_a_different_locked_driver_version() {
             "--target",
             "pi@raspberrypi.local",
             "--expect-tryboot",
+            "--expect-kernel-release",
+            "6.18.34+rpt-rpi-v8",
             "--expect-driver-version",
             "0.1.0",
             "--expect-overlay-file",
@@ -2425,6 +2506,8 @@ fn normal_boot_verification_keeps_the_same_locked_candidate_identity() {
             "--target",
             "pi@raspberrypi.local",
             "--expect-normal",
+            "--expect-kernel-release",
+            "6.18.34+rpt-rpi-v8",
             "--expect-driver-version",
             "0.1.0",
             "--expect-overlay-file",

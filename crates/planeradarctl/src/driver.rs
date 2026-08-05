@@ -1855,6 +1855,15 @@ impl<R: CommandRunner> DriverTool<R> {
             "--backlight-rule-sha256".into(),
             candidate.backlight_rule_sha256.clone(),
         ];
+        let mut arguments = arguments;
+        if candidate.kernel_release != self.context.running_kernel_release {
+            arguments.extend([
+                "--kernel-target".into(),
+                self.context.kernel_export.to_string_lossy().into_owned(),
+                "--target-identity-sha256".into(),
+                self.context.target_identity_sha256.clone(),
+            ]);
+        }
         self.execute(DriverAction::PrepareAccepted, arguments)?;
         Ok(())
     }
@@ -1918,6 +1927,8 @@ impl<R: CommandRunner> DriverTool<R> {
             "--target".into(),
             self.context.target.clone(),
             "--expect-normal".into(),
+            "--expect-kernel-release".into(),
+            self.context.candidate_kernel_release.clone(),
             "--expect-driver-version".into(),
             self.driver_version.clone(),
             "--expect-overlay-file".into(),
@@ -1999,10 +2010,20 @@ impl<R: CommandRunner> DriverTool<R> {
                     self.context.replace_overlay.clone(),
                     "--stage-only".into(),
                 ]);
+                if self.context.candidate_kernel_release != self.context.running_kernel_release {
+                    arguments.extend([
+                        "--kernel-release".into(),
+                        self.context.candidate_kernel_release.clone(),
+                        "--target-identity-sha256".into(),
+                        self.context.target_identity_sha256.clone(),
+                    ]);
+                }
             }
             DriverAction::VerifyBoot => {
                 arguments.extend([
                     "--expect-tryboot".into(),
+                    "--expect-kernel-release".into(),
+                    self.context.candidate_kernel_release.clone(),
                     "--expect-driver-version".into(),
                     self.driver_version.clone(),
                     "--expect-overlay-file".into(),
