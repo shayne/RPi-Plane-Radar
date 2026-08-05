@@ -38,6 +38,34 @@ const PUBLISHED_SCHEMA_ONE_MANIFEST: &[u8] =
     include_bytes!("../../../tests/fixtures/driver/published-0.1.1-driver-manifest.json");
 
 #[test]
+fn driver_context_debug_is_structural_without_target_or_identity_secrets() {
+    let target = "target-sentinel.example".to_owned();
+    let identity = "d".repeat(64);
+    let context = DriverContext {
+        target: target.clone(),
+        running_kernel_release: "6.18.34+rpt-rpi-v8".into(),
+        candidate_kernel_release: "6.18.35+rpt-rpi-v8".into(),
+        target_identity_sha256: identity.clone(),
+        kernel_export: PathBuf::from("/private/kernel-export"),
+        artifacts: PathBuf::from("/private/artifacts"),
+        replace_overlay: "planeradar-hyperpixel2r-eefaf3ae40fd".into(),
+    };
+
+    let debug = format!("{context:?}");
+    assert!(debug.contains("DriverContext"));
+    assert!(debug.contains("running_kernel_release"));
+    assert!(debug.contains("candidate_kernel_release"));
+    for secret in [
+        target.as_str(),
+        identity.as_str(),
+        "/private/kernel-export",
+        "/private/artifacts",
+    ] {
+        assert!(!debug.contains(secret), "context debug leaked {secret}");
+    }
+}
+
+#[test]
 fn target_identity_driver_binding_is_stable_distinguishes_every_input_and_stays_redacted() {
     let identity = TargetIdentity {
         host_key_sha256: "SHA256:target-host-key".into(),
@@ -1101,20 +1129,78 @@ fn inactive_candidate_commands_bind_the_candidate_release_and_target_identity() 
     }
 }
 
+fn write_exact_artifact_fixture(root: &std::path::Path, kernel_release: &str) -> PathBuf {
+    let artifact = root.join(kernel_release);
+    fs::create_dir_all(&artifact).expect("artifact directory");
+    let module = b"running module bytes";
+    let overlay = b"running overlay bytes";
+    let applied = b"running applied DTB bytes";
+    let overlay_name = "hyperpixel2r-kms-ca95ffeb30b3.dtbo";
+    fs::write(artifact.join("hyperpixel2r_kms.ko"), module).expect("module");
+    fs::write(artifact.join(overlay_name), overlay).expect("overlay");
+    fs::write(artifact.join("hyperpixel2r-kms-applied.dtb"), applied).expect("applied DTB");
+    fs::write(artifact.join(BACKLIGHT_RULE_FILE), BACKLIGHT_RULE).expect("backlight rule");
+    fs::write(
+        artifact.join("manifest.txt"),
+        format!(
+            "schema_version\\t2\\ndriver_version\\t0.1.0\\nsource_revision\\t{DRIVER_COMMIT}\\nsource_tree\\t{DRIVER_TREE}\\nkernel_release\\t{kernel_release}\\narchitecture\\taarch64\\nbase_dtb_sha256\\t{}\\ncapability\\t{REQUIRED_CAPABILITY}\\nmodule_file\\thyperpixel2r_kms.ko\\nmodule_sha256\\t{}\\nmodule_vermagic\\t{kernel_release} SMP preempt mod_unload modversions aarch64\\noverlay_file\\t{overlay_name}\\noverlay_sha256\\t{}\\napplied_dtb_file\\thyperpixel2r-kms-applied.dtb\\napplied_dtb_sha256\\t{}\\nbacklight_rule_file\\t{BACKLIGHT_RULE_FILE}\\nbacklight_rule_sha256\\t{}\\n",
+            "a".repeat(64),
+            digest(module),
+            digest(overlay),
+            digest(applied),
+            digest(BACKLIGHT_RULE),
+        )
+        .replace("\\t", "\t")
+        .replace("\\n", "\n"),
+    )
+    .expect("manifest");
+    artifact
+}
+
 #[test]
-fn candidate_context_never_falls_back_to_a_running_release_artifact() {
+fn candidate_context_never_falls_back_to_a_valid_running_release_artifact() {
     let temporary = tempfile::tempdir().expect("candidate artifact fixture");
     let source = temporary.path().join("source");
     let artifacts = temporary.path().join("artifacts");
-    fs::create_dir_all(artifacts.join("6.18.34+rpt-rpi-v8")).expect("running artifact directory");
+    let running = "6.18.34+rpt-rpi-v8";
+    let candidate = "6.18.35+rpt-rpi-v8";
+    write_exact_artifact_fixture(&artifacts, running);
+    let running_tool = DriverTool::new(
+        (),
+        source.clone(),
+        DriverPlan::CrossBuild {
+            source: source.clone(),
+        },
+        DriverContext {
+            target: "pi@raspberrypi.local".into(),
+            running_kernel_release: running.into(),
+            candidate_kernel_release: running.into(),
+            target_identity_sha256: "a".repeat(64),
+            kernel_export: temporary.path().join("kernel"),
+            artifacts: artifacts.clone(),
+            replace_overlay: String::new(),
+        },
+        "0.1.0".into(),
+        DRIVER_COMMIT.into(),
+        REQUIRED_CAPABILITY.into(),
+    )
+    .expect("running tool");
+    assert_eq!(
+        running_tool
+            .postconditions()
+            .expect("valid running artifact")
+            .kernel_release,
+        running
+    );
+
     let tool = DriverTool::new(
         (),
         source.clone(),
         DriverPlan::CrossBuild { source },
         DriverContext {
             target: "pi@raspberrypi.local".into(),
-            running_kernel_release: "6.18.34+rpt-rpi-v8".into(),
-            candidate_kernel_release: "6.18.35+rpt-rpi-v8".into(),
+            running_kernel_release: running.into(),
+            candidate_kernel_release: candidate.into(),
             target_identity_sha256: "a".repeat(64),
             kernel_export: temporary.path().join("kernel"),
             artifacts,

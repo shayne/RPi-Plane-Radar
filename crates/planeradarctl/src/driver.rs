@@ -1526,7 +1526,7 @@ pub enum DriverAction {
     Uninstall,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct DriverContext {
     pub target: String,
     pub running_kernel_release: String,
@@ -1535,6 +1535,21 @@ pub struct DriverContext {
     pub kernel_export: PathBuf,
     pub artifacts: PathBuf,
     pub replace_overlay: String,
+}
+
+impl fmt::Debug for DriverContext {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DriverContext")
+            .field("target", &"<redacted>")
+            .field("running_kernel_release", &self.running_kernel_release)
+            .field("candidate_kernel_release", &self.candidate_kernel_release)
+            .field("target_identity_sha256", &"<redacted>")
+            .field("kernel_export", &"<redacted>")
+            .field("artifacts", &"<redacted>")
+            .field("replace_overlay", &"<redacted>")
+            .finish()
+    }
 }
 
 pub struct DriverTool<R> {
