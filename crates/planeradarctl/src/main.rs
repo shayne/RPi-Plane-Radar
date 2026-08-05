@@ -1054,8 +1054,11 @@ impl<R: TransportCommandRunner, C: Clock> SystemLifecycleBackend<R, C> {
         let facts = TargetPreflight::new(&self.transport, SystemUnixClock)
             .facts(&self.target())
             .map_err(|_| LifecycleError::Backend)?;
-        let probe = DriverTargetProbe::new(facts.kernel_release.clone(), facts.kernel_vermagic)
-            .map_err(|_| LifecycleError::Backend)?;
+        let probe = DriverTargetProbe::new(
+            facts.candidate_kernel_release.clone(),
+            facts.candidate_kernel_vermagic.clone(),
+        )
+        .map_err(|_| LifecycleError::Backend)?;
         let synced = DriverManager::new(
             GhDriverReleaseSource::system(),
             GhDriverReleaseVerifier::system(),
@@ -1069,11 +1072,13 @@ impl<R: TransportCommandRunner, C: Clock> SystemLifecycleBackend<R, C> {
                 &probe,
                 DriverContext {
                     target: self.target().ssh_destination(),
-                    kernel_release: facts.kernel_release.clone(),
+                    running_kernel_release: facts.kernel_release.clone(),
+                    candidate_kernel_release: facts.candidate_kernel_release.clone(),
+                    target_identity_sha256: self.expected_identity.driver_binding_sha256(),
                     kernel_export: self
                         .cache_root
                         .join("kernel-export")
-                        .join(&facts.kernel_release),
+                        .join(&facts.candidate_kernel_release),
                     artifacts: self.cache_root.join("driver-artifacts"),
                     replace_overlay: facts.replace_overlay.clone(),
                 },
@@ -1090,8 +1095,11 @@ impl<R: TransportCommandRunner, C: Clock> SystemLifecycleBackend<R, C> {
         let facts = TargetPreflight::new(&self.transport, SystemUnixClock)
             .facts(&self.target())
             .map_err(|_| LifecycleError::Backend)?;
-        let probe = DriverTargetProbe::new(facts.kernel_release.clone(), facts.kernel_vermagic)
-            .map_err(|_| LifecycleError::Backend)?;
+        let probe = DriverTargetProbe::new(
+            facts.candidate_kernel_release.clone(),
+            facts.candidate_kernel_vermagic.clone(),
+        )
+        .map_err(|_| LifecycleError::Backend)?;
         let synced = DriverManager::new(
             GhDriverReleaseSource::system(),
             GhDriverReleaseVerifier::system(),
@@ -1105,11 +1113,13 @@ impl<R: TransportCommandRunner, C: Clock> SystemLifecycleBackend<R, C> {
                 &probe,
                 DriverContext {
                     target: self.target().ssh_destination(),
-                    kernel_release: facts.kernel_release.clone(),
+                    running_kernel_release: facts.kernel_release.clone(),
+                    candidate_kernel_release: facts.candidate_kernel_release.clone(),
+                    target_identity_sha256: self.expected_identity.driver_binding_sha256(),
                     kernel_export: self
                         .cache_root
                         .join("kernel-export")
-                        .join(&facts.kernel_release),
+                        .join(&facts.candidate_kernel_release),
                     artifacts: self.cache_root.join("driver-artifacts"),
                     replace_overlay: facts.replace_overlay.clone(),
                 },

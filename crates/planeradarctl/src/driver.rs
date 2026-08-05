@@ -550,7 +550,7 @@ impl SyncedDriver {
         probe: &TargetProbe,
         context: DriverContext,
     ) -> Result<DriverTool<R>, DriverError> {
-        if context.kernel_release != probe.kernel_release {
+        if context.candidate_kernel_release != probe.kernel_release {
             return Err(DriverError::InvalidContext);
         }
         DriverTool::new(
@@ -1529,7 +1529,9 @@ pub enum DriverAction {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DriverContext {
     pub target: String,
-    pub kernel_release: String,
+    pub running_kernel_release: String,
+    pub candidate_kernel_release: String,
+    pub target_identity_sha256: String,
     pub kernel_export: PathBuf,
     pub artifacts: PathBuf,
     pub replace_overlay: String,
@@ -1602,7 +1604,11 @@ impl<R> DriverTool<R> {
                 }
             }
         }
-        validate_kernel_release(&context.kernel_release)?;
+        validate_kernel_release(&context.running_kernel_release)?;
+        validate_kernel_release(&context.candidate_kernel_release)?;
+        if !is_lower_hex(&context.target_identity_sha256, 64) {
+            return Err(DriverError::InvalidContext);
+        }
         let expected_overlay_file = format!("hyperpixel2r-kms-{}.dtbo", &source_revision[..12]);
         Ok(Self {
             runner,
@@ -1625,7 +1631,7 @@ impl<R> DriverTool<R> {
     }
 
     pub fn kernel_release(&self) -> &str {
-        &self.context.kernel_release
+        &self.context.candidate_kernel_release
     }
 
     pub fn expected_overlay_file(&self) -> &str {
@@ -1643,12 +1649,19 @@ impl<R> DriverTool<R> {
     pub fn postconditions(&self) -> Result<DriverPostconditions, DriverError> {
         let artifact_dir = match &self.plan {
             DriverPlan::Prebuilt { archive } => archive.clone(),
-            DriverPlan::CrossBuild { .. } => {
-                self.context.artifacts.join(&self.context.kernel_release)
-            }
+            DriverPlan::CrossBuild { .. } => self
+                .context
+                .artifacts
+                .join(&self.context.candidate_kernel_release),
         };
         let manifest_path = artifact_dir.join("manifest.txt");
-        let metadata = fs::symlink_metadata(&manifest_path).map_err(DriverError::Io)?;
+        let metadata = fs::symlink_metadata(&manifest_path).map_err(|error| {
+            if error.kind() == io::ErrorKind::NotFound {
+                DriverError::InvalidPrebuiltIdentity
+            } else {
+                DriverError::Io(error)
+            }
+        })?;
         if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
             return Err(DriverError::InvalidPrebuiltIdentity);
         }
@@ -1675,7 +1688,7 @@ impl<R> DriverTool<R> {
         };
         if result.driver_version != self.driver_version
             || result.source_revision != self.source_revision
-            || result.kernel_release != self.context.kernel_release
+            || result.kernel_release != self.context.candidate_kernel_release
             || result.capability != self.required_capability
             || result.overlay_file != self.expected_overlay_file
             || validate_vermagic(&result.module_vermagic, &result.kernel_release).is_err()
@@ -1772,7 +1785,7 @@ impl<R: CommandRunner> DriverTool<R> {
                 "--source-revision".into(),
                 revision.to_owned(),
                 "--kernel-release".into(),
-                self.context.kernel_release.clone(),
+                self.context.candidate_kernel_release.clone(),
             ]);
         }
         self.execute(action, arguments)?;
@@ -1783,7 +1796,7 @@ impl<R: CommandRunner> DriverTool<R> {
         &self,
         candidate: &DriverPostconditions,
     ) -> Result<(), DriverError> {
-        if candidate.kernel_release != self.context.kernel_release
+        if candidate.kernel_release != self.context.candidate_kernel_release
             || candidate.module_file != "hyperpixel2r_kms.ko"
             || !is_lower_hex(&candidate.source_revision, 40)
             || !is_lower_hex(&candidate.manifest_sha256, 64)
@@ -1931,6 +1944,10 @@ impl<R: CommandRunner> DriverTool<R> {
         match action {
             DriverAction::ExportKernel => {
                 arguments.extend([
+                    "--kernel-release".into(),
+                    self.context.candidate_kernel_release.clone(),
+                    "--target-identity-sha256".into(),
+                    self.context.target_identity_sha256.clone(),
                     "--output".into(),
                     self.context.kernel_export.to_string_lossy().into_owned(),
                 ]);
@@ -1938,7 +1955,9 @@ impl<R: CommandRunner> DriverTool<R> {
             DriverAction::Build => {
                 arguments.extend([
                     "--kernel-release".into(),
-                    self.context.kernel_release.clone(),
+                    self.context.candidate_kernel_release.clone(),
+                    "--target-identity-sha256".into(),
+                    self.context.target_identity_sha256.clone(),
                     "--kernel-target".into(),
                     self.context.kernel_export.to_string_lossy().into_owned(),
                     "--source-revision".into(),
@@ -1955,7 +1974,7 @@ impl<R: CommandRunner> DriverTool<R> {
                         DriverPlan::CrossBuild { .. } => self
                             .context
                             .artifacts
-                            .join(&self.context.kernel_release)
+                            .join(&self.context.candidate_kernel_release)
                             .to_string_lossy()
                             .into_owned(),
                     },
@@ -2016,7 +2035,7 @@ impl<R: CommandRunner> DriverTool<R> {
                         "--source-revision".into(),
                         self.source_revision.clone(),
                         "--kernel-release".into(),
-                        self.context.kernel_release.clone(),
+                        self.context.candidate_kernel_release.clone(),
                     ]);
                 }
             }
@@ -2032,7 +2051,7 @@ impl<R: CommandRunner> DriverTool<R> {
     fn parse_verification(&self, output: &[u8]) -> Result<DriverVerification, DriverError> {
         let verification: DriverVerification =
             serde_json::from_slice(output).map_err(|_| DriverError::InvalidVerification)?;
-        verification.validate(&self.context.kernel_release, &self.driver_version)?;
+        verification.validate(&self.context.candidate_kernel_release, &self.driver_version)?;
         Ok(verification)
     }
 

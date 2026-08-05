@@ -32,16 +32,15 @@ pub const TARGET_FACTS_SCRIPT: &str = concat!(
     r#"repository_uri=$(apt-get indextargets --format '$(URI)' | head -n 1); repository_probe="${repository_uri}.xz"; repository_scheme=${repository_uri%%://*}; case "$repository_scheme" in http|https) repository_scheme_valid=true;; *) repository_scheme_valid=false;; esac; package_repository_reachable=$(if test "$repository_scheme_valid" = true && timeout 15 curl --fail --location --silent --show-error --range 0-0 --output /dev/null "$repository_probe"; then printf true; else printf false; fi); "#,
     r#"port_80_listeners=$(ss -H -ltnp 'sport = :80'); port_80_free=true; if test -n "$port_80_listeners"; then port_80_free=false; port_80_listener_count=$(printf '%s\n' "$port_80_listeners" | grep -c . || true); port_80_pid_count=$(printf '%s\n' "$port_80_listeners" | grep -o 'pid=[0-9][0-9]*' | grep -c . || true); port_80_listener_pid=$(printf '%s\n' "$port_80_listeners" | sed -n 's/.*pid=\([0-9][0-9]*\).*/\1/p'); service_main_pid=$(systemctl show --property=MainPID --value planeradar.service); service_fragment=$(systemctl show --property=FragmentPath --value planeradar.service); service_executable=; case "$service_main_pid" in ''|0|*[!0-9]*) ;; *) service_executable=$(readlink -f -- /proc/"$service_main_pid"/exe 2>/dev/null || true);; esac; if test "$port_80_listener_count" = 1 && test "$port_80_pid_count" = 1 && test "$port_80_listener_pid" = "$service_main_pid" && systemctl is-active --quiet planeradar.service && test "$service_fragment" = /etc/systemd/system/planeradar.service && test "$service_executable" = /opt/planeradar/bin/planeradar && test ! -L "$service_executable" && test -f "$service_executable" && test -x "$service_executable" && test "$(stat -c '%U:%G:%a:%h' "$service_executable")" = root:root:755:1; then port_80_free=true; fi; fi; root_available_bytes=$(df -B1 --output=avail / | tail -n 1 | tr -d ' '); boot_available_bytes=$(df -B1 --output=avail /boot/firmware | tail -n 1 | tr -d ' '); "#,
     r#"running_headers_release=; if test -r "/lib/modules/$kernel_release/build/include/config/kernel.release"; then running_headers_release=$(tr -d '\r\n' <"/lib/modules/$kernel_release/build/include/config/kernel.release"); fi; running_headers_available=$(bool test "$running_headers_release" = "$kernel_release"); "#,
-    r#"kernel8_image=/boot/firmware/kernel8.img; boot_selected_kernel_match_count=0; boot_selected_kernel_release=; if test ! -L "$kernel8_image" && test -f "$kernel8_image" && test "$(stat -c '%U:%G' "$kernel8_image")" = root:root; then kernel8_sha=$(sha256sum -- "$kernel8_image" | awk '{print $1}'); for candidate_image in /boot/vmlinuz-*; do test ! -L "$candidate_image" && test -f "$candidate_image" || continue; test "$(stat -c '%U:%G' "$candidate_image")" = root:root || continue; candidate_release=${candidate_image#/boot/vmlinuz-}; case "$candidate_release" in ''|*[!A-Za-z0-9._+-]*) continue;; esac; test "$(sha256sum -- "$candidate_image" | awk '{print $1}')" = "$kernel8_sha" || continue; boot_selected_kernel_match_count=$((boot_selected_kernel_match_count + 1)); boot_selected_kernel_release=$candidate_release; done; fi; "#,
-    r#"installed_kernel_header_pair_count=0; installed_kernel_release=; installed_headers_release=; for module_dir in /lib/modules/*; do test -d "$module_dir" || continue; candidate=${module_dir##*/}; candidate_headers=; if test -r "$module_dir/build/include/config/kernel.release"; then candidate_headers=$(tr -d '\r\n' <"$module_dir/build/include/config/kernel.release"); fi; if test "$candidate" = "$candidate_headers" && test "$candidate" = "$boot_selected_kernel_release"; then installed_kernel_header_pair_count=$((installed_kernel_header_pair_count + 1)); installed_kernel_release=$candidate; installed_headers_release=$candidate_headers; fi; done; "#,
+    r#"candidate_kernel_match_count=0; candidate_kernel_release=$kernel_release; candidate_kernel_vermagic=$kernel_vermagic; candidate_vmlinuz=$(readlink -f -- /boot/vmlinuz 2>/dev/null || true); candidate_initrd=$(readlink -f -- /boot/initrd.img 2>/dev/null || true); candidate_vmlinuz_release=; candidate_initrd_release=; case "$candidate_vmlinuz" in /boot/vmlinuz-*) candidate_vmlinuz_release=${candidate_vmlinuz#/boot/vmlinuz-};; esac; case "$candidate_initrd" in /boot/initrd.img-*) candidate_initrd_release=${candidate_initrd#/boot/initrd.img-};; esac; for candidate_release in "$candidate_vmlinuz_release" "$candidate_initrd_release"; do case "$candidate_release" in ''|*[!A-Za-z0-9._+-]*) ;; *) candidate_kernel_match_count=$((candidate_kernel_match_count + 1));; esac; done; if test "$candidate_kernel_match_count" = 2 && test "$candidate_vmlinuz_release" = "$candidate_initrd_release" && test ! -L "$candidate_vmlinuz" && test -f "$candidate_vmlinuz" && test "$(stat -c '%U:%G' "$candidate_vmlinuz")" = root:root && test ! -L "$candidate_initrd" && test -f "$candidate_initrd" && test "$(stat -c '%U:%G' "$candidate_initrd")" = root:root && test "$candidate_vmlinuz" = "/boot/vmlinuz-$candidate_vmlinuz_release" && test "$candidate_initrd" = "/boot/initrd.img-$candidate_vmlinuz_release"; then candidate_kernel_match_count=1; candidate_kernel_release=$candidate_vmlinuz_release; candidate_headers_release=; if test -r "/lib/modules/$candidate_kernel_release/build/include/config/kernel.release"; then candidate_headers_release=$(tr -d '\r\n' <"/lib/modules/$candidate_kernel_release/build/include/config/kernel.release"); fi; if test "$candidate_headers_release" = "$candidate_kernel_release"; then candidate_kernel_vermagic=$(/usr/sbin/modinfo -k "$candidate_kernel_release" -F vermagic vc4 2>/dev/null || true); else candidate_kernel_vermagic=; fi; elif test "$candidate_kernel_match_count" = 0; then :; else candidate_kernel_release=; candidate_kernel_vermagic=; fi; installed_kernel_header_pair_count=$candidate_kernel_match_count; installed_kernel_release=$candidate_kernel_release; installed_headers_release=$candidate_kernel_release; boot_selected_kernel_match_count=$candidate_kernel_match_count; boot_selected_kernel_release=$candidate_kernel_release; "#,
     r#"boot_kernel_override_conflicting=$(if awk '{ line=$0; sub(/^[[:space:]]+/, "", line); if (line == "" || line ~ /^#/) next; split(line, pieces, "="); key=pieces[1]; gsub(/[[:space:]]/, "", key); if (key != "kernel") next; sub(/^[^=]*=/, "", line); sub(/^[[:space:]]+/, "", line); sub(/[[:space:]]+$/, "", line); if (line != "kernel8.img") exit 1 }' "$boot_config"; then printf false; else printf true; fi); "#,
     r#"overlay_lines=$(awk '{ line=$0; sub(/^[[:space:]]+/, "", line); sub(/[[:space:]]+$/, "", line); if (line ~ /^dtoverlay=/) print line }' "$boot_config"); external_hyperpixel_overlay_count=$(printf '%s\n' "$overlay_lines" | grep -Ec '^dtoverlay=hyperpixel2r-kms-[0-9a-f]{12}\.dtbo$' || true); hyperpixel_declaration_count=$(printf '%s\n' "$overlay_lines" | grep -Ec '^dtoverlay=(vc4-kms-dpi-hyperpixel2r|planeradar-hyperpixel2r-[0-9a-f]{12}|hyperpixel2r-kms-[0-9a-f]{12}\.dtbo)$' || true); replace_overlay=; if test "$hyperpixel_declaration_count" = 1; then replace_overlay=$(printf '%s\n' "$overlay_lines" | awk -F= '$0 ~ /^dtoverlay=(vc4-kms-dpi-hyperpixel2r|planeradar-hyperpixel2r-[0-9a-f]{12}|hyperpixel2r-kms-[0-9a-f]{12}\.dtbo)$/ { print $2 }'); fi; conflicting_overlay_lines=$(printf '%s\n' "$overlay_lines" | grep -E '^dtoverlay=(.*hyperpixel.*|vc4-kms-dpi.*|dpi[0-9].*)$' || true); unsafe_overlay_present=$(if printf '%s\n' "$conflicting_overlay_lines" | grep -Ev '^(|dtoverlay=vc4-kms-dpi-hyperpixel2r|dtoverlay=planeradar-hyperpixel2r-[0-9a-f]{12}|dtoverlay=hyperpixel2r-kms-[0-9a-f]{12}\.dtbo)$' | grep -q . || test "$hyperpixel_declaration_count" -gt 1; then printf true; else printf false; fi); "#,
     r#"hyperpixel_state_dir=/var/lib/hyperpixel2r-kms; hyperpixel_state_dir_safe=$(if test -L "$hyperpixel_state_dir"; then printf false; elif test -e "$hyperpixel_state_dir"; then if test ! -d "$hyperpixel_state_dir" || test "$(stat -c '%a:%U:%G' "$hyperpixel_state_dir")" != 755:root:root; then printf false; else printf true; fi; else printf true; fi); hyperpixel_transaction_active=false; if test "$hyperpixel_state_dir_safe" = false; then hyperpixel_transaction_active=true; elif test -L /var/lib/hyperpixel2r-kms/tryboot-state || test -e /var/lib/hyperpixel2r-kms/tryboot-state; then hyperpixel_transaction_active=true; else for transaction_path in /var/lib/hyperpixel2r-kms/.tryboot-state-hold.* /var/lib/hyperpixel2r-kms/.hp2r-transaction.*; do if test -L "$transaction_path" || test -e "$transaction_path"; then hyperpixel_transaction_active=true; break; fi; done; fi; legacy_checkpoint_active=$(bool systemctl is-active --quiet planeradar-hyperpixel-checkpoint.service); "#,
     r#"external_hyperpixel_module_count=$(awk '$1 == "hyperpixel2r_kms" { count++ } END { print count + 0 }' /proc/modules); external_hyperpixel_module_loaded=$(if test "$external_hyperpixel_module_count" = 1; then printf true; else printf false; fi); unexpected_hyperpixel_module_loaded=$(if awk '$1 ~ /hyperpixel/ && $1 != "hyperpixel2r_kms" { found=1 } END { exit !found }' /proc/modules; then printf true; else printf false; fi); "#,
     r#"external_hyperpixel_binding_count=0; generic_driver=/sys/bus/platform/drivers/hyperpixel2r-kms; if test ! -L "$generic_driver" && test -d "$generic_driver"; then for binding in "$generic_driver"/*; do test -L "$binding" || continue; resolved_binding=$(readlink -f -- "$binding") || continue; case "$resolved_binding" in /sys/devices/platform/*) ;; *) continue;; esac; compatible="$resolved_binding/of_node/compatible"; test ! -L "$compatible" && test -f "$compatible" || continue; if tr '\000' '\n' <"$compatible" | grep -Fxq shayne,hyperpixel2r-kms; then external_hyperpixel_binding_count=$((external_hyperpixel_binding_count + 1)); fi; done; fi; "#,
     r#"gpio_display_state_safe=$(if test "$hyperpixel_transaction_active" = false && test "$legacy_checkpoint_active" = false && test "$unexpected_hyperpixel_module_loaded" = false && { { test "$external_hyperpixel_overlay_count" = 0 && test "$external_hyperpixel_module_loaded" = false && test "$external_hyperpixel_binding_count" = 0; } || { test "$external_hyperpixel_overlay_count" = 1 && test "$external_hyperpixel_module_loaded" = true && test "$external_hyperpixel_binding_count" = 1; }; }; then printf true; else printf false; fi); "#,
-    r#"printf '{"model":"%s","os_id":"%s","os_version":"%s","architecture":"%s","kernel_release":"%s","kernel_vermagic":"%s","default_target":"%s","display_manager_active":%s,"boot_config":"%s","boot_config_regular":%s,"tryboot_supported":%s,"clock_synchronized":%s,"system_time_unix":%s,"package_repository_reachable":%s,"port_80_free":%s,"root_available_bytes":%s,"boot_available_bytes":%s,"running_headers_available":%s,"running_headers_release":"%s","installed_kernel_header_pair_count":%s,"installed_kernel_release":"%s","installed_headers_release":"%s","boot_selected_kernel_match_count":%s,"boot_selected_kernel_release":"%s","boot_kernel_override_conflicting":%s,"unsafe_overlay_present":%s,"hyperpixel_declaration_count":%s,"replace_overlay":"%s","external_hyperpixel_overlay_count":%s,"external_hyperpixel_module_loaded":%s,"unexpected_hyperpixel_module_loaded":%s,"hyperpixel_state_dir_safe":%s,"hyperpixel_transaction_active":%s,"legacy_checkpoint_active":%s,"external_hyperpixel_binding_count":%s,"gpio_display_state_safe":%s}' "#,
-    r#""$model" "$os_id" "$os_version" "$architecture" "$kernel_release" "$kernel_vermagic" "$default_target" "$display_manager_active" "$boot_config" "$boot_config_regular" "$tryboot_supported" "$clock_synchronized" "$system_time_unix" "$package_repository_reachable" "$port_80_free" "$root_available_bytes" "$boot_available_bytes" "$running_headers_available" "$running_headers_release" "$installed_kernel_header_pair_count" "$installed_kernel_release" "$installed_headers_release" "$boot_selected_kernel_match_count" "$boot_selected_kernel_release" "$boot_kernel_override_conflicting" "$unsafe_overlay_present" "$hyperpixel_declaration_count" "$replace_overlay" "$external_hyperpixel_overlay_count" "$external_hyperpixel_module_loaded" "$unexpected_hyperpixel_module_loaded" "$hyperpixel_state_dir_safe" "$hyperpixel_transaction_active" "$legacy_checkpoint_active" "$external_hyperpixel_binding_count" "$gpio_display_state_safe""#,
+    r#"printf '{"model":"%s","os_id":"%s","os_version":"%s","architecture":"%s","kernel_release":"%s","kernel_vermagic":"%s","default_target":"%s","display_manager_active":%s,"boot_config":"%s","boot_config_regular":%s,"tryboot_supported":%s,"clock_synchronized":%s,"system_time_unix":%s,"package_repository_reachable":%s,"port_80_free":%s,"root_available_bytes":%s,"boot_available_bytes":%s,"running_headers_available":%s,"running_headers_release":"%s","installed_kernel_header_pair_count":%s,"installed_kernel_release":"%s","installed_headers_release":"%s","boot_selected_kernel_match_count":%s,"boot_selected_kernel_release":"%s","candidate_kernel_release":"%s","candidate_kernel_vermagic":"%s","candidate_kernel_match_count":%s,"boot_kernel_override_conflicting":%s,"unsafe_overlay_present":%s,"hyperpixel_declaration_count":%s,"replace_overlay":"%s","external_hyperpixel_overlay_count":%s,"external_hyperpixel_module_loaded":%s,"unexpected_hyperpixel_module_loaded":%s,"hyperpixel_state_dir_safe":%s,"hyperpixel_transaction_active":%s,"legacy_checkpoint_active":%s,"external_hyperpixel_binding_count":%s,"gpio_display_state_safe":%s}' "#,
+    r#""$model" "$os_id" "$os_version" "$architecture" "$kernel_release" "$kernel_vermagic" "$default_target" "$display_manager_active" "$boot_config" "$boot_config_regular" "$tryboot_supported" "$clock_synchronized" "$system_time_unix" "$package_repository_reachable" "$port_80_free" "$root_available_bytes" "$boot_available_bytes" "$running_headers_available" "$running_headers_release" "$installed_kernel_header_pair_count" "$installed_kernel_release" "$installed_headers_release" "$boot_selected_kernel_match_count" "$boot_selected_kernel_release" "$candidate_kernel_release" "$candidate_kernel_vermagic" "$candidate_kernel_match_count" "$boot_kernel_override_conflicting" "$unsafe_overlay_present" "$hyperpixel_declaration_count" "$replace_overlay" "$external_hyperpixel_overlay_count" "$external_hyperpixel_module_loaded" "$unexpected_hyperpixel_module_loaded" "$hyperpixel_state_dir_safe" "$hyperpixel_transaction_active" "$legacy_checkpoint_active" "$external_hyperpixel_binding_count" "$gpio_display_state_safe""#,
 );
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -555,6 +554,9 @@ pub struct TargetFacts {
     pub installed_headers_release: String,
     pub boot_selected_kernel_match_count: u8,
     pub boot_selected_kernel_release: String,
+    pub candidate_kernel_release: String,
+    pub candidate_kernel_vermagic: String,
+    pub candidate_kernel_match_count: u8,
     pub boot_kernel_override_conflicting: bool,
     pub unsafe_overlay_present: bool,
     pub hyperpixel_declaration_count: u8,
@@ -573,7 +575,7 @@ impl fmt::Debug for TargetFacts {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("TargetFacts")
-            .field("field_count", &36)
+            .field("field_count", &39)
             .finish_non_exhaustive()
     }
 }
@@ -616,11 +618,32 @@ impl TargetFacts {
         if !self.running_headers_release.is_empty() {
             require_kernel_release(&self.running_headers_release)?;
         }
+        match self.candidate_kernel_match_count {
+            0 if self.candidate_kernel_release == self.kernel_release
+                && self.candidate_kernel_vermagic == self.kernel_vermagic => {}
+            1 if !self.candidate_kernel_release.is_empty()
+                && !self.candidate_kernel_vermagic.is_empty() =>
+            {
+                require_canonical_field(&self.candidate_kernel_release, false)?;
+                require_canonical_field(&self.candidate_kernel_vermagic, false)?;
+                crate::driver::TargetProbe::new(
+                    self.candidate_kernel_release.clone(),
+                    self.candidate_kernel_vermagic.clone(),
+                )
+                .map_err(|_| TargetFactsError::NoncanonicalField)?;
+            }
+            count
+                if count > 1
+                    && self.candidate_kernel_release.is_empty()
+                    && self.candidate_kernel_vermagic.is_empty() => {}
+            _ => return Err(TargetFactsError::NoncanonicalField),
+        }
         if !(MIN_SYSTEM_TIME_UNIX..=MAX_SYSTEM_TIME_UNIX).contains(&self.system_time_unix)
             || self.root_available_bytes > MAX_REPORTED_FREE_BYTES
             || self.boot_available_bytes > MAX_REPORTED_FREE_BYTES
             || self.installed_kernel_header_pair_count > 16
             || self.boot_selected_kernel_match_count > 16
+            || self.candidate_kernel_match_count > 16
             || self.hyperpixel_declaration_count > 16
             || self.external_hyperpixel_overlay_count > 16
             || self.external_hyperpixel_binding_count > 16
@@ -834,16 +857,12 @@ pub fn evaluate_target(
             ),
         ),
     ]);
-    let installed_pair_matches = facts.installed_kernel_header_pair_count == 1
-        && facts.installed_kernel_release == facts.installed_headers_release;
-    let boot_selection_proven = facts.boot_selected_kernel_match_count == 1
-        && !facts.boot_kernel_override_conflicting
-        && facts.boot_selected_kernel_release == facts.installed_kernel_release;
+    let candidate_selected = facts.candidate_kernel_match_count == 1;
     let running_matches =
         facts.running_headers_available && facts.running_headers_release == facts.kernel_release;
-    let safe_alternate = installed_pair_matches
-        && boot_selection_proven
-        && facts.installed_kernel_release != facts.kernel_release;
+    let safe_alternate = candidate_selected
+        && !facts.boot_kernel_override_conflicting
+        && facts.candidate_kernel_release != facts.kernel_release;
     let running_status = if running_matches {
         CheckStatus::Passed
     } else if safe_alternate {
@@ -853,11 +872,13 @@ pub fn evaluate_target(
     } else {
         CheckStatus::Failed(FailureCode::RunningHeadersUnavailable)
     };
-    let installed_status = if !installed_pair_matches {
+    let installed_status = if facts.candidate_kernel_match_count == 0 && running_matches {
+        CheckStatus::Passed
+    } else if facts.candidate_kernel_match_count == 0 {
         CheckStatus::Failed(FailureCode::InstalledKernelHeadersMismatch)
-    } else if !boot_selection_proven {
+    } else if !candidate_selected || facts.boot_kernel_override_conflicting {
         CheckStatus::Failed(FailureCode::BootSelectedKernelUnproven)
-    } else if facts.installed_kernel_release != facts.kernel_release {
+    } else if facts.candidate_kernel_release != facts.kernel_release {
         CheckStatus::RebootRequired
     } else {
         CheckStatus::Passed

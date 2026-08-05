@@ -16,6 +16,7 @@ use planeradarctl::{
         GhDriverReleaseVerifier, PrebuiltBundle, TargetProbe,
     },
     release::{ReleaseSourceError, StreamingCommandRunner},
+    target::TargetIdentity,
     transport::{CommandOutput, CommandRunner, Invocation, RunnerError, SystemCommandRunner},
 };
 use semver::Version;
@@ -35,6 +36,58 @@ const TASK_TWO_DRIVER_TREE: &str = "0693468744845cc03e91b6dfdd10b8cd676dbce6";
 const TASK_TWO_DRIVER_DATE_EPOCH: u64 = 1_785_742_634;
 const PUBLISHED_SCHEMA_ONE_MANIFEST: &[u8] =
     include_bytes!("../../../tests/fixtures/driver/published-0.1.1-driver-manifest.json");
+
+#[test]
+fn target_identity_driver_binding_is_stable_distinguishes_every_input_and_stays_redacted() {
+    let identity = TargetIdentity {
+        host_key_sha256: "SHA256:target-host-key".into(),
+        model: "Raspberry Pi Zero 2 W Rev 1.0".into(),
+        serial: "0123456789abcdef".into(),
+    };
+    let same = identity.clone();
+    let changed_host_key = TargetIdentity {
+        host_key_sha256: "SHA256:other-host-key".into(),
+        ..identity.clone()
+    };
+    let changed_model = TargetIdentity {
+        model: "Raspberry Pi Zero 2 W Rev 1.1".into(),
+        ..identity.clone()
+    };
+    let changed_serial = TargetIdentity {
+        serial: "fedcba9876543210".into(),
+        ..identity.clone()
+    };
+    let boundary_shifted = TargetIdentity {
+        host_key_sha256: "SHA256:target-host-keyR".into(),
+        model: "aspberry Pi Zero 2 W Rev 1.0".into(),
+        serial: identity.serial.clone(),
+    };
+
+    let binding = identity.driver_binding_sha256();
+    assert_eq!(binding, same.driver_binding_sha256());
+    assert_ne!(binding, changed_host_key.driver_binding_sha256());
+    assert_ne!(binding, changed_model.driver_binding_sha256());
+    assert_ne!(binding, changed_serial.driver_binding_sha256());
+    assert_ne!(binding, boundary_shifted.driver_binding_sha256());
+    assert_eq!(binding.len(), 64);
+    assert!(
+        binding
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    );
+
+    let debug = format!("{identity:?}");
+    let error = format!("{:?}", DriverError::InvalidContext);
+    for secret in [
+        identity.host_key_sha256.as_str(),
+        identity.model.as_str(),
+        identity.serial.as_str(),
+        binding.as_str(),
+    ] {
+        assert!(!debug.contains(secret), "debug leaked {secret}");
+        assert!(!error.contains(secret), "error leaked {secret}");
+    }
+}
 
 fn probe(kernel_release: &str) -> TargetProbe {
     let vermagic = if kernel_release == "6.18.34+rpt-rpi-v8" {
@@ -916,7 +969,9 @@ fn resolved_driver_plan_drives_the_exact_prebuilt_and_crossbuild_command_sequenc
             &probe("6.18.34+rpt-rpi-v8"),
             DriverContext {
                 target: "pi@raspberrypi.local".into(),
-                kernel_release: "6.18.34+rpt-rpi-v8".into(),
+                running_kernel_release: "6.18.34+rpt-rpi-v8".into(),
+                candidate_kernel_release: "6.18.34+rpt-rpi-v8".into(),
+                target_identity_sha256: "a".repeat(64),
                 kernel_export: PathBuf::from("/cache/kernel"),
                 artifacts: PathBuf::from("/cache/artifacts"),
                 replace_overlay: "planeradar-hyperpixel2r-eefaf3ae40fd".into(),
@@ -957,7 +1012,9 @@ fn resolved_driver_plan_drives_the_exact_prebuilt_and_crossbuild_command_sequenc
             &probe(new_kernel),
             DriverContext {
                 target: "pi@raspberrypi.local".into(),
-                kernel_release: new_kernel.into(),
+                running_kernel_release: new_kernel.into(),
+                candidate_kernel_release: new_kernel.into(),
+                target_identity_sha256: "a".repeat(64),
                 kernel_export: PathBuf::from("/cache/kernel"),
                 artifacts: PathBuf::from("/cache/artifacts"),
                 replace_overlay: "planeradar-hyperpixel2r-eefaf3ae40fd".into(),
@@ -992,6 +1049,87 @@ fn resolved_driver_plan_drives_the_exact_prebuilt_and_crossbuild_command_sequenc
             .any(|pair| pair == ["--source-revision", DRIVER_COMMIT]),
         "crossbuild did not bind the locked source revision"
     );
+}
+
+#[test]
+fn inactive_candidate_commands_bind_the_candidate_release_and_target_identity() {
+    let runner = RecordingRunner::default();
+    let candidate = "6.18.35+rpt-rpi-v8";
+    let running = "6.18.34+rpt-rpi-v8";
+    let identity = "a".repeat(64);
+    let tool = DriverTool::new(
+        runner.clone(),
+        PathBuf::from("/cache/source"),
+        DriverPlan::CrossBuild {
+            source: PathBuf::from("/cache/source"),
+        },
+        DriverContext {
+            target: "pi@raspberrypi.local".into(),
+            running_kernel_release: running.into(),
+            candidate_kernel_release: candidate.into(),
+            target_identity_sha256: identity.clone(),
+            kernel_export: PathBuf::from("/cache/kernel"),
+            artifacts: PathBuf::from("/cache/artifacts"),
+            replace_overlay: String::new(),
+        },
+        "0.1.0".into(),
+        DRIVER_COMMIT.into(),
+        REQUIRED_CAPABILITY.into(),
+    )
+    .expect("inactive candidate context");
+
+    tool.run(DriverAction::ExportKernel)
+        .expect("candidate export");
+    tool.run(DriverAction::Build).expect("candidate build");
+    let calls = runner.invocations.lock().expect("candidate calls");
+    for call in calls.iter() {
+        assert!(
+            call.arguments()
+                .windows(2)
+                .any(|pair| pair == ["--kernel-release", candidate]),
+            "candidate release missing from {:?}",
+            call.arguments()
+        );
+        assert!(
+            call.arguments()
+                .windows(2)
+                .any(|pair| pair == ["--target-identity-sha256", identity.as_str()]),
+            "identity binding missing from {:?}",
+            call.arguments()
+        );
+        assert!(!call.arguments().contains(&running.to_owned()));
+    }
+}
+
+#[test]
+fn candidate_context_never_falls_back_to_a_running_release_artifact() {
+    let temporary = tempfile::tempdir().expect("candidate artifact fixture");
+    let source = temporary.path().join("source");
+    let artifacts = temporary.path().join("artifacts");
+    fs::create_dir_all(artifacts.join("6.18.34+rpt-rpi-v8")).expect("running artifact directory");
+    let tool = DriverTool::new(
+        (),
+        source.clone(),
+        DriverPlan::CrossBuild { source },
+        DriverContext {
+            target: "pi@raspberrypi.local".into(),
+            running_kernel_release: "6.18.34+rpt-rpi-v8".into(),
+            candidate_kernel_release: "6.18.35+rpt-rpi-v8".into(),
+            target_identity_sha256: "a".repeat(64),
+            kernel_export: temporary.path().join("kernel"),
+            artifacts,
+            replace_overlay: String::new(),
+        },
+        "0.1.0".into(),
+        DRIVER_COMMIT.into(),
+        REQUIRED_CAPABILITY.into(),
+    )
+    .expect("candidate tool");
+
+    assert!(matches!(
+        tool.postconditions(),
+        Err(DriverError::InvalidContext | DriverError::InvalidPrebuiltIdentity)
+    ));
 }
 
 #[test]
@@ -1034,7 +1172,9 @@ fn crossbuild_reuses_exact_verified_artifacts_when_the_moving_package_index_is_u
         DriverPlan::CrossBuild { source },
         DriverContext {
             target: "pi@raspberrypi.local".into(),
-            kernel_release: kernel_release.into(),
+            running_kernel_release: kernel_release.into(),
+            candidate_kernel_release: kernel_release.into(),
+            target_identity_sha256: "a".repeat(64),
             kernel_export: temporary.path().join("kernel-target"),
             artifacts,
             replace_overlay: String::new(),
@@ -1076,7 +1216,9 @@ fn crossbuild_reuses_exact_verified_artifacts_when_the_moving_package_index_is_u
         },
         DriverContext {
             target: "pi@raspberrypi.local".into(),
-            kernel_release: kernel_release.into(),
+            running_kernel_release: kernel_release.into(),
+            candidate_kernel_release: kernel_release.into(),
+            target_identity_sha256: "a".repeat(64),
             kernel_export: temporary.path().join("kernel-target"),
             artifacts: temporary.path().join("artifacts"),
             replace_overlay: String::new(),
@@ -1119,6 +1261,8 @@ output=''
 while test "$#" -gt 0; do
   case "$1" in
     --target) shift 2 ;;
+    --kernel-release) test "$2" = 6.18.34+rpt-rpi-v8; shift 2 ;;
+    --target-identity-sha256) test "$2" = aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa; shift 2 ;;
     --output) output="$2"; shift 2 ;;
     *) exit 64 ;;
   esac
@@ -1170,7 +1314,9 @@ printf 'unexpected build\n' > "$output/build-was-run"
         DriverPlan::Prebuilt { archive: prebuilt },
         DriverContext {
             target: "pi@fixture".into(),
-            kernel_release: "6.18.34+rpt-rpi-v8".into(),
+            running_kernel_release: "6.18.34+rpt-rpi-v8".into(),
+            candidate_kernel_release: "6.18.34+rpt-rpi-v8".into(),
+            target_identity_sha256: "a".repeat(64),
             kernel_export: kernel_target.clone(),
             artifacts: artifacts.clone(),
             replace_overlay: "hyperpixel2r-kms-aaaaaaaaaaaa.dtbo".into(),
@@ -1225,7 +1371,9 @@ fn driver_postconditions_come_from_exact_verified_local_artifact_bytes() {
         },
         DriverContext {
             target: "pi@fixture".into(),
-            kernel_release: "6.18.34+rpt-rpi-v8".into(),
+            running_kernel_release: "6.18.34+rpt-rpi-v8".into(),
+            candidate_kernel_release: "6.18.34+rpt-rpi-v8".into(),
+            target_identity_sha256: "a".repeat(64),
             kernel_export: temporary.path().join("kernel"),
             artifacts: temporary.path().join("artifacts"),
             replace_overlay: "vc4-kms-dpi-hyperpixel2r".into(),
@@ -1702,7 +1850,9 @@ fn release_verification_preserves_bounded_nonzero_and_spawn_diagnostics() {
 fn lifecycle_tools_preserve_bounded_nonzero_and_spawn_diagnostics() {
     let context = DriverContext {
         target: "pi@raspberrypi.local".into(),
-        kernel_release: "6.18.34+rpt-rpi-v8".into(),
+        running_kernel_release: "6.18.34+rpt-rpi-v8".into(),
+        candidate_kernel_release: "6.18.34+rpt-rpi-v8".into(),
+        target_identity_sha256: "a".repeat(64),
         kernel_export: PathBuf::from("/cache/kernel"),
         artifacts: PathBuf::from("/cache/artifacts"),
         replace_overlay: "planeradar-hyperpixel2r-eefaf3ae40fd".into(),
@@ -1780,7 +1930,9 @@ fn driver_staging_accepts_only_an_absent_or_exact_supported_overlay_replacement(
             },
             DriverContext {
                 target: "pi@raspberrypi.local".into(),
-                kernel_release: "6.18.34+rpt-rpi-v8".into(),
+                running_kernel_release: "6.18.34+rpt-rpi-v8".into(),
+                candidate_kernel_release: "6.18.34+rpt-rpi-v8".into(),
+                target_identity_sha256: "a".repeat(64),
                 kernel_export: PathBuf::from("/cache/kernel"),
                 artifacts: PathBuf::from("/cache/artifacts"),
                 replace_overlay: replacement.into(),
@@ -1821,7 +1973,9 @@ fn driver_staging_accepts_only_an_absent_or_exact_supported_overlay_replacement(
             },
             DriverContext {
                 target: "pi@raspberrypi.local".into(),
-                kernel_release: "6.18.34+rpt-rpi-v8".into(),
+                running_kernel_release: "6.18.34+rpt-rpi-v8".into(),
+                candidate_kernel_release: "6.18.34+rpt-rpi-v8".into(),
+                target_identity_sha256: "a".repeat(64),
                 kernel_export: PathBuf::from("/cache/kernel"),
                 artifacts: PathBuf::from("/cache/artifacts"),
                 replace_overlay: replacement.into(),
@@ -1900,7 +2054,9 @@ fn typed_actions_invoke_only_the_exact_external_driver_scripts_and_parse_verific
         },
         DriverContext {
             target: "pi@raspberrypi.local".into(),
-            kernel_release: "6.18.34+rpt-rpi-v8".into(),
+            running_kernel_release: "6.18.34+rpt-rpi-v8".into(),
+            candidate_kernel_release: "6.18.34+rpt-rpi-v8".into(),
+            target_identity_sha256: "a".repeat(64),
             kernel_export: PathBuf::from("/cache/kernel"),
             artifacts: PathBuf::from("/cache/artifacts"),
             replace_overlay: "planeradar-hyperpixel2r-eefaf3ae40fd".into(),
@@ -2008,7 +2164,9 @@ fn accepted_driver_protocol_actions_are_typed_exact_and_bounded() {
         },
         DriverContext {
             target: "pi@raspberrypi.local".into(),
-            kernel_release: "6.18.34+rpt-rpi-v8".into(),
+            running_kernel_release: "6.18.34+rpt-rpi-v8".into(),
+            candidate_kernel_release: "6.18.34+rpt-rpi-v8".into(),
+            target_identity_sha256: "a".repeat(64),
             kernel_export: PathBuf::from("/cache/kernel"),
             artifacts: PathBuf::from("/cache/artifacts"),
             replace_overlay: "vc4-kms-dpi-hyperpixel2r".into(),
@@ -2113,7 +2271,9 @@ fn verify_boot_rejects_json_for_a_different_locked_driver_version() {
         },
         DriverContext {
             target: "pi@raspberrypi.local".into(),
-            kernel_release: "6.18.34+rpt-rpi-v8".into(),
+            running_kernel_release: "6.18.34+rpt-rpi-v8".into(),
+            candidate_kernel_release: "6.18.34+rpt-rpi-v8".into(),
+            target_identity_sha256: "a".repeat(64),
             kernel_export: PathBuf::from("/cache/kernel"),
             artifacts: PathBuf::from("/cache/artifacts"),
             replace_overlay: "planeradar-hyperpixel2r-eefaf3ae40fd".into(),
@@ -2155,7 +2315,9 @@ fn normal_boot_verification_keeps_the_same_locked_candidate_identity() {
         },
         DriverContext {
             target: "pi@raspberrypi.local".into(),
-            kernel_release: "6.18.34+rpt-rpi-v8".into(),
+            running_kernel_release: "6.18.34+rpt-rpi-v8".into(),
+            candidate_kernel_release: "6.18.34+rpt-rpi-v8".into(),
+            target_identity_sha256: "a".repeat(64),
             kernel_export: PathBuf::from("/cache/kernel"),
             artifacts: PathBuf::from("/cache/artifacts"),
             replace_overlay: "planeradar-hyperpixel2r-eefaf3ae40fd".into(),
@@ -2195,7 +2357,9 @@ fn legacy_cleanup_uses_the_locked_overlay_through_the_existing_uninstall_action(
         },
         DriverContext {
             target: "pi@raspberrypi.local".into(),
-            kernel_release: "6.18.34+rpt-rpi-v8".into(),
+            running_kernel_release: "6.18.34+rpt-rpi-v8".into(),
+            candidate_kernel_release: "6.18.34+rpt-rpi-v8".into(),
+            target_identity_sha256: "a".repeat(64),
             kernel_export: PathBuf::from("/cache/kernel"),
             artifacts: PathBuf::from("/cache/artifacts"),
             replace_overlay: "planeradar-hyperpixel2r-eefaf3ae40fd".into(),
@@ -2250,7 +2414,9 @@ fn locked_release_runs_the_selected_live_phase_through_the_typed_adapter() {
             &TargetProbe::new("6.18.34+rpt-rpi-v8", EXPECTED_VERMAGIC).expect("live target probe"),
             DriverContext {
                 target,
-                kernel_release: "6.18.34+rpt-rpi-v8".into(),
+                running_kernel_release: "6.18.34+rpt-rpi-v8".into(),
+                candidate_kernel_release: "6.18.34+rpt-rpi-v8".into(),
+                target_identity_sha256: "a".repeat(64),
                 kernel_export: workspace.join("kernel-target"),
                 artifacts: workspace.join("artifacts"),
                 replace_overlay,
@@ -2312,7 +2478,9 @@ fn locked_release_builds_the_live_kernel_from_separate_cache_paths() {
             &TargetProbe::new("6.18.34+rpt-rpi-v8", EXPECTED_VERMAGIC).expect("live target probe"),
             DriverContext {
                 target,
-                kernel_release: "6.18.34+rpt-rpi-v8".into(),
+                running_kernel_release: "6.18.34+rpt-rpi-v8".into(),
+                candidate_kernel_release: "6.18.34+rpt-rpi-v8".into(),
+                target_identity_sha256: "a".repeat(64),
                 kernel_export: kernel_export.clone(),
                 artifacts: artifacts.clone(),
                 replace_overlay: "planeradar-hyperpixel2r-eefaf3ae40fd".into(),
@@ -2363,7 +2531,9 @@ fn locked_release_stages_the_live_tryboot_through_the_typed_adapter() {
             &TargetProbe::new("6.18.34+rpt-rpi-v8", EXPECTED_VERMAGIC).expect("live target probe"),
             DriverContext {
                 target,
-                kernel_release: "6.18.34+rpt-rpi-v8".into(),
+                running_kernel_release: "6.18.34+rpt-rpi-v8".into(),
+                candidate_kernel_release: "6.18.34+rpt-rpi-v8".into(),
+                target_identity_sha256: "a".repeat(64),
                 kernel_export: workspace.join("kernel-target"),
                 artifacts: workspace.join("artifacts"),
                 replace_overlay: "planeradar-hyperpixel2r-eefaf3ae40fd".into(),

@@ -81,6 +81,9 @@ fn valid_target_json() -> Vec<u8> {
       "installed_headers_release":"6.18.34+rpt-rpi-v8",
       "boot_selected_kernel_match_count":1,
       "boot_selected_kernel_release":"6.18.34+rpt-rpi-v8",
+      "candidate_kernel_release":"6.18.34+rpt-rpi-v8",
+      "candidate_kernel_vermagic":"6.18.34+rpt-rpi-v8 SMP preempt mod_unload modversions aarch64",
+      "candidate_kernel_match_count":1,
       "boot_kernel_override_conflicting":false,
       "unsafe_overlay_present":false,
       "hyperpixel_declaration_count":0,
@@ -121,6 +124,68 @@ fn target_facts_accept_one_complete_canonical_json_value() {
     );
     assert_eq!(facts.hyperpixel_declaration_count, 0);
     assert_eq!(facts.replace_overlay, "");
+}
+
+#[test]
+fn target_facts_bind_the_exact_candidate_kernel_or_running_fallback() {
+    let selected_fixture = String::from_utf8(valid_target_json()).expect("fixture utf8");
+    let fallback_fixture = selected_fixture.replacen(
+        "\"candidate_kernel_match_count\":1",
+        "\"candidate_kernel_match_count\":0",
+        1,
+    );
+    let fallback = TargetFacts::parse(fallback_fixture.as_bytes()).expect("running fallback");
+    assert_eq!(fallback.candidate_kernel_match_count, 0);
+    assert_eq!(fallback.candidate_kernel_release, fallback.kernel_release);
+    assert_eq!(fallback.candidate_kernel_vermagic, fallback.kernel_vermagic);
+
+    let selected = selected_fixture
+        .replacen(
+            "\"candidate_kernel_release\":\"6.18.34+rpt-rpi-v8\"",
+            "\"candidate_kernel_release\":\"6.18.35+rpt-rpi-v8\"",
+            1,
+        )
+        .replacen(
+            "\"candidate_kernel_vermagic\":\"6.18.34+rpt-rpi-v8 SMP preempt mod_unload modversions aarch64\"",
+            "\"candidate_kernel_vermagic\":\"6.18.35+rpt-rpi-v8 SMP preempt mod_unload modversions aarch64\"",
+            1,
+        )
+        .replacen("\"candidate_kernel_match_count\":1", "\"candidate_kernel_match_count\":1", 1);
+    let selected = TargetFacts::parse(selected.as_bytes()).expect("one selected candidate");
+    assert_eq!(selected.candidate_kernel_release, "6.18.35+rpt-rpi-v8");
+
+    for malformed in [
+        selected_fixture.replacen("\"candidate_kernel_match_count\":1", "\"candidate_kernel_match_count\":2", 1),
+        selected_fixture.replacen(
+            "\"candidate_kernel_release\":\"6.18.34+rpt-rpi-v8\"",
+            "\"candidate_kernel_release\":\"6.18.35/rpt-rpi-v8\"",
+            1,
+        ),
+        selected_fixture.replacen(
+            "\"candidate_kernel_vermagic\":\"6.18.34+rpt-rpi-v8 SMP preempt mod_unload modversions aarch64\"",
+            "\"candidate_kernel_vermagic\":\"6.18.35+rpt-rpi-v8 SMP preempt mod_unload modversions aarch64\"",
+            1,
+        ),
+    ] {
+        assert_eq!(
+            TargetFacts::parse(malformed.as_bytes()),
+            Err(TargetFactsError::NoncanonicalField)
+        );
+    }
+
+    for fragment in [
+        "candidate_kernel_release",
+        "candidate_kernel_vermagic",
+        "candidate_kernel_match_count",
+        "readlink -f -- /boot/vmlinuz",
+        "readlink -f -- /boot/initrd.img",
+        "/usr/sbin/modinfo -k \"$candidate_kernel_release\" -F vermagic vc4",
+    ] {
+        assert!(
+            TARGET_FACTS_SCRIPT.contains(fragment),
+            "candidate discovery omitted {fragment}"
+        );
+    }
 }
 
 #[test]
@@ -775,6 +840,9 @@ fn target_header_relationship_is_ready_rebootable_or_blocking() {
     reboot.installed_kernel_release = "6.18.35+rpt-rpi-v8".into();
     reboot.installed_headers_release = "6.18.35+rpt-rpi-v8".into();
     reboot.boot_selected_kernel_release = "6.18.35+rpt-rpi-v8".into();
+    reboot.candidate_kernel_release = "6.18.35+rpt-rpi-v8".into();
+    reboot.candidate_kernel_vermagic =
+        "6.18.35+rpt-rpi-v8 SMP preempt mod_unload modversions aarch64".into();
     let report = evaluate_target(
         &expected,
         Some(&expected),
@@ -792,16 +860,25 @@ fn target_header_relationship_is_ready_rebootable_or_blocking() {
             let mut value = reboot.clone();
             value.boot_selected_kernel_match_count = 0;
             value.boot_selected_kernel_release.clear();
+            value.candidate_kernel_match_count = 2;
+            value.candidate_kernel_release.clear();
+            value.candidate_kernel_vermagic.clear();
             value
         },
         {
             let mut value = reboot.clone();
             value.boot_selected_kernel_match_count = 2;
+            value.candidate_kernel_match_count = 2;
+            value.candidate_kernel_release.clear();
+            value.candidate_kernel_vermagic.clear();
             value
         },
         {
             let mut value = reboot.clone();
             value.boot_selected_kernel_release = "6.18.36+rpt-rpi-v8".into();
+            value.candidate_kernel_match_count = 2;
+            value.candidate_kernel_release.clear();
+            value.candidate_kernel_vermagic.clear();
             value
         },
         {
@@ -826,6 +903,9 @@ fn target_header_relationship_is_ready_rebootable_or_blocking() {
 
     let mut invalid = reboot.clone();
     invalid.installed_headers_release = "6.18.36+rpt-rpi-v8".into();
+    invalid.candidate_kernel_match_count = 2;
+    invalid.candidate_kernel_release.clear();
+    invalid.candidate_kernel_vermagic.clear();
     let report = evaluate_target(
         &expected,
         Some(&expected),
@@ -835,11 +915,14 @@ fn target_header_relationship_is_ready_rebootable_or_blocking() {
     );
     assert_eq!(
         target_status(&report, CheckId::TargetInstalledKernelHeaders),
-        CheckStatus::Failed(FailureCode::InstalledKernelHeadersMismatch)
+        CheckStatus::Failed(FailureCode::BootSelectedKernelUnproven)
     );
 
     let mut ambiguous = facts.clone();
     ambiguous.installed_kernel_header_pair_count = 2;
+    ambiguous.candidate_kernel_match_count = 2;
+    ambiguous.candidate_kernel_release.clear();
+    ambiguous.candidate_kernel_vermagic.clear();
     let report = evaluate_target(
         &expected,
         Some(&expected),
@@ -849,7 +932,7 @@ fn target_header_relationship_is_ready_rebootable_or_blocking() {
     );
     assert_eq!(
         target_status(&report, CheckId::TargetInstalledKernelHeaders),
-        CheckStatus::Failed(FailureCode::InstalledKernelHeadersMismatch)
+        CheckStatus::Failed(FailureCode::BootSelectedKernelUnproven)
     );
 
     let mut mismatched_running = facts.clone();
@@ -883,22 +966,22 @@ fn target_header_relationship_is_ready_rebootable_or_blocking() {
 }
 
 #[test]
-fn target_boot_selected_kernel_probe_is_owned_regular_hash_bound_and_override_safe() {
+fn target_candidate_kernel_probe_uses_only_exact_owned_package_selectors() {
     for fragment in [
-        r#"kernel8_image=/boot/firmware/kernel8.img"#,
-        r#"test ! -L "$kernel8_image" && test -f "$kernel8_image""#,
-        r#"test "$(stat -c '%U:%G' "$kernel8_image")" = root:root"#,
-        r#"for candidate_image in /boot/vmlinuz-*"#,
-        r#"test ! -L "$candidate_image" && test -f "$candidate_image""#,
-        r#"test "$(stat -c '%U:%G' "$candidate_image")" = root:root"#,
-        r#"sha256sum -- "$kernel8_image""#,
-        r#"sha256sum -- "$candidate_image""#,
+        r#"readlink -f -- /boot/vmlinuz"#,
+        r#"readlink -f -- /boot/initrd.img"#,
+        r#"test "$(stat -c '%U:%G' "$candidate_vmlinuz")" = root:root"#,
+        r#"test "$(stat -c '%U:%G' "$candidate_initrd")" = root:root"#,
+        r#"/lib/modules/$candidate_kernel_release/build/include/config/kernel.release"#,
+        r#"/usr/sbin/modinfo -k "$candidate_kernel_release" -F vermagic vc4"#,
     ] {
         assert!(
             TARGET_FACTS_SCRIPT.contains(fragment),
             "missing boot-selection contract: {fragment}"
         );
     }
+    assert!(!TARGET_FACTS_SCRIPT.contains("for candidate_image in"));
+    assert!(!TARGET_FACTS_SCRIPT.contains("/lib/modules/*"));
 
     let expected = identity();
     let running_selected = parsed_target();
@@ -918,13 +1001,11 @@ fn target_boot_selected_kernel_probe_is_owned_regular_hash_bound_and_override_sa
     let inconsistent = String::from_utf8(valid_target_json())
         .expect("fixture utf8")
         .replace(
-            "\"boot_selected_kernel_match_count\":1",
-            "\"boot_selected_kernel_match_count\":0",
+            "\"candidate_kernel_match_count\":1",
+            "\"candidate_kernel_match_count\":0",
         );
-    assert_eq!(
-        TargetFacts::parse(inconsistent.as_bytes()),
-        Err(TargetFactsError::NoncanonicalField)
-    );
+    let fallback = TargetFacts::parse(inconsistent.as_bytes()).expect("package candidate absent");
+    assert_eq!(fallback.candidate_kernel_release, fallback.kernel_release);
 }
 
 #[test]
@@ -951,7 +1032,11 @@ fn zero_installed_header_pairs_parse_and_fail_with_typed_check_codes() {
             "\"installed_headers_release\":\"6.18.34+rpt-rpi-v8\"",
             "\"installed_headers_release\":\"\"",
         );
-    let parsed = TargetFacts::parse(missing.as_bytes()).expect("zero pair facts remain structured");
+    let mut parsed =
+        TargetFacts::parse(missing.as_bytes()).expect("zero pair facts remain structured");
+    parsed.candidate_kernel_match_count = 0;
+    parsed.candidate_kernel_release = parsed.kernel_release.clone();
+    parsed.candidate_kernel_vermagic = parsed.kernel_vermagic.clone();
     let expected = identity();
     let report = evaluate_target(
         &expected,
@@ -1626,7 +1711,7 @@ fn target_facts_probe_accepts_safe_existing_pi_state_without_weakening_conflict_
         r#"port_80_pid_count"#,
         r#"test "$port_80_pid_count" = 1"#,
         r#"root:root:755:1"#,
-        r#"candidate" = "$boot_selected_kernel_release"#,
+        r#"candidate_kernel_release=$candidate_vmlinuz_release"#,
         r#"grep -E '^dtoverlay=(.*hyperpixel.*|vc4-kms-dpi.*|dpi[0-9].*)$'"#,
     ] {
         assert!(

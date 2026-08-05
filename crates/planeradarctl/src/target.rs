@@ -3,6 +3,7 @@ use std::str::FromStr;
 use std::{borrow::Cow, fmt};
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 /// A stable target identity collected from OpenSSH and target hardware probes.
@@ -10,7 +11,7 @@ use thiserror::Error;
 /// Host names and addresses may change during installation, so later operations
 /// must compare every field rather than treating a connection address as an
 /// identity.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct TargetIdentity {
     pub host_key_sha256: String,
@@ -19,9 +20,26 @@ pub struct TargetIdentity {
 }
 
 impl TargetIdentity {
+    /// A domain-specific, length-delimited binding for driver lifecycle state.
+    pub fn driver_binding_sha256(&self) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(b"planeradarctl.target-identity.v1\\0");
+        for value in [&self.host_key_sha256, &self.model, &self.serial] {
+            hasher.update((value.len() as u64).to_be_bytes());
+            hasher.update(value.as_bytes());
+        }
+        format!("{:x}", hasher.finalize())
+    }
+
     /// Returns true only when the host key and both hardware identifiers agree.
     pub fn matches(&self, observed: &Self) -> bool {
         self == observed
+    }
+}
+
+impl fmt::Debug for TargetIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("TargetIdentity(<redacted>)")
     }
 }
 
