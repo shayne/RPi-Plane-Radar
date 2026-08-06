@@ -1518,6 +1518,9 @@ pub enum DriverAction {
     StageRetained,
     CommitRetained,
     RecoverAccepted,
+    MarkExplicitNormalVerified,
+    NormalizeInactiveKernel,
+    MarkNormalizedVerified,
     MarkVerifiedAccepted,
     FinalizeAccepted,
     UninstallAccepted,
@@ -1581,6 +1584,11 @@ pub struct DriverPostconditions {
     pub backlight_rule_file: String,
     pub backlight_rule_sha256: String,
     pub replaced_overlay: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DriverRecoveryResult {
+    pub reboot_required: bool,
 }
 
 impl<R> DriverTool<R> {
@@ -1647,6 +1655,10 @@ impl<R> DriverTool<R> {
 
     pub fn kernel_release(&self) -> &str {
         &self.context.candidate_kernel_release
+    }
+
+    pub fn requires_inactive_kernel_promotion(&self) -> bool {
+        self.context.candidate_kernel_release != self.context.running_kernel_release
     }
 
     pub fn expected_overlay_file(&self) -> &str {
@@ -1738,6 +1750,42 @@ impl<R> DriverTool<R> {
 }
 
 impl<R: CommandRunner> DriverTool<R> {
+    pub fn recover_accepted_protocol(&self) -> Result<DriverRecoveryResult, DriverError> {
+        let arguments = vec![
+            self.source
+                .join("scripts/accepted-lifecycle.sh")
+                .to_string_lossy()
+                .into_owned(),
+            "--target".into(),
+            self.context.target.clone(),
+            "--action".into(),
+            "recover".into(),
+        ];
+        let output = self.execute(DriverAction::RecoverAccepted, arguments)?;
+        let text =
+            std::str::from_utf8(output.stdout()).map_err(|_| DriverError::InvalidVerification)?;
+        let text = text
+            .strip_suffix('\n')
+            .ok_or(DriverError::InvalidVerification)?;
+        let mut lines = text.lines();
+        let message = lines.next().ok_or(DriverError::InvalidVerification)?;
+        let result = lines.next().ok_or(DriverError::InvalidVerification)?;
+        if lines.next().is_some()
+            || message.is_empty()
+            || message.len() > 256
+            || message.contains('=')
+            || message.bytes().any(|byte| byte.is_ascii_control())
+        {
+            return Err(DriverError::InvalidVerification);
+        }
+        let reboot_required = match result {
+            "reboot_required=true" => true,
+            "reboot_required=false" => false,
+            _ => return Err(DriverError::InvalidVerification),
+        };
+        Ok(DriverRecoveryResult { reboot_required })
+    }
+
     pub fn run_accepted_protocol(
         &self,
         action: DriverAction,
@@ -1750,6 +1798,9 @@ impl<R: CommandRunner> DriverTool<R> {
                 | DriverAction::StageRetained
                 | DriverAction::CommitRetained
                 | DriverAction::RecoverAccepted
+                | DriverAction::MarkExplicitNormalVerified
+                | DriverAction::NormalizeInactiveKernel
+                | DriverAction::MarkNormalizedVerified
                 | DriverAction::MarkVerifiedAccepted
                 | DriverAction::FinalizeAccepted
                 | DriverAction::UninstallAccepted
@@ -1776,6 +1827,9 @@ impl<R: CommandRunner> DriverTool<R> {
             DriverAction::StageRetained => "stage-retained",
             DriverAction::CommitRetained => "commit-retained",
             DriverAction::RecoverAccepted => "recover",
+            DriverAction::MarkExplicitNormalVerified => "mark-explicit-normal-verified",
+            DriverAction::NormalizeInactiveKernel => "normalize-inactive-kernel",
+            DriverAction::MarkNormalizedVerified => "mark-normalized-verified",
             DriverAction::MarkVerifiedAccepted => "mark-verified",
             DriverAction::FinalizeAccepted => "finalize",
             DriverAction::UninstallAccepted => "uninstall",
@@ -1953,6 +2007,9 @@ impl<R: CommandRunner> DriverTool<R> {
             | DriverAction::StageRetained
             | DriverAction::CommitRetained
             | DriverAction::RecoverAccepted
+            | DriverAction::MarkExplicitNormalVerified
+            | DriverAction::NormalizeInactiveKernel
+            | DriverAction::MarkNormalizedVerified
             | DriverAction::MarkVerifiedAccepted
             | DriverAction::FinalizeAccepted
             | DriverAction::UninstallAccepted => "accepted-lifecycle.sh",
@@ -2037,6 +2094,9 @@ impl<R: CommandRunner> DriverTool<R> {
             | DriverAction::StageRetained
             | DriverAction::CommitRetained
             | DriverAction::RecoverAccepted
+            | DriverAction::MarkExplicitNormalVerified
+            | DriverAction::NormalizeInactiveKernel
+            | DriverAction::MarkNormalizedVerified
             | DriverAction::MarkVerifiedAccepted
             | DriverAction::FinalizeAccepted
             | DriverAction::UninstallAccepted
@@ -2049,6 +2109,9 @@ impl<R: CommandRunner> DriverTool<R> {
                     DriverAction::StageRetained => "stage-retained",
                     DriverAction::CommitRetained => "commit-retained",
                     DriverAction::RecoverAccepted => "recover",
+                    DriverAction::MarkExplicitNormalVerified => "mark-explicit-normal-verified",
+                    DriverAction::NormalizeInactiveKernel => "normalize-inactive-kernel",
+                    DriverAction::MarkNormalizedVerified => "mark-normalized-verified",
                     DriverAction::MarkVerifiedAccepted => "mark-verified",
                     DriverAction::FinalizeAccepted => "finalize",
                     DriverAction::UninstallAccepted => "uninstall",

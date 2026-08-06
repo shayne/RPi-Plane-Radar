@@ -21,14 +21,17 @@ use planeradarctl::install::{
     Installer as ControllerInstaller, InterruptionReason, extract_application_payload_at_mtime,
 };
 use planeradarctl::operations::{
-    CaptureClock, CaptureMetadata, CaptureTransfer, DiagnosticFacts, OperationError,
-    OperationsBackend, OperationsClient, SshOperationsBackend,
+    AcceptedPair, CaptureClock, CaptureMetadata, CaptureTransfer, DiagnosticFacts,
+    LifecycleBackend, LifecycleError, LifecycleManager, LifecycleOutcome, LifecycleState,
+    ManagementHelper, OperationError, OperationsBackend, OperationsClient, ReleasePair,
+    SshOperationsBackend,
 };
 use planeradarctl::preflight::TARGET_FACTS_SCRIPT;
 use planeradarctl::release::{ArtifactKind, ReleaseManifest};
 use planeradarctl::smoke::verify_smoke_artifacts;
 use planeradarctl::state::{
-    ArtifactIdentity, InstallPhase, LocalStateStore, StateStore, TargetInstallState,
+    ArtifactIdentity, InstallPhase, LocalStateStore, OwnedFile, StateStore, TargetHardwareIdentity,
+    TargetInstallState,
 };
 use planeradarctl::system_install::{
     AcceptedDriverIdentity, DriverActions, HostPreflightGate, InstallClock, SystemInstallBackend,
@@ -466,6 +469,12 @@ impl FixtureSystem {
             "overlay_sha256": self.sha256(&overlay),
             "expected_overlay_sha256": self.sha256(&overlay),
             "boot_config_sha256": self.sha256(self.path("/boot/firmware/config.txt")),
+            "normal_kernel_file": "",
+            "normal_kernel_sha256": "",
+            "normal_initramfs_file": "",
+            "normal_initramfs_sha256": "",
+            "base_dtb_sha256": "",
+            "vc4_overlay_sha256": "",
             "overlay_configured": true,
             "drm_device": "/dev/dri/card0",
             "drm_mode": "480x480",
@@ -1263,6 +1272,12 @@ fn healthy_fixture_facts(
         overlay_sha256: digest(&overlay),
         expected_overlay_sha256: digest(&overlay),
         boot_config_sha256: digest(&root.join("boot/firmware/config.txt")),
+        normal_kernel_file: None,
+        normal_kernel_sha256: None,
+        normal_initramfs_file: None,
+        normal_initramfs_sha256: None,
+        base_dtb_sha256: None,
+        vc4_overlay_sha256: None,
         overlay_configured: true,
         drm_device: "/dev/dri/card0".into(),
         drm_mode: "480x480".into(),
@@ -2165,4 +2180,411 @@ fn accepted_driver_receipt_check_keeps_postconditions_out_of_the_shell_program()
     ] {
         assert!(program.contains(path), "receipt check omitted {path}");
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PromotionEvent {
+    StageApplication,
+    StageDriver,
+    RebootTryboot,
+    RebootNormal,
+    FreshProbe,
+    VerifyTryboot,
+    CommitDriver,
+    VerifyExplicitNormal,
+    StopService,
+    ProveQuiesced,
+    NormalizeDriver,
+    VerifyNormalized,
+    ActivateApplication,
+    StartService,
+    VerifyPair,
+    FinalizeDriver,
+    RecoverDriver,
+    RestoreApplication,
+    RetireCandidate,
+}
+
+struct PromotionBackend {
+    state: RefCell<LifecycleState>,
+    release: ReleasePair,
+    events: RefCell<Vec<PromotionEvent>>,
+    fail_tryboot: Cell<bool>,
+    running_driver: RefCell<ArtifactIdentity>,
+}
+
+impl PromotionBackend {
+    fn new(state: LifecycleState, release: ReleasePair) -> Self {
+        let running_driver = state.accepted()[0].pair.driver.clone();
+        Self {
+            state: RefCell::new(state),
+            release,
+            events: RefCell::new(Vec::new()),
+            fail_tryboot: Cell::new(false),
+            running_driver: RefCell::new(running_driver),
+        }
+    }
+
+    fn event(&self, event: PromotionEvent) {
+        self.events.borrow_mut().push(event);
+    }
+
+    fn reboot(&self, event: PromotionEvent) {
+        self.event(event);
+        self.event(PromotionEvent::FreshProbe);
+    }
+}
+
+impl LifecycleBackend for PromotionBackend {
+    fn load_lifecycle_state(&self) -> Result<LifecycleState, LifecycleError> {
+        Ok(self.state.borrow().clone())
+    }
+
+    fn save_lifecycle_state(&self, state: &LifecycleState) -> Result<(), LifecycleError> {
+        *self.state.borrow_mut() = state.clone();
+        Ok(())
+    }
+
+    fn resolve_release(&self, _requested: Option<&Version>) -> Result<ReleasePair, LifecycleError> {
+        Ok(self.release.clone())
+    }
+
+    fn verify_historical_release(&self, _expected: &ReleasePair) -> Result<(), LifecycleError> {
+        Ok(())
+    }
+
+    fn prepare_management_helper(
+        &self,
+        pair: &ReleasePair,
+    ) -> Result<ManagementHelper, LifecycleError> {
+        Ok(ManagementHelper {
+            application: pair.application.clone(),
+            target_path: format!(
+                "/var/lib/planeradar-installer/helpers/{}/planeradar",
+                pair.application.sha256
+            ),
+            protocol: "lifecycle-v3".into(),
+        })
+    }
+
+    fn stage_application(&self, _pair: &ReleasePair) -> Result<(), LifecycleError> {
+        self.event(PromotionEvent::StageApplication);
+        Ok(())
+    }
+
+    fn stage_driver(&self, _pair: &ReleasePair) -> Result<(), LifecycleError> {
+        self.event(PromotionEvent::StageDriver);
+        Ok(())
+    }
+
+    fn tryboot_driver(&self, pair: &ReleasePair) -> Result<(), LifecycleError> {
+        self.reboot(PromotionEvent::RebootTryboot);
+        if self.fail_tryboot.get() {
+            return Err(LifecycleError::Backend);
+        }
+        *self.running_driver.borrow_mut() = pair.driver.clone();
+        Ok(())
+    }
+
+    fn verify_tryboot_driver(&self, _pair: &ReleasePair) -> Result<(), LifecycleError> {
+        self.event(PromotionEvent::VerifyTryboot);
+        Ok(())
+    }
+
+    fn commit_driver(&self, _pair: &ReleasePair) -> Result<(), LifecycleError> {
+        self.event(PromotionEvent::CommitDriver);
+        Ok(())
+    }
+
+    fn reboot_normal(&self, pair: &ReleasePair) -> Result<(), LifecycleError> {
+        self.reboot(PromotionEvent::RebootNormal);
+        *self.running_driver.borrow_mut() = pair.driver.clone();
+        Ok(())
+    }
+
+    fn verify_explicit_normal_driver(&self, _pair: &ReleasePair) -> Result<(), LifecycleError> {
+        self.event(PromotionEvent::VerifyExplicitNormal);
+        Ok(())
+    }
+
+    fn normalize_driver(&self, _pair: &ReleasePair) -> Result<(), LifecycleError> {
+        self.event(PromotionEvent::StopService);
+        self.event(PromotionEvent::ProveQuiesced);
+        self.event(PromotionEvent::NormalizeDriver);
+        Ok(())
+    }
+
+    fn verify_normalized_driver(&self, _pair: &ReleasePair) -> Result<(), LifecycleError> {
+        self.event(PromotionEvent::VerifyNormalized);
+        Ok(())
+    }
+
+    fn activate_application(&self, pair: &ReleasePair) -> Result<Vec<OwnedFile>, LifecycleError> {
+        self.event(PromotionEvent::ActivateApplication);
+        Ok(vec![OwnedFile {
+            target_path: format!(
+                "/opt/planeradar/releases/{}/{}/planeradar",
+                pair.application.version, pair.application.sha256
+            ),
+            sha256: pair.application.sha256.clone(),
+        }])
+    }
+
+    fn restart_application(&self) -> Result<(), LifecycleError> {
+        self.event(PromotionEvent::StartService);
+        Ok(())
+    }
+
+    fn verify_pair(&self, _pair: &ReleasePair) -> Result<(), LifecycleError> {
+        self.event(PromotionEvent::VerifyPair);
+        Ok(())
+    }
+
+    fn finalize_driver_acceptance(&self, _pair: &ReleasePair) -> Result<(), LifecycleError> {
+        self.event(PromotionEvent::FinalizeDriver);
+        Ok(())
+    }
+
+    fn restore_application(&self, prior: &AcceptedPair) -> Result<Vec<OwnedFile>, LifecycleError> {
+        self.event(PromotionEvent::RestoreApplication);
+        Ok(prior.owned_files.clone())
+    }
+
+    fn restore_driver(&self, prior: &AcceptedPair) -> Result<(), LifecycleError> {
+        self.event(PromotionEvent::StopService);
+        self.event(PromotionEvent::ProveQuiesced);
+        self.event(PromotionEvent::RecoverDriver);
+        let requires_reboot = self
+            .state
+            .borrow()
+            .transaction()
+            .is_some_and(|transaction| {
+                matches!(
+                    transaction.phase,
+                    planeradarctl::operations::LifecyclePhase::ExplicitNormalVerified
+                        | planeradarctl::operations::LifecyclePhase::DriverNormalized
+                        | planeradarctl::operations::LifecyclePhase::NormalizedBootVerified
+                        | planeradarctl::operations::LifecyclePhase::NormalBootVerified
+                )
+            });
+        if requires_reboot {
+            self.reboot(PromotionEvent::RebootNormal);
+        }
+        *self.running_driver.borrow_mut() = prior.pair.driver.clone();
+        Ok(())
+    }
+
+    fn retire_candidate(&self, _owned_files: &[OwnedFile]) -> Result<(), LifecycleError> {
+        self.event(PromotionEvent::RetireCandidate);
+        Ok(())
+    }
+
+    fn prepare_uninstall(&self, _accepted: &AcceptedPair) -> Result<OwnedFile, LifecycleError> {
+        Err(LifecycleError::Backend)
+    }
+
+    fn uninstall_application(
+        &self,
+        _owned_files: &[OwnedFile],
+        _purge_settings: bool,
+    ) -> Result<(), LifecycleError> {
+        Err(LifecycleError::Backend)
+    }
+
+    fn uninstall_driver(&self, _drivers: &[ArtifactIdentity]) -> Result<(), LifecycleError> {
+        Err(LifecycleError::Backend)
+    }
+
+    fn finalize_driver_uninstall(&self) -> Result<(), LifecycleError> {
+        Err(LifecycleError::Backend)
+    }
+
+    fn finalize_uninstall(&self, _state: &LifecycleState) -> Result<(), LifecycleError> {
+        Err(LifecycleError::Backend)
+    }
+}
+
+fn promotion_artifact(version: &str, seed: char) -> ArtifactIdentity {
+    ArtifactIdentity {
+        version: version.into(),
+        source_commit: seed.to_string().repeat(40),
+        sha256: seed.to_string().repeat(64),
+    }
+}
+
+fn promotion_pair(version: &str, app_seed: char, driver_seed: char) -> ReleasePair {
+    ReleasePair {
+        application: promotion_artifact(version, app_seed),
+        driver: promotion_artifact("0.1.0", driver_seed),
+    }
+}
+
+fn promotion_accepted(pair: ReleasePair, sequence: u64) -> AcceptedPair {
+    AcceptedPair {
+        owned_files: vec![OwnedFile {
+            target_path: "/opt/planeradar/bin/planeradar".into(),
+            sha256: pair.application.sha256.clone(),
+        }],
+        pair,
+        sequence,
+    }
+}
+
+fn promotion_state(prior: &AcceptedPair, candidate: &ReleasePair, phase: &str) -> LifecycleState {
+    LifecycleState::from_json(
+        serde_json::to_vec(&serde_json::json!({
+            "schema_version": 3,
+            "hardware": {
+                "model": "Raspberry Pi Zero 2 W",
+                "serial": "10000000abcdef01"
+            },
+            "accepted": [prior],
+            "transaction": {
+                "prior": prior,
+                "candidate": candidate,
+                "management_helper": {
+                    "application": candidate.application,
+                    "target_path": format!(
+                        "/var/lib/planeradar-installer/helpers/{}/planeradar",
+                        candidate.application.sha256
+                    ),
+                    "protocol": "lifecycle-v3"
+                },
+                "candidate_owned_files": [{
+                    "target_path": format!(
+                        "/opt/planeradar/releases/{}/{}/planeradar",
+                        candidate.application.version, candidate.application.sha256
+                    ),
+                    "sha256": candidate.application.sha256
+                }],
+                "restored_owned_files": null,
+                "phase": phase
+            },
+            "uninstall": null
+        }))
+        .expect("serialize promotion fixture")
+        .as_slice(),
+    )
+    .expect("promotion fixture state")
+}
+
+#[test]
+fn failed_tryboot_returns_to_prior_without_a_candidate_normal_boot() {
+    let prior = promotion_accepted(promotion_pair("1.0.0", '1', 'a'), 7);
+    let candidate = promotion_pair("2.0.0", '2', 'b');
+    let backend = PromotionBackend::new(
+        LifecycleState::installed(
+            TargetHardwareIdentity {
+                model: "Raspberry Pi Zero 2 W".into(),
+                serial: "10000000abcdef01".into(),
+            },
+            vec![prior.clone()],
+        )
+        .expect("installed promotion state"),
+        candidate,
+    );
+    backend.fail_tryboot.set(true);
+
+    assert_eq!(
+        LifecycleManager::new(&backend).upgrade(None),
+        Err(LifecycleError::Backend)
+    );
+
+    let events = backend.events.borrow();
+    assert_eq!(
+        events.as_slice(),
+        [
+            PromotionEvent::StageApplication,
+            PromotionEvent::StageDriver,
+            PromotionEvent::RebootTryboot,
+            PromotionEvent::FreshProbe,
+            PromotionEvent::StopService,
+            PromotionEvent::ProveQuiesced,
+            PromotionEvent::RecoverDriver,
+            PromotionEvent::RestoreApplication,
+            PromotionEvent::StartService,
+            PromotionEvent::VerifyPair,
+            PromotionEvent::RetireCandidate,
+        ]
+    );
+    assert_eq!(*backend.running_driver.borrow(), prior.pair.driver);
+    assert!(!events.contains(&PromotionEvent::RebootNormal));
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(
+                event,
+                PromotionEvent::RebootTryboot | PromotionEvent::RebootNormal
+            ))
+            .count(),
+        events
+            .iter()
+            .filter(|event| **event == PromotionEvent::FreshProbe)
+            .count()
+    );
+}
+
+#[test]
+fn recovery_after_partial_normalization_quiesces_and_reboots_the_prior_pair_once() {
+    let prior = promotion_accepted(promotion_pair("1.0.0", '1', 'a'), 7);
+    let candidate = promotion_pair("2.0.0", '2', 'b');
+    let state = promotion_state(&prior, &candidate, "driver_normalized");
+    let backend = PromotionBackend::new(state, prior.pair.clone());
+
+    assert_eq!(
+        LifecycleManager::new(&backend).upgrade(None),
+        Ok(LifecycleOutcome::AlreadyAccepted {
+            version: Version::parse("1.0.0").expect("version")
+        })
+    );
+
+    let events = backend.events.borrow();
+    assert_eq!(
+        events.as_slice(),
+        [
+            PromotionEvent::StopService,
+            PromotionEvent::ProveQuiesced,
+            PromotionEvent::RecoverDriver,
+            PromotionEvent::RebootNormal,
+            PromotionEvent::FreshProbe,
+            PromotionEvent::RestoreApplication,
+            PromotionEvent::StartService,
+            PromotionEvent::VerifyPair,
+            PromotionEvent::RetireCandidate,
+        ]
+    );
+    assert_eq!(*backend.running_driver.borrow(), prior.pair.driver);
+}
+
+#[test]
+fn post_receipt_interruption_completes_only_candidate_finalization() {
+    let prior = promotion_accepted(promotion_pair("1.0.0", '1', 'a'), 7);
+    let candidate_pair = promotion_pair("2.0.0", '2', 'b');
+    let candidate = promotion_accepted(candidate_pair.clone(), 8);
+    let mut value: serde_json::Value = serde_json::from_slice(
+        promotion_state(&prior, &candidate_pair, "normalized_boot_verified")
+            .to_json()
+            .expect("promotion JSON")
+            .as_bytes(),
+    )
+    .expect("promotion value");
+    value["accepted"] = serde_json::json!([candidate, prior]);
+    value["transaction"]["phase"] = serde_json::json!("pair_accepted");
+    let state = LifecycleState::from_json(
+        serde_json::to_vec(&value)
+            .expect("durable receipt JSON")
+            .as_slice(),
+    )
+    .expect("durable receipt state");
+    let backend = PromotionBackend::new(state, candidate_pair);
+
+    assert!(matches!(
+        LifecycleManager::new(&backend).upgrade(None),
+        Ok(LifecycleOutcome::AlreadyAccepted { .. })
+    ));
+    assert_eq!(
+        backend.events.borrow().as_slice(),
+        [PromotionEvent::FinalizeDriver]
+    );
+    assert!(backend.state.borrow().transaction().is_none());
 }

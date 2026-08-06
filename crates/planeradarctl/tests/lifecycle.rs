@@ -98,6 +98,9 @@ enum Call {
     VerifyTryboot,
     CommitDriver,
     RebootNormal,
+    VerifyExplicitNormalDriver,
+    NormalizeDriver,
+    VerifyNormalizedDriver,
     ActivateApplication,
     RestartApplication,
     VerifyPair,
@@ -243,6 +246,18 @@ impl LifecycleBackend for FakeBackend {
 
     fn reboot_normal(&self, _pair: &ReleasePair) -> Result<(), LifecycleError> {
         self.call(Call::RebootNormal)
+    }
+
+    fn verify_explicit_normal_driver(&self, _pair: &ReleasePair) -> Result<(), LifecycleError> {
+        self.call(Call::VerifyExplicitNormalDriver)
+    }
+
+    fn normalize_driver(&self, _pair: &ReleasePair) -> Result<(), LifecycleError> {
+        self.call(Call::NormalizeDriver)
+    }
+
+    fn verify_normalized_driver(&self, _pair: &ReleasePair) -> Result<(), LifecycleError> {
+        self.call(Call::VerifyNormalizedDriver)
     }
 
     fn activate_application(&self, _pair: &ReleasePair) -> Result<Vec<OwnedFile>, LifecycleError> {
@@ -428,7 +443,7 @@ fn every_application_failure_restores_and_proves_the_prior_pair() {
 }
 
 #[test]
-fn driver_change_uses_exact_tryboot_commit_normal_boot_sequence() {
+fn driver_change_uses_two_verified_normal_boots_before_application_activation() {
     let current = accepted("1.0.0", '1', 'a', 7);
     let backend = FakeBackend::installed(vec![current], pair("2.0.0", '2', 'b'));
 
@@ -446,12 +461,58 @@ fn driver_change_uses_exact_tryboot_commit_normal_boot_sequence() {
             Call::VerifyTryboot,
             Call::CommitDriver,
             Call::RebootNormal,
+            Call::VerifyExplicitNormalDriver,
+            Call::NormalizeDriver,
+            Call::RebootNormal,
+            Call::VerifyNormalizedDriver,
             Call::ActivateApplication,
             Call::RestartApplication,
             Call::VerifyPair,
             Call::FinalizeDriverAcceptance,
         ]
     );
+}
+
+#[test]
+fn every_new_driver_promotion_failure_recovers_before_application_mutation() {
+    for failure in [
+        Call::VerifyExplicitNormalDriver,
+        Call::NormalizeDriver,
+        Call::VerifyNormalizedDriver,
+    ] {
+        let current = accepted("1.0.0", '1', 'a', 7);
+        let backend = FakeBackend::installed(vec![current.clone()], pair("2.0.0", '2', 'b'));
+        backend.fail.set(Some(failure));
+
+        assert_eq!(
+            LifecycleManager::new(&backend).upgrade(None),
+            Err(LifecycleError::Backend),
+            "{failure:?}"
+        );
+
+        let calls = backend.calls.borrow();
+        let failure_index = calls
+            .iter()
+            .position(|call| *call == failure)
+            .expect("injected driver promotion failure ran");
+        let recovery_index = calls
+            .iter()
+            .position(|call| *call == Call::RestoreDriver)
+            .expect("driver recovery ran");
+        assert!(failure_index < recovery_index, "{failure:?}: {calls:?}");
+        assert!(
+            !calls[..recovery_index].contains(&Call::ActivateApplication),
+            "application mutated before recovery for {failure:?}: {calls:?}"
+        );
+        assert!(calls.ends_with(&[
+            Call::RestoreDriver,
+            Call::RestoreApplication,
+            Call::RestartApplication,
+            Call::VerifyPair,
+            Call::RetireCandidate,
+        ]));
+        assert_eq!(backend.state.borrow().accepted()[0].pair, current.pair);
+    }
 }
 
 #[test]
@@ -836,6 +897,15 @@ fn purge_settings_is_passed_only_when_explicitly_requested() {
         fn reboot_normal(&self, pair: &ReleasePair) -> Result<(), LifecycleError> {
             self.inner.reboot_normal(pair)
         }
+        fn verify_explicit_normal_driver(&self, pair: &ReleasePair) -> Result<(), LifecycleError> {
+            self.inner.verify_explicit_normal_driver(pair)
+        }
+        fn normalize_driver(&self, pair: &ReleasePair) -> Result<(), LifecycleError> {
+            self.inner.normalize_driver(pair)
+        }
+        fn verify_normalized_driver(&self, pair: &ReleasePair) -> Result<(), LifecycleError> {
+            self.inner.verify_normalized_driver(pair)
+        }
         fn activate_application(
             &self,
             pair: &ReleasePair,
@@ -941,6 +1011,9 @@ fn every_persisted_mutation_boundary_recovers_the_prior_pair_before_retrying() {
         "driver_staged",
         "tryboot_verified",
         "driver_committed",
+        "explicit_normal_verified",
+        "driver_normalized",
+        "normalized_boot_verified",
         "normal_boot_verified",
         "application_activated",
         "application_restarted",

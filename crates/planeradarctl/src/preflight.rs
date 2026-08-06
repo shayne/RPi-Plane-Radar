@@ -591,6 +591,14 @@ impl TargetFacts {
         Ok(facts)
     }
 
+    pub fn conventional_candidate_is_running(&self) -> bool {
+        !self.boot_kernel_override_conflicting
+            && self.candidate_kernel_match_count == 1
+            && self.boot_selected_kernel_match_count == 1
+            && self.kernel_release == self.candidate_kernel_release
+            && self.boot_selected_kernel_release == self.candidate_kernel_release
+    }
+
     fn validate(&self) -> Result<(), TargetFactsError> {
         for value in [
             &self.model,

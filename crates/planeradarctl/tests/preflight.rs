@@ -966,6 +966,41 @@ fn target_header_relationship_is_ready_rebootable_or_blocking() {
 }
 
 #[test]
+fn target_facts_prove_the_conventional_candidate_is_the_running_kernel() {
+    let mut facts = parsed_target();
+    facts.kernel_release = "6.18.35+rpt-rpi-v8".into();
+    facts.kernel_vermagic = "6.18.35+rpt-rpi-v8 SMP preempt mod_unload modversions aarch64".into();
+    facts.candidate_kernel_release = facts.kernel_release.clone();
+    facts.candidate_kernel_vermagic = facts.kernel_vermagic.clone();
+    facts.candidate_kernel_match_count = 1;
+    facts.boot_selected_kernel_release = facts.kernel_release.clone();
+    facts.boot_selected_kernel_match_count = 1;
+    facts.boot_kernel_override_conflicting = false;
+
+    assert!(facts.conventional_candidate_is_running());
+
+    for invalid in [
+        {
+            let mut value = facts.clone();
+            value.kernel_release = "6.18.34+rpt-rpi-v8".into();
+            value
+        },
+        {
+            let mut value = facts.clone();
+            value.boot_selected_kernel_release = "6.18.34+rpt-rpi-v8".into();
+            value
+        },
+        {
+            let mut value = facts.clone();
+            value.boot_kernel_override_conflicting = true;
+            value
+        },
+    ] {
+        assert!(!invalid.conventional_candidate_is_running());
+    }
+}
+
+#[test]
 fn target_candidate_kernel_probe_uses_only_exact_owned_package_selectors() {
     for fragment in [
         r#"readlink -f -- /boot/vmlinuz"#,

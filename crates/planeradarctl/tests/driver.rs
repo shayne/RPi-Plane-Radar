@@ -2267,6 +2267,8 @@ fn inactive_accepted_driver_protocol_carries_only_candidate_authority() {
     )
     .expect("valid inactive driver protocol tool");
 
+    assert!(tool.requires_inactive_kernel_promotion());
+
     tool.prepare_accepted_protocol(&planeradarctl::driver::DriverPostconditions {
         driver_version: "0.1.0".into(),
         source_revision: DRIVER_COMMIT.into(),
@@ -2336,6 +2338,7 @@ fn accepted_driver_protocol_actions_are_typed_exact_and_bounded() {
         REQUIRED_CAPABILITY.into(),
     )
     .expect("valid driver protocol tool");
+    assert!(!tool.requires_inactive_kernel_promotion());
 
     for (action, revision) in [
         (DriverAction::RecordAccepted, Some(DRIVER_COMMIT)),
@@ -2343,6 +2346,9 @@ fn accepted_driver_protocol_actions_are_typed_exact_and_bounded() {
         (DriverAction::StageRetained, Some(DRIVER_COMMIT)),
         (DriverAction::CommitRetained, None),
         (DriverAction::RecoverAccepted, None),
+        (DriverAction::MarkExplicitNormalVerified, None),
+        (DriverAction::NormalizeInactiveKernel, None),
+        (DriverAction::MarkNormalizedVerified, None),
         (DriverAction::MarkVerifiedAccepted, None),
         (DriverAction::FinalizeAccepted, None),
         (DriverAction::UninstallAccepted, Some(DRIVER_COMMIT)),
@@ -2373,7 +2379,7 @@ fn accepted_driver_protocol_actions_are_typed_exact_and_bounded() {
     .expect("pre-mutation accepted journal");
 
     let invocations = runner.invocations.lock().expect("invocation lock");
-    assert_eq!(invocations.len(), 11);
+    assert_eq!(invocations.len(), 14);
     for invocation in invocations.iter() {
         assert_eq!(invocation.program(), "bash");
         assert_eq!(invocation.timeout(), Some(Duration::from_secs(15 * 60)));
@@ -2396,24 +2402,37 @@ fn accepted_driver_protocol_actions_are_typed_exact_and_bounded() {
             .any(|pair| pair == ["--source-revision", DRIVER_COMMIT])
     );
     assert!(
-        invocations[10]
+        invocations[13]
             .arguments()
             .windows(2)
             .any(|pair| pair == ["--action", "prepare-new"])
     );
     assert!(
-        invocations[10]
+        invocations[13]
             .arguments()
             .windows(2)
             .any(|pair| pair == ["--manifest-sha256", "2".repeat(64).as_str()])
     );
     assert!(
-        !invocations[10]
+        !invocations[13]
             .arguments()
             .windows(2)
             .any(|pair| pair[0] == "--kernel-target" || pair[0] == "--target-identity-sha256"),
         "same-kernel accepted preparation must not carry inactive authority"
     );
+    for (index, expected) in [
+        (5, "mark-explicit-normal-verified"),
+        (6, "normalize-inactive-kernel"),
+        (7, "mark-normalized-verified"),
+    ] {
+        assert!(
+            invocations[index]
+                .arguments()
+                .windows(2)
+                .any(|pair| pair == ["--action", expected]),
+            "typed action omitted exact protocol verb {expected}"
+        );
+    }
     assert!(
         tool.run_accepted_protocol(DriverAction::CommitBoot, None)
             .is_err()
@@ -2422,6 +2441,78 @@ fn accepted_driver_protocol_actions_are_typed_exact_and_bounded() {
         tool.run_accepted_protocol(DriverAction::RecordAccepted, None)
             .is_err()
     );
+}
+
+#[test]
+fn accepted_recovery_exposes_only_the_fixed_reboot_required_result() {
+    let recovery_output =
+        b"recovered accepted ca95ffeb30b36cb22feb7687034bd5c8d85a9332\nreboot_required=true\n";
+    let runner = SequencedRunner::new([Ok(CommandOutput::success(
+        recovery_output.to_vec(),
+        Vec::new(),
+    ))]);
+    let tool = DriverTool::new(
+        runner,
+        PathBuf::from("/cache/source"),
+        DriverPlan::CrossBuild {
+            source: PathBuf::from("/cache/source"),
+        },
+        DriverContext {
+            target: "pi@raspberrypi.local".into(),
+            running_kernel_release: "6.18.34+rpt-rpi-v8".into(),
+            candidate_kernel_release: "6.18.35+rpt-rpi-v8".into(),
+            target_identity_sha256: "a".repeat(64),
+            kernel_export: PathBuf::from("/cache/kernel"),
+            artifacts: PathBuf::from("/cache/artifacts"),
+            replace_overlay: "vc4-kms-dpi-hyperpixel2r".into(),
+        },
+        "0.1.0".into(),
+        DRIVER_COMMIT.into(),
+        REQUIRED_CAPABILITY.into(),
+    )
+    .expect("recovery protocol tool");
+
+    assert!(
+        tool.recover_accepted_protocol()
+            .expect("fixed recovery result")
+            .reboot_required
+    );
+}
+
+#[test]
+fn accepted_recovery_rejects_missing_duplicate_or_noncanonical_results() {
+    for output in [
+        b"recovered accepted\n".as_slice(),
+        b"reboot_required=true\nreboot_required=false\n".as_slice(),
+        b"reboot_required=yes\n".as_slice(),
+        b"reboot_required=false\nunknown=true\n".as_slice(),
+    ] {
+        let tool = DriverTool::new(
+            SequencedRunner::new([Ok(CommandOutput::success(output.to_vec(), Vec::new()))]),
+            PathBuf::from("/cache/source"),
+            DriverPlan::CrossBuild {
+                source: PathBuf::from("/cache/source"),
+            },
+            DriverContext {
+                target: "pi@raspberrypi.local".into(),
+                running_kernel_release: "6.18.34+rpt-rpi-v8".into(),
+                candidate_kernel_release: "6.18.35+rpt-rpi-v8".into(),
+                target_identity_sha256: "a".repeat(64),
+                kernel_export: PathBuf::from("/cache/kernel"),
+                artifacts: PathBuf::from("/cache/artifacts"),
+                replace_overlay: "vc4-kms-dpi-hyperpixel2r".into(),
+            },
+            "0.1.0".into(),
+            DRIVER_COMMIT.into(),
+            REQUIRED_CAPABILITY.into(),
+        )
+        .expect("recovery protocol tool");
+        assert!(
+            tool.recover_accepted_protocol().is_err(),
+            "accepted malformed recovery result: {:?}",
+            String::from_utf8_lossy(output)
+        );
+    }
 }
 
 #[test]

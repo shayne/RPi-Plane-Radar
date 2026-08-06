@@ -38,7 +38,7 @@ use planeradarctl::{
         LifecycleState, MANAGEMENT_HELPER_PROTOCOL, ManagementHelper, OperationsClient,
         ReleasePair, SshOperationsBackend, SystemCaptureClock, UninstallPhase,
     },
-    preflight::{SystemUnixClock, TargetPreflight},
+    preflight::{SystemUnixClock, TargetFacts, TargetPreflight},
     release::{GhReleaseSource, MANIFEST_NAME, ReleaseClient, ReleaseInput, Verifier},
     state::{
         ArtifactIdentity, InstallPhase, InstallState, LocalStateStore, OwnedFile, StateStore,
@@ -810,6 +810,7 @@ fn run_lifecycle_target(
         driver_tool: RefCell::new(None),
         protocol_tool: RefCell::new(None),
         retained_driver_transition: Cell::new(false),
+        inactive_driver_transition: Cell::new(false),
         #[cfg(test)]
         driver_protocol_actions: RefCell::new(None),
     };
@@ -850,6 +851,7 @@ struct SystemLifecycleBackend<R = SystemCommandRunner, C = SystemClock> {
     driver_tool: RefCell<Option<(ArtifactIdentity, DriverTool<SystemCommandRunner>)>>,
     protocol_tool: RefCell<Option<DriverTool<SystemCommandRunner>>>,
     retained_driver_transition: Cell<bool>,
+    inactive_driver_transition: Cell<bool>,
     #[cfg(test)]
     driver_protocol_actions: RefCell<Option<DriverProtocolActions>>,
 }
@@ -1035,15 +1037,21 @@ impl<R: TransportCommandRunner, C: Clock> SystemLifecycleBackend<R, C> {
         Ok((pair, payload))
     }
 
-    fn ensure_driver_tool(&self, identity: &ArtifactIdentity) -> Result<(), LifecycleError> {
-        if self
-            .driver_tool
-            .borrow()
-            .as_ref()
-            .is_some_and(|(current, _)| current == identity)
-        {
-            return Ok(());
-        }
+    fn fresh_target_facts(&self) -> Result<TargetFacts, LifecycleError> {
+        let target = self.target();
+        self.transport
+            .probe_identity_bound(&target, &self.expected_identity)
+            .map_err(|_| LifecycleError::Backend)?;
+        TargetPreflight::new(&self.transport, SystemUnixClock)
+            .facts(&target)
+            .map_err(|_| LifecycleError::Backend)
+    }
+
+    fn install_driver_tool(
+        &self,
+        identity: &ArtifactIdentity,
+        facts: TargetFacts,
+    ) -> Result<(), LifecycleError> {
         let lock = DriverLock {
             repository: planeradarctl::config::DRIVER_REPOSITORY.into(),
             version: Version::parse(&identity.version).map_err(|_| LifecycleError::Backend)?,
@@ -1051,9 +1059,6 @@ impl<R: TransportCommandRunner, C: Clock> SystemLifecycleBackend<R, C> {
             manifest_sha256: identity.sha256.clone(),
             required_capability: planeradarctl::config::REQUIRED_DRIVER_CAPABILITY.into(),
         };
-        let facts = TargetPreflight::new(&self.transport, SystemUnixClock)
-            .facts(&self.target())
-            .map_err(|_| LifecycleError::Backend)?;
         let probe = DriverTargetProbe::new(
             facts.candidate_kernel_release.clone(),
             facts.candidate_kernel_vermagic.clone(),
@@ -1088,13 +1093,24 @@ impl<R: TransportCommandRunner, C: Clock> SystemLifecycleBackend<R, C> {
         Ok(())
     }
 
+    fn ensure_driver_tool(&self, identity: &ArtifactIdentity) -> Result<(), LifecycleError> {
+        if self
+            .driver_tool
+            .borrow()
+            .as_ref()
+            .is_some_and(|(current, _)| current == identity)
+        {
+            return Ok(());
+        }
+        let facts = self.fresh_target_facts()?;
+        self.install_driver_tool(identity, facts)
+    }
+
     fn ensure_protocol_tool(&self) -> Result<(), LifecycleError> {
         if self.protocol_tool.borrow().is_some() {
             return Ok(());
         }
-        let facts = TargetPreflight::new(&self.transport, SystemUnixClock)
-            .facts(&self.target())
-            .map_err(|_| LifecycleError::Backend)?;
+        let facts = self.fresh_target_facts()?;
         let probe = DriverTargetProbe::new(
             facts.candidate_kernel_release.clone(),
             facts.candidate_kernel_vermagic.clone(),
@@ -1154,7 +1170,29 @@ impl<R: TransportCommandRunner, C: Clock> SystemLifecycleBackend<R, C> {
             .map_err(|_| LifecycleError::Backend)
     }
 
-    fn reboot_and_reconnect(&self, tryboot: bool) -> Result<(), LifecycleError> {
+    fn recover_driver_protocol(&self) -> Result<bool, LifecycleError> {
+        #[cfg(test)]
+        if let Some(actions) = self.driver_protocol_actions.borrow().as_ref() {
+            actions
+                .borrow_mut()
+                .push((DriverAction::RecoverAccepted, None));
+            return Ok(false);
+        }
+        self.ensure_protocol_tool()?;
+        self.protocol_tool
+            .borrow()
+            .as_ref()
+            .ok_or(LifecycleError::Backend)?
+            .recover_accepted_protocol()
+            .map(|result| result.reboot_required)
+            .map_err(|_| LifecycleError::Backend)
+    }
+
+    fn reboot_and_reconnect(
+        &self,
+        tryboot: bool,
+        driver: &ArtifactIdentity,
+    ) -> Result<(), LifecycleError> {
         let original = self.target();
         self.transport
             .probe_identity_bound(&original, &self.expected_identity)
@@ -1192,6 +1230,52 @@ impl<R: TransportCommandRunner, C: Clock> SystemLifecycleBackend<R, C> {
         *self.target.borrow_mut() = target;
         *self.driver_tool.borrow_mut() = None;
         *self.protocol_tool.borrow_mut() = None;
+        let facts = self.fresh_target_facts()?;
+        self.install_driver_tool(driver, facts)
+    }
+
+    fn quiesce_control_service(&self) -> Result<String, LifecycleError> {
+        let command = RemoteCommand::interactive_sudo([
+            "sudo",
+            "sh",
+            "-c",
+            "set -eu; systemctl is-enabled --quiet planeradar.service; systemctl stop planeradar.service; test \"$(systemctl show --property=ActiveState --value planeradar.service)\" = inactive; test \"$(systemctl show --property=MainPID --value planeradar.service)\" = 0; restarts=$(systemctl show --property=NRestarts --value planeradar.service); case \"$restarts\" in ''|*[!0-9]*) exit 1;; esac; printf '%s\\n' \"$restarts\"",
+            "planeradar-driver-quiesce",
+        ])
+        .map_err(|_| LifecycleError::Backend)?;
+        let output = self.run_remote(command)?;
+        let restarts = std::str::from_utf8(output.stdout())
+            .ok()
+            .and_then(|value| value.strip_suffix('\n'))
+            .filter(|value| !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()))
+            .ok_or(LifecycleError::Backend)?;
+        Ok(restarts.to_owned())
+    }
+
+    fn verify_control_service_quiesced(&self, restarts: &str) -> Result<(), LifecycleError> {
+        let command = RemoteCommand::interactive_sudo([
+            "sudo",
+            "sh",
+            "-c",
+            "set -eu; systemctl is-enabled --quiet planeradar.service; test \"$(systemctl show --property=ActiveState --value planeradar.service)\" = inactive; test \"$(systemctl show --property=MainPID --value planeradar.service)\" = 0; test \"$(systemctl show --property=NRestarts --value planeradar.service)\" = \"$1\"",
+            "planeradar-driver-quiesced",
+            restarts,
+        ])
+        .map_err(|_| LifecycleError::Backend)?;
+        self.run_remote(command)?;
+        Ok(())
+    }
+
+    fn verify_control_service_restarted(&self) -> Result<(), LifecycleError> {
+        let command = RemoteCommand::interactive_sudo([
+            "sudo",
+            "sh",
+            "-c",
+            "set -eu; systemctl is-enabled --quiet planeradar.service; systemctl is-active --quiet planeradar.service; test \"$(systemctl show --property=NRestarts --value planeradar.service)\" = 0; pid=$(systemctl show --property=MainPID --value planeradar.service); case \"$pid\" in ''|0|*[!0-9]*) exit 1;; esac",
+            "planeradar-driver-restarted",
+        ])
+        .map_err(|_| LifecycleError::Backend)?;
+        self.run_remote(command)?;
         Ok(())
     }
 
@@ -1672,10 +1756,19 @@ impl<R: TransportCommandRunner, C: Clock> LifecycleBackend for SystemLifecycleBa
             .skip(1)
             .any(|accepted| accepted.pair.driver == pair.driver);
         self.retained_driver_transition.set(retained);
+        self.inactive_driver_transition.set(false);
         if retained {
             return self.run_driver_protocol(DriverAction::StageRetained, Some(&pair.driver));
         }
         self.ensure_driver_tool(&pair.driver)?;
+        self.inactive_driver_transition.set(
+            self.driver_tool
+                .borrow()
+                .as_ref()
+                .ok_or(LifecycleError::Backend)?
+                .1
+                .requires_inactive_kernel_promotion(),
+        );
         let postconditions = {
             let driver = self.driver_tool.borrow();
             let tool = &driver.as_ref().ok_or(LifecycleError::Backend)?.1;
@@ -1700,7 +1793,7 @@ impl<R: TransportCommandRunner, C: Clock> LifecycleBackend for SystemLifecycleBa
     }
 
     fn tryboot_driver(&self, _pair: &ReleasePair) -> Result<(), LifecycleError> {
-        self.reboot_and_reconnect(true)
+        self.reboot_and_reconnect(true, &_pair.driver)
     }
 
     fn verify_tryboot_driver(&self, pair: &ReleasePair) -> Result<(), LifecycleError> {
@@ -1720,19 +1813,73 @@ impl<R: TransportCommandRunner, C: Clock> LifecycleBackend for SystemLifecycleBa
             return self.run_driver_protocol(DriverAction::CommitRetained, None);
         }
         self.ensure_driver_tool(&pair.driver)?;
+        {
+            let driver = self.driver_tool.borrow();
+            let tool = &driver.as_ref().ok_or(LifecycleError::Backend)?.1;
+            tool.run(DriverAction::CommitBoot)
+                .map_err(|_| LifecycleError::Backend)?;
+        }
+        if self.inactive_driver_transition.get() {
+            Ok(())
+        } else {
+            self.run_driver_protocol(DriverAction::MarkCommittedAccepted, None)
+        }
+    }
+
+    fn reboot_normal(&self, _pair: &ReleasePair) -> Result<(), LifecycleError> {
+        self.reboot_and_reconnect(false, &_pair.driver)
+    }
+
+    fn verify_explicit_normal_driver(&self, pair: &ReleasePair) -> Result<(), LifecycleError> {
+        *self.driver_tool.borrow_mut() = None;
+        let facts = self.fresh_target_facts()?;
+        self.install_driver_tool(&pair.driver, facts)?;
         self.driver_tool
             .borrow()
             .as_ref()
             .ok_or(LifecycleError::Backend)?
             .1
-            .run(DriverAction::CommitBoot)
-            .map(|_| ())
+            .verify_normal_boot()
             .map_err(|_| LifecycleError::Backend)?;
-        self.run_driver_protocol(DriverAction::MarkCommittedAccepted, None)
+        self.run_driver_protocol(
+            if self.inactive_driver_transition.get() {
+                DriverAction::MarkExplicitNormalVerified
+            } else {
+                DriverAction::MarkVerifiedAccepted
+            },
+            None,
+        )
     }
 
-    fn reboot_normal(&self, _pair: &ReleasePair) -> Result<(), LifecycleError> {
-        self.reboot_and_reconnect(false)
+    fn normalize_driver(&self, _pair: &ReleasePair) -> Result<(), LifecycleError> {
+        if !self.inactive_driver_transition.get() {
+            return Ok(());
+        }
+        let restarts = self.quiesce_control_service()?;
+        let mutation = self.run_driver_protocol(DriverAction::NormalizeInactiveKernel, None);
+        let quiesced = self.verify_control_service_quiesced(&restarts);
+        mutation?;
+        quiesced
+    }
+
+    fn verify_normalized_driver(&self, pair: &ReleasePair) -> Result<(), LifecycleError> {
+        *self.driver_tool.borrow_mut() = None;
+        let facts = self.fresh_target_facts()?;
+        if self.inactive_driver_transition.get() && !facts.conventional_candidate_is_running() {
+            return Err(LifecycleError::Backend);
+        }
+        self.install_driver_tool(&pair.driver, facts)?;
+        self.driver_tool
+            .borrow()
+            .as_ref()
+            .ok_or(LifecycleError::Backend)?
+            .1
+            .verify_normal_boot()
+            .map_err(|_| LifecycleError::Backend)?;
+        if self.inactive_driver_transition.get() {
+            self.run_driver_protocol(DriverAction::MarkNormalizedVerified, None)?;
+        }
+        self.verify_control_service_restarted()
     }
 
     fn activate_application(&self, pair: &ReleasePair) -> Result<Vec<OwnedFile>, LifecycleError> {
@@ -1769,19 +1916,6 @@ impl<R: TransportCommandRunner, C: Clock> LifecycleBackend for SystemLifecycleBa
             .verify_normal_boot()
             .map_err(|_| LifecycleError::Backend)?;
         self.verify_application(pair)?;
-        let state = self.read_private_lifecycle_state()?;
-        if state
-            .as_ref()
-            .and_then(LifecycleState::transaction)
-            .is_some_and(|transaction| {
-                transaction.candidate == *pair
-                    && transaction.prior.pair.driver != transaction.candidate.driver
-                    && transaction.phase
-                        == planeradarctl::operations::LifecyclePhase::ApplicationRestarted
-            })
-        {
-            self.run_driver_protocol(DriverAction::MarkVerifiedAccepted, None)?;
-        }
         Ok(())
     }
 
@@ -1804,24 +1938,21 @@ impl<R: TransportCommandRunner, C: Clock> LifecycleBackend for SystemLifecycleBa
     }
 
     fn restore_driver(&self, prior: &AcceptedPair) -> Result<(), LifecycleError> {
-        let _ = self.run_driver_protocol(DriverAction::RecoverAccepted, None);
+        let restarts = self.quiesce_control_service()?;
+        let reboot_required = self.recover_driver_protocol()?;
+        self.verify_control_service_quiesced(&restarts)?;
+        if reboot_required {
+            self.reboot_and_reconnect(false, &prior.pair.driver)?;
+        }
         self.ensure_driver_tool(&prior.pair.driver)?;
-        if self
-            .driver_tool
+        self.driver_tool
             .borrow()
             .as_ref()
             .ok_or(LifecycleError::Backend)?
             .1
             .verify_normal_boot()
-            .is_ok()
-        {
-            return Ok(());
-        }
-        self.stage_driver(&prior.pair)?;
-        self.tryboot_driver(&prior.pair)?;
-        self.verify_tryboot_driver(&prior.pair)?;
-        self.commit_driver(&prior.pair)?;
-        self.reboot_normal(&prior.pair)
+            .map(|_| ())
+            .map_err(|_| LifecycleError::Backend)
     }
 
     fn retire_candidate(&self, owned_files: &[OwnedFile]) -> Result<(), LifecycleError> {
@@ -1888,7 +2019,7 @@ impl<R: TransportCommandRunner, C: Clock> LifecycleBackend for SystemLifecycleBa
             return Err(LifecycleError::InvalidState);
         };
         self.run_driver_protocol(DriverAction::UninstallAccepted, Some(driver))?;
-        self.reboot_and_reconnect(false)?;
+        self.reboot_and_reconnect(false, driver)?;
         let overlay = format!(
             "/boot/firmware/overlays/hyperpixel2r-kms-{}.dtbo",
             &driver.source_commit[..12]
@@ -2527,12 +2658,13 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     use super::{
-        DriverProtocolActions, InstallCandidateState, InstallPhase, InstallState, MANIFEST_NAME,
-        SCREENSHOT_OPERATION_TIMEOUT, SystemLifecycleBackend, TargetIdentity, TransportError,
-        deploy_helper_command, final_reboot_command, finalize_lifecycle_uninstall_command,
-        preserve_lifecycle_helper_command, private_state_read_command, requested_version,
-        resume_state_matches, retire_lifecycle_helper_command, select_candidate_index,
-        tryboot_reboot_command, worker_exit_code,
+        DriverAction, DriverProtocolActions, InstallCandidateState, InstallPhase, InstallState,
+        MANIFEST_NAME, SCREENSHOT_OPERATION_TIMEOUT, SystemLifecycleBackend, TargetIdentity,
+        TransportError, deploy_helper_command, final_reboot_command,
+        finalize_lifecycle_uninstall_command, preserve_lifecycle_helper_command,
+        private_state_read_command, requested_version, resume_state_matches,
+        retire_lifecycle_helper_command, select_candidate_index, tryboot_reboot_command,
+        worker_exit_code,
     };
 
     #[test]
@@ -2708,6 +2840,7 @@ mod tests {
             driver_tool: RefCell::new(None),
             protocol_tool: RefCell::new(None),
             retained_driver_transition: std::cell::Cell::new(false),
+            inactive_driver_transition: std::cell::Cell::new(false),
             driver_protocol_actions: RefCell::new(driver_protocol_actions),
         }
     }
@@ -2768,6 +2901,7 @@ mod tests {
             driver_tool: RefCell::new(None),
             protocol_tool: RefCell::new(None),
             retained_driver_transition: std::cell::Cell::new(false),
+            inactive_driver_transition: std::cell::Cell::new(false),
             driver_protocol_actions: RefCell::new(None),
         };
 
@@ -2813,6 +2947,7 @@ mod tests {
             driver_tool: RefCell::new(None),
             protocol_tool: RefCell::new(None),
             retained_driver_transition: std::cell::Cell::new(false),
+            inactive_driver_transition: std::cell::Cell::new(false),
             driver_protocol_actions: RefCell::new(Some(actions.clone())),
         };
 
@@ -2825,6 +2960,49 @@ mod tests {
             actions.borrow().as_slice(),
             [(planeradarctl::driver::DriverAction::FinalizeAccepted, None)]
         );
+    }
+
+    #[test]
+    fn driver_normalization_quiesces_without_disabling_and_proves_no_writer_churn() {
+        let runner = ScriptedLifecycleRunner::new([
+            CommandOutput::success(b"7\n".to_vec(), Vec::new()),
+            CommandOutput::success(Vec::new(), Vec::new()),
+        ]);
+        let temporary = tempfile::tempdir().expect("temporary backend");
+        let candidate = release_pair("2.0.0", '2', 'b');
+        let actions = Rc::new(RefCell::new(Vec::new()));
+        let backend = scripted_backend(
+            &runner,
+            temporary.path(),
+            BTreeMap::new(),
+            None,
+            Some(actions.clone()),
+        );
+        backend.inactive_driver_transition.set(true);
+
+        planeradarctl::operations::LifecycleBackend::normalize_driver(&backend, &candidate)
+            .expect("quiesced driver normalization");
+
+        assert_eq!(
+            actions.borrow().as_slice(),
+            [(DriverAction::NormalizeInactiveKernel, None)]
+        );
+        let commands = runner
+            .invocations
+            .borrow()
+            .iter()
+            .map(|invocation| invocation.arguments().join(" "))
+            .collect::<Vec<_>>();
+        assert_eq!(commands.len(), 2);
+        assert!(commands[0].contains("systemctl stop planeradar.service"));
+        assert!(commands[0].contains("systemctl is-enabled --quiet planeradar.service"));
+        assert!(commands[0].contains("MainPID"));
+        assert!(commands[0].contains("NRestarts"));
+        assert!(commands[1].contains("NRestarts"));
+        assert!(commands[1].contains(" 7"));
+        assert!(commands.iter().all(|command| {
+            !command.contains("systemctl disable") && !command.contains("systemctl mask")
+        }));
     }
 
     #[test]

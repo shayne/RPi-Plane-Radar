@@ -84,6 +84,18 @@ pub struct DiagnosticFacts {
     pub overlay_sha256: String,
     pub expected_overlay_sha256: String,
     pub boot_config_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub normal_kernel_file: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub normal_kernel_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub normal_initramfs_file: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub normal_initramfs_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_dtb_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vc4_overlay_sha256: Option<String>,
     pub overlay_configured: bool,
     pub drm_device: String,
     pub drm_mode: String,
@@ -239,7 +251,7 @@ const DIAGNOSTIC_SCRIPT: &str = concat!(
     r#"field() { awk -F '\t' -v key="$1" '$1 == key { if (seen++) exit 2; value=$2 } END { if (!seen || value == "") exit 1; print value }' "$manifest"; }; "#,
     r#"test "$(awk -F '\t' 'NF != 2 || $1 == "" || $2 == "" || seen[$1]++ { bad=1 } END { print NR ":" bad+0 }' "$manifest")" = 17:0; for key in schema_version driver_version source_revision source_tree kernel_release architecture base_dtb_sha256 capability module_file module_sha256 module_vermagic overlay_file overlay_sha256 applied_dtb_file applied_dtb_sha256 backlight_rule_file backlight_rule_sha256; do test "$(awk -F '\t' -v key="$key" '$1 == key { count++ } END { print count+0 }' "$manifest")" = 1; done; driver_version=$(field driver_version); driver_revision=$(field source_revision); driver_manifest_sha256=$(sha256sum -- "$manifest" | awk '{print $1}'); expected_kernel=$(field kernel_release); expected_module_vermagic=$(field module_vermagic); module_file=$(field module_file); expected_module_sha256=$(field module_sha256); expected_overlay_file=$(field overlay_file); expected_overlay_sha256=$(field overlay_sha256); applied_dtb_file=$(field applied_dtb_file); expected_applied_dtb_sha256=$(field applied_dtb_sha256); backlight_rule_file=$(field backlight_rule_file); expected_backlight_rule_sha256=$(field backlight_rule_sha256); "#,
     r#"test "$(field schema_version)" = 2; test "$(field architecture)" = aarch64; test "$(field capability)" = pwm-backlight-v1; test "$driver_version" = "$1"; test "$driver_revision" = "$2"; valid_revision "$(field source_tree)"; valid_sha "$(field base_dtb_sha256)"; test "$expected_overlay_file" = "hyperpixel2r-kms-${2%${2#????????????}}.dtbo"; test "$module_file" = hyperpixel2r_kms.ko; test "$applied_dtb_file" = hyperpixel2r-kms-applied.dtb; test "$backlight_rule_file" = 70-planeradar-backlight.rules; for value in "$expected_module_sha256" "$expected_overlay_sha256" "$expected_applied_dtb_sha256" "$expected_backlight_rule_sha256"; do valid_sha "$value"; done; test "$expected_backlight_rule_sha256" = 579166d62b6444ea3b289b62d68a9c41ee3120262e2e2bca18967550e8423c11; regular "$driver_dir/$module_file" 644; digest "$driver_dir/$module_file" "$expected_module_sha256"; regular "$driver_dir/$expected_overlay_file" 644; digest "$driver_dir/$expected_overlay_file" "$expected_overlay_sha256"; regular "$driver_dir/$applied_dtb_file" 644; digest "$driver_dir/$applied_dtb_file" "$expected_applied_dtb_sha256"; regular "$driver_dir/$backlight_rule_file" 644; digest "$driver_dir/$backlight_rule_file" "$expected_backlight_rule_sha256"; installed_rule="/etc/udev/rules.d/$backlight_rule_file"; regular "$installed_rule" 644; digest "$installed_rule" "$expected_backlight_rule_sha256"; "#,
-    r#"accepted_root=/var/lib/hyperpixel2r-kms; accepted=$accepted_root/accepted-state; accepted_stock=$accepted_root/accepted-stock-config.txt; accepted_prior_rule=$accepted_root/accepted-prior-backlight-rule; config=/boot/firmware/config.txt; regular "$accepted" 600; regular "$accepted_stock" 600; boot_regular "$config"; test "$(awk -F= 'NF != 2 || $1 == "" || $2 == "" || seen[$1]++ { bad=1 } END { print NR ":" bad+0 }' "$accepted")" = 16:0; accepted_field() { awk -F= -v key="$1" '$1 == key { if (seen++) exit 2; value=$2 } END { if (!seen || value == "") exit 1; print value }' "$accepted"; }; for key in schema_version driver_version source_revision kernel_release manifest_sha256 module_file module_sha256 overlay_file overlay_sha256 normal_config_sha256 stock_config_sha256 prior_dkms_inventory_sha256 backlight_rule_file backlight_rule_sha256 prior_backlight_rule_existed prior_backlight_rule_sha256; do test "$(awk -F= -v key="$key" '$1 == key { count++ } END { print count+0 }' "$accepted")" = 1; done; accepted_driver_manifest_sha256=$(accepted_field manifest_sha256); test "$(accepted_field schema_version)" = 3; test "$(accepted_field driver_version)" = "$driver_version"; test "$(accepted_field source_revision)" = "$driver_revision"; test "$(accepted_field kernel_release)" = "$expected_kernel"; test "$(accepted_field module_file)" = "$module_file"; test "$(accepted_field module_sha256)" = "$expected_module_sha256"; test "$(accepted_field overlay_file)" = "$expected_overlay_file"; test "$(accepted_field overlay_sha256)" = "$expected_overlay_sha256"; test "$(accepted_field backlight_rule_file)" = "$backlight_rule_file"; test "$(accepted_field backlight_rule_sha256)" = "$expected_backlight_rule_sha256"; test "$accepted_driver_manifest_sha256" = "$driver_manifest_sha256"; for key in manifest_sha256 module_sha256 overlay_sha256 normal_config_sha256 stock_config_sha256 prior_dkms_inventory_sha256 backlight_rule_sha256; do valid_sha "$(accepted_field "$key")"; done; digest "$config" "$(accepted_field normal_config_sha256)"; digest "$accepted_stock" "$(accepted_field stock_config_sha256)"; marker=$driver_dir/dkms-prior-state; regular "$marker" 600; digest "$marker" "$(accepted_field prior_dkms_inventory_sha256)"; case "$(accepted_field prior_backlight_rule_existed)" in true) valid_sha "$(accepted_field prior_backlight_rule_sha256)"; regular "$accepted_prior_rule" 600; digest "$accepted_prior_rule" "$(accepted_field prior_backlight_rule_sha256)";; false) test "$(accepted_field prior_backlight_rule_sha256)" = none; absent "$accepted_prior_rule";; *) exit 1;; esac; prior_tryboot=$driver_dir/prior-tryboot.txt; live_tryboot=/boot/firmware/tryboot.txt; if test -L "$prior_tryboot" || test -L "$live_tryboot"; then exit 1; elif test -e "$prior_tryboot"; then regular "$prior_tryboot" 600; boot_regular "$live_tryboot"; digest "$live_tryboot" "$(sha256sum -- "$prior_tryboot" | awk '{print $1}')"; else absent "$prior_tryboot"; absent "$live_tryboot"; fi; "#,
+    r#"accepted_root=/var/lib/hyperpixel2r-kms; accepted=$accepted_root/accepted-state; accepted_stock=$accepted_root/accepted-stock-config.txt; accepted_prior_rule=$accepted_root/accepted-prior-backlight-rule; config=/boot/firmware/config.txt; regular "$accepted" 600; regular "$accepted_stock" 600; boot_regular "$config"; accepted_field() { awk -F= -v key="$1" '$1 == key { if (seen++) exit 2; value=$2 } END { if (!seen || value == "") exit 1; print value }' "$accepted"; }; accepted_schema=$(accepted_field schema_version); accepted_shape=$(awk -F= 'NF != 2 || $1 == "" || $2 == "" || seen[$1]++ { bad=1 } END { print NR ":" bad+0 }' "$accepted"); accepted_keys='schema_version driver_version source_revision kernel_release manifest_sha256 module_file module_sha256 overlay_file overlay_sha256 normal_config_sha256 stock_config_sha256 prior_dkms_inventory_sha256 backlight_rule_file backlight_rule_sha256 prior_backlight_rule_existed prior_backlight_rule_sha256'; case "$accepted_schema:$accepted_shape" in 3:16:0) ;; 4:22:0) accepted_keys="$accepted_keys normal_kernel_file normal_kernel_sha256 normal_initramfs_file normal_initramfs_sha256 base_dtb_sha256 vc4_overlay_sha256";; *) exit 1;; esac; for key in $accepted_keys; do test "$(awk -F= -v key="$key" '$1 == key { count++ } END { print count+0 }' "$accepted")" = 1; done; accepted_driver_manifest_sha256=$(accepted_field manifest_sha256); test "$(accepted_field driver_version)" = "$driver_version"; test "$(accepted_field source_revision)" = "$driver_revision"; test "$(accepted_field kernel_release)" = "$expected_kernel"; test "$(accepted_field module_file)" = "$module_file"; test "$(accepted_field module_sha256)" = "$expected_module_sha256"; test "$(accepted_field overlay_file)" = "$expected_overlay_file"; test "$(accepted_field overlay_sha256)" = "$expected_overlay_sha256"; test "$(accepted_field backlight_rule_file)" = "$backlight_rule_file"; test "$(accepted_field backlight_rule_sha256)" = "$expected_backlight_rule_sha256"; test "$accepted_driver_manifest_sha256" = "$driver_manifest_sha256"; for key in manifest_sha256 module_sha256 overlay_sha256 normal_config_sha256 stock_config_sha256 prior_dkms_inventory_sha256 backlight_rule_sha256; do valid_sha "$(accepted_field "$key")"; done; digest "$config" "$(accepted_field normal_config_sha256)"; digest "$accepted_stock" "$(accepted_field stock_config_sha256)"; marker=$driver_dir/dkms-prior-state; regular "$marker" 600; digest "$marker" "$(accepted_field prior_dkms_inventory_sha256)"; case "$(accepted_field prior_backlight_rule_existed)" in true) valid_sha "$(accepted_field prior_backlight_rule_sha256)"; regular "$accepted_prior_rule" 600; digest "$accepted_prior_rule" "$(accepted_field prior_backlight_rule_sha256)";; false) test "$(accepted_field prior_backlight_rule_sha256)" = none; absent "$accepted_prior_rule";; *) exit 1;; esac; prior_tryboot=$driver_dir/prior-tryboot.txt; live_tryboot=/boot/firmware/tryboot.txt; if test -L "$prior_tryboot" || test -L "$live_tryboot"; then exit 1; elif test -e "$prior_tryboot"; then regular "$prior_tryboot" 600; boot_regular "$live_tryboot"; digest "$live_tryboot" "$(sha256sum -- "$prior_tryboot" | awk '{print $1}')"; else absent "$prior_tryboot"; absent "$live_tryboot"; fi; normal_kernel_file=; normal_kernel_sha256=; normal_initramfs_file=; normal_initramfs_sha256=; base_dtb_sha256=; vc4_overlay_sha256=; if test "$accepted_schema" = 4; then normal_kernel_file=$(accepted_field normal_kernel_file); test "$normal_kernel_file" = kernel8.img; normal_kernel_sha256=$(accepted_field normal_kernel_sha256); normal_initramfs_file=$(accepted_field normal_initramfs_file); test "$normal_initramfs_file" = initramfs8; normal_initramfs_sha256=$(accepted_field normal_initramfs_sha256); base_dtb_sha256=$(accepted_field base_dtb_sha256); vc4_overlay_sha256=$(accepted_field vc4_overlay_sha256); for value in "$normal_kernel_sha256" "$normal_initramfs_sha256" "$base_dtb_sha256" "$vc4_overlay_sha256"; do valid_sha "$value"; done; normal_kernel=/boot/firmware/kernel8.img; normal_initramfs=/boot/firmware/initramfs8; active_base_dtb=/boot/firmware/bcm2710-rpi-zero-2-w.dtb; active_vc4_overlay=/boot/firmware/overlays/vc4-kms-v3d.dtbo; for file in "$normal_kernel" "$normal_initramfs" "$active_base_dtb" "$active_vc4_overlay"; do boot_regular "$file"; done; digest "$normal_kernel" "$normal_kernel_sha256"; digest "$normal_initramfs" "$normal_initramfs_sha256"; digest "$active_base_dtb" "$base_dtb_sha256"; digest "$active_vc4_overlay" "$vc4_overlay_sha256"; fi; "#,
     r#"running_kernel=$(uname -r); module_loaded=false; if awk '$1 == "hyperpixel2r_kms" { count++ } END { exit count != 1 }' /proc/modules; then module_loaded=true; fi; "#,
     r#"module_vermagic=$(/usr/sbin/modinfo -F vermagic hyperpixel2r_kms 2>/dev/null || printf unavailable); "#,
     r#"module_sha256=0000000000000000000000000000000000000000000000000000000000000000; module="/lib/modules/$expected_kernel/extra/$module_file"; if test ! -L "$module" && test -f "$module" && test "$(stat -c '%u:%g:%a' -- "$module")" = 0:0:644; then module_sha256=$(sha256sum -- "$module" | awk '{print $1}'); fi; "#,
@@ -249,8 +261,8 @@ const DIAGNOSTIC_SCRIPT: &str = concat!(
     r#"drm_device=unavailable; drm_mode=unavailable; renderer=unavailable; case "$service_main_pid:$service_invocation" in 0:*|*[!0-9]*:*|*:*[!0-9a-f]*) ;; *) card_count=0; for fd in /proc/"$service_main_pid"/fd/*; do target=$(readlink -- "$fd" 2>/dev/null || true); case "$target" in /dev/dri/card[0-9]*) if test "$drm_device" != unavailable && test "$drm_device" != "$target"; then card_count=2; break; fi; drm_device=$target; card_count=1;; esac; done; if test "$card_count" = 1 && test -c "$drm_device"; then card_name=${drm_device#/dev/dri/}; mode_file="/sys/class/drm/$card_name-DPI-1/modes"; drm_mode=$(sed -n '1p' "$mode_file" 2>/dev/null || true); test -n "$drm_mode" || drm_mode=unavailable; else drm_device=unavailable; fi; renderer=$(journalctl -b -u planeradar.service "_PID=$service_main_pid" "_SYSTEMD_INVOCATION_ID=$service_invocation" --no-pager -o cat 2>/dev/null | awk 'match($0, /render_driver=[^ ]+/) { value=substr($0, RSTART+14, RLENGTH-14); count++ } END { if (count == 1) print value }'); test -n "$renderer" || renderer=unavailable;; esac; "#,
     r#"touch_device=; touch_count=0; for name_file in /sys/class/input/event*/device/name; do test ! -L "$name_file" && test -f "$name_file" || continue; candidate=$(tr -d '\r\n' <"$name_file"); case "$candidate" in *HyperPixel*|*"generic ft5x06"*) touch_count=$((touch_count + 1)); touch_device=$candidate;; esac; done; test "$touch_count" -le 1; "#,
     r#"hostname=$(tr -d '\r\n' </etc/hostname); health_base64=; if health=$(curl --fail --silent --show-error --max-time 5 --max-filesize 4096 -H "Host: $hostname.local" http://127.0.0.1/healthz 2>/dev/null); then health_base64=$(printf %s "$health" | base64 -w0); fi; "#,
-    r#"printf '{"schema_version":1,"os_id":"%s","os_version":"%s","architecture":"%s","application_version":"%s","application_revision":"%s","application_sha256":"%s","driver_version":"%s","driver_revision":"%s","driver_manifest_sha256":"%s","accepted_driver_manifest_sha256":"%s","expected_kernel":"%s","running_kernel":"%s","module_loaded":%s,"module_vermagic":"%s","expected_module_vermagic":"%s","module_sha256":"%s","expected_module_sha256":"%s","overlay_file":"%s","expected_overlay_file":"%s","overlay_sha256":"%s","expected_overlay_sha256":"%s","boot_config_sha256":"%s","overlay_configured":%s,"drm_device":"%s","drm_mode":"%s","renderer":"%s","touch_device":"%s","service_active":%s,"service_restart_count":%s,"health_base64":"%s","hostname":"%s"}' "#,
-    r#""$os_id" "$os_version" "$architecture" "$application_version" "$application_revision" "$application_sha256" "$driver_version" "$driver_revision" "$driver_manifest_sha256" "$accepted_driver_manifest_sha256" "$expected_kernel" "$running_kernel" "$module_loaded" "$module_vermagic" "$expected_module_vermagic" "$module_sha256" "$expected_module_sha256" "$overlay_file" "$expected_overlay_file" "$overlay_sha256" "$expected_overlay_sha256" "$boot_config_sha256" "$overlay_configured" "$drm_device" "$drm_mode" "$renderer" "$touch_device" "$service_active" "$service_restart_count" "$health_base64" "$hostname""#,
+    r#"printf '{"schema_version":1,"os_id":"%s","os_version":"%s","architecture":"%s","application_version":"%s","application_revision":"%s","application_sha256":"%s","driver_version":"%s","driver_revision":"%s","driver_manifest_sha256":"%s","accepted_driver_manifest_sha256":"%s","expected_kernel":"%s","running_kernel":"%s","module_loaded":%s,"module_vermagic":"%s","expected_module_vermagic":"%s","module_sha256":"%s","expected_module_sha256":"%s","overlay_file":"%s","expected_overlay_file":"%s","overlay_sha256":"%s","expected_overlay_sha256":"%s","boot_config_sha256":"%s","normal_kernel_file":"%s","normal_kernel_sha256":"%s","normal_initramfs_file":"%s","normal_initramfs_sha256":"%s","base_dtb_sha256":"%s","vc4_overlay_sha256":"%s","overlay_configured":%s,"drm_device":"%s","drm_mode":"%s","renderer":"%s","touch_device":"%s","service_active":%s,"service_restart_count":%s,"health_base64":"%s","hostname":"%s"}' "#,
+    r#""$os_id" "$os_version" "$architecture" "$application_version" "$application_revision" "$application_sha256" "$driver_version" "$driver_revision" "$driver_manifest_sha256" "$accepted_driver_manifest_sha256" "$expected_kernel" "$running_kernel" "$module_loaded" "$module_vermagic" "$expected_module_vermagic" "$module_sha256" "$expected_module_sha256" "$overlay_file" "$expected_overlay_file" "$overlay_sha256" "$expected_overlay_sha256" "$boot_config_sha256" "$normal_kernel_file" "$normal_kernel_sha256" "$normal_initramfs_file" "$normal_initramfs_sha256" "$base_dtb_sha256" "$vc4_overlay_sha256" "$overlay_configured" "$drm_device" "$drm_mode" "$renderer" "$touch_device" "$service_active" "$service_restart_count" "$health_base64" "$hostname""#,
 );
 
 #[derive(Deserialize)]
@@ -279,6 +291,12 @@ struct DiagnosticProbe {
     overlay_sha256: String,
     expected_overlay_sha256: String,
     boot_config_sha256: String,
+    normal_kernel_file: String,
+    normal_kernel_sha256: String,
+    normal_initramfs_file: String,
+    normal_initramfs_sha256: String,
+    base_dtb_sha256: String,
+    vc4_overlay_sha256: String,
     overlay_configured: bool,
     drm_device: String,
     drm_mode: String,
@@ -462,6 +480,17 @@ impl<T: Transport> OperationsBackend for SshOperationsBackend<'_, T> {
             overlay_sha256: probe.overlay_sha256,
             expected_overlay_sha256: probe.expected_overlay_sha256,
             boot_config_sha256: probe.boot_config_sha256,
+            normal_kernel_file: (!probe.normal_kernel_file.is_empty())
+                .then_some(probe.normal_kernel_file),
+            normal_kernel_sha256: (!probe.normal_kernel_sha256.is_empty())
+                .then_some(probe.normal_kernel_sha256),
+            normal_initramfs_file: (!probe.normal_initramfs_file.is_empty())
+                .then_some(probe.normal_initramfs_file),
+            normal_initramfs_sha256: (!probe.normal_initramfs_sha256.is_empty())
+                .then_some(probe.normal_initramfs_sha256),
+            base_dtb_sha256: (!probe.base_dtb_sha256.is_empty()).then_some(probe.base_dtb_sha256),
+            vc4_overlay_sha256: (!probe.vc4_overlay_sha256.is_empty())
+                .then_some(probe.vc4_overlay_sha256),
             overlay_configured: probe.overlay_configured,
             drm_device: probe.drm_device,
             drm_mode: probe.drm_mode,
@@ -874,6 +903,35 @@ fn validate_facts(facts: &DiagnosticFacts) -> Result<(), OperationError> {
     }
     if let Some(touch) = &facts.touch_device {
         validate_field(touch)?;
+    }
+    let provenance = [
+        facts.normal_kernel_file.as_deref(),
+        facts.normal_kernel_sha256.as_deref(),
+        facts.normal_initramfs_file.as_deref(),
+        facts.normal_initramfs_sha256.as_deref(),
+        facts.base_dtb_sha256.as_deref(),
+        facts.vc4_overlay_sha256.as_deref(),
+    ];
+    if provenance.iter().any(Option::is_some) != provenance.iter().all(Option::is_some) {
+        return Err(OperationError::MalformedFacts);
+    }
+    if let [
+        Some(kernel_file),
+        Some(kernel_sha),
+        Some(initramfs_file),
+        Some(initramfs_sha),
+        Some(base_dtb_sha),
+        Some(vc4_overlay_sha),
+    ] = provenance
+    {
+        if kernel_file != "kernel8.img"
+            || initramfs_file != "initramfs8"
+            || ![kernel_sha, initramfs_sha, base_dtb_sha, vc4_overlay_sha]
+                .into_iter()
+                .all(|digest| is_lower_hex(digest, 64))
+        {
+            return Err(OperationError::MalformedFacts);
+        }
     }
     for artifact in [
         &facts.installed_application,
@@ -1303,6 +1361,10 @@ pub enum LifecyclePhase {
     DriverStaged,
     TrybootVerified,
     DriverCommitted,
+    ExplicitNormalVerified,
+    DriverNormalized,
+    NormalizedBootVerified,
+    /// Legacy pre-application phase retained for persisted lifecycle compatibility.
     NormalBootVerified,
     ApplicationActivated,
     ApplicationRestarted,
@@ -1718,6 +1780,9 @@ pub trait LifecycleBackend {
     fn verify_tryboot_driver(&self, pair: &ReleasePair) -> Result<(), LifecycleError>;
     fn commit_driver(&self, pair: &ReleasePair) -> Result<(), LifecycleError>;
     fn reboot_normal(&self, pair: &ReleasePair) -> Result<(), LifecycleError>;
+    fn verify_explicit_normal_driver(&self, pair: &ReleasePair) -> Result<(), LifecycleError>;
+    fn normalize_driver(&self, pair: &ReleasePair) -> Result<(), LifecycleError>;
+    fn verify_normalized_driver(&self, pair: &ReleasePair) -> Result<(), LifecycleError>;
     fn activate_application(&self, pair: &ReleasePair) -> Result<Vec<OwnedFile>, LifecycleError>;
     fn restart_application(&self) -> Result<(), LifecycleError>;
     fn verify_pair(&self, pair: &ReleasePair) -> Result<(), LifecycleError>;
@@ -1935,7 +2000,13 @@ impl<'a, B: LifecycleBackend> LifecycleManager<'a, B> {
             self.backend.commit_driver(pair)?;
             self.persist_phase(state, LifecyclePhase::DriverCommitted)?;
             self.backend.reboot_normal(pair)?;
-            self.persist_phase(state, LifecyclePhase::NormalBootVerified)?;
+            self.backend.verify_explicit_normal_driver(pair)?;
+            self.persist_phase(state, LifecyclePhase::ExplicitNormalVerified)?;
+            self.backend.normalize_driver(pair)?;
+            self.persist_phase(state, LifecyclePhase::DriverNormalized)?;
+            self.backend.reboot_normal(pair)?;
+            self.backend.verify_normalized_driver(pair)?;
+            self.persist_phase(state, LifecyclePhase::NormalizedBootVerified)?;
         }
         let owned_files = self.backend.activate_application(pair)?;
         self.persist_phase(state, LifecyclePhase::ApplicationActivated)?;

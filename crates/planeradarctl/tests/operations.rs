@@ -71,6 +71,12 @@ fn healthy_facts() -> DiagnosticFacts {
         overlay_sha256: OVERLAY_SHA256.into(),
         expected_overlay_sha256: OVERLAY_SHA256.into(),
         boot_config_sha256: BOOT_CONFIG_SHA256.into(),
+        normal_kernel_file: None,
+        normal_kernel_sha256: None,
+        normal_initramfs_file: None,
+        normal_initramfs_sha256: None,
+        base_dtb_sha256: None,
+        vc4_overlay_sha256: None,
         overlay_configured: true,
         drm_device: "/dev/dri/card0".into(),
         drm_mode: "480x480".into(),
@@ -470,6 +476,37 @@ fn status_is_concise_on_success_and_typed_on_failure() {
     assert_eq!(
         client.status().expect_err("unhealthy status"),
         OperationError::Unhealthy(DiagnosticCode::HttpFailure)
+    );
+}
+
+#[test]
+fn boot_provenance_is_optional_and_does_not_replace_public_driver_identity() {
+    let backend = FakeBackend::healthy(rgba_png(480, 480));
+    let mut facts = healthy_facts();
+    facts.normal_kernel_file = Some("kernel8.img".into());
+    facts.normal_kernel_sha256 = Some("a".repeat(64));
+    facts.normal_initramfs_file = Some("initramfs8".into());
+    facts.normal_initramfs_sha256 = Some("b".repeat(64));
+    facts.base_dtb_sha256 = Some("c".repeat(64));
+    facts.vc4_overlay_sha256 = Some("d".repeat(64));
+    *backend.facts.borrow_mut() = Ok(facts.clone());
+
+    let report = OperationsClient::new(&backend, FakeClock::default())
+        .doctor()
+        .expect("schema-4 boot provenance");
+
+    assert_eq!(
+        report.facts.normal_kernel_file.as_deref(),
+        Some("kernel8.img")
+    );
+    assert_eq!(
+        report.facts.normal_initramfs_file.as_deref(),
+        Some("initramfs8")
+    );
+    assert_eq!(report.facts.installed_driver, facts.installed_driver);
+    assert_eq!(
+        report.facts.accepted_driver_manifest_sha256,
+        facts.accepted_driver_manifest_sha256
     );
 }
 
@@ -1076,7 +1113,7 @@ fn diagnostic_probe_json() -> Vec<u8> {
         ),
     );
     format!(
-        r#"{{"schema_version":1,"os_id":"raspbian","os_version":"13","architecture":"arm64","application_version":"0.1.0","application_revision":"{APP_REVISION}","application_sha256":"{APP_SHA256}","driver_version":"{DRIVER_VERSION}","driver_revision":"{DRIVER_REVISION}","driver_manifest_sha256":"{DRIVER_MANIFEST}","accepted_driver_manifest_sha256":"{DRIVER_MANIFEST}","expected_kernel":"{KERNEL}","running_kernel":"{KERNEL}","module_loaded":true,"module_vermagic":"{VERMAGIC}","expected_module_vermagic":"{VERMAGIC}","module_sha256":"{MODULE_SHA256}","expected_module_sha256":"{MODULE_SHA256}","overlay_file":"hyperpixel2r-kms-261a29f45963.dtbo","expected_overlay_file":"hyperpixel2r-kms-261a29f45963.dtbo","overlay_sha256":"{OVERLAY_SHA256}","expected_overlay_sha256":"{OVERLAY_SHA256}","boot_config_sha256":"{BOOT_CONFIG_SHA256}","overlay_configured":true,"drm_device":"/dev/dri/card0","drm_mode":"480x480","renderer":"opengles2","touch_device":"HyperPixel 2.1 Round Touch","service_active":true,"service_restart_count":0,"health_base64":"{health}","hostname":"planeradar"}}"#
+        r#"{{"schema_version":1,"os_id":"raspbian","os_version":"13","architecture":"arm64","application_version":"0.1.0","application_revision":"{APP_REVISION}","application_sha256":"{APP_SHA256}","driver_version":"{DRIVER_VERSION}","driver_revision":"{DRIVER_REVISION}","driver_manifest_sha256":"{DRIVER_MANIFEST}","accepted_driver_manifest_sha256":"{DRIVER_MANIFEST}","expected_kernel":"{KERNEL}","running_kernel":"{KERNEL}","module_loaded":true,"module_vermagic":"{VERMAGIC}","expected_module_vermagic":"{VERMAGIC}","module_sha256":"{MODULE_SHA256}","expected_module_sha256":"{MODULE_SHA256}","overlay_file":"hyperpixel2r-kms-261a29f45963.dtbo","expected_overlay_file":"hyperpixel2r-kms-261a29f45963.dtbo","overlay_sha256":"{OVERLAY_SHA256}","expected_overlay_sha256":"{OVERLAY_SHA256}","boot_config_sha256":"{BOOT_CONFIG_SHA256}","normal_kernel_file":"","normal_kernel_sha256":"","normal_initramfs_file":"","normal_initramfs_sha256":"","base_dtb_sha256":"","vc4_overlay_sha256":"","overlay_configured":true,"drm_device":"/dev/dri/card0","drm_mode":"480x480","renderer":"opengles2","touch_device":"HyperPixel 2.1 Round Touch","service_active":true,"service_restart_count":0,"health_base64":"{health}","hostname":"planeradar"}}"#
     )
     .into_bytes()
 }
@@ -1472,6 +1509,42 @@ fn production_backend_collects_strict_fixed_diagnostics_without_mutating_target(
     let flattened = commands.concat().join(" ");
     assert!(!flattened.contains("latitude"));
     assert!(!flattened.contains("longitude"));
+}
+
+#[test]
+fn production_doctor_accepts_only_exact_schema_three_or_schema_four_receipt_keys() {
+    let transport = RecordingTransport::default();
+    transport.outputs.borrow_mut().extend([
+        Ok(Output::success(target_state_json(), Vec::new())),
+        Ok(Output::success(diagnostic_probe_json(), Vec::new())),
+    ]);
+    let backend = SshOperationsBackend::new(
+        &transport,
+        "pi@raspberrypi.local".parse().expect("target"),
+        DriverLock::checked_in().expect("driver lock"),
+    );
+
+    OperationsClient::new(&backend, FakeClock::default())
+        .doctor()
+        .expect("doctor");
+
+    let commands = transport.commands.borrow();
+    let program = &commands[1][6];
+    assert!(program.contains("3:16:0"));
+    assert!(program.contains("4:22:0"));
+    for binding in [
+        "test \"$normal_kernel_file\" = kernel8.img",
+        "test \"$normal_initramfs_file\" = initramfs8",
+        "/boot/firmware/kernel8.img",
+        "/boot/firmware/initramfs8",
+        "/boot/firmware/bcm2710-rpi-zero-2-w.dtb",
+        "/boot/firmware/overlays/vc4-kms-v3d.dtbo",
+    ] {
+        assert!(
+            program.contains(binding),
+            "schema-4 probe omitted {binding}"
+        );
+    }
 }
 
 #[test]
