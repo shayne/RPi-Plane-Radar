@@ -811,6 +811,7 @@ fn run_lifecycle_target(
         protocol_tool: RefCell::new(None),
         retained_driver_transition: Cell::new(false),
         inactive_driver_transition: Cell::new(false),
+        candidate_kernel_intent: RefCell::new(None),
         #[cfg(test)]
         driver_protocol_actions: RefCell::new(None),
     };
@@ -835,6 +836,60 @@ fn run_lifecycle_target(
 #[cfg(test)]
 type DriverProtocolActions = std::rc::Rc<RefCell<Vec<(DriverAction, Option<String>)>>>;
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CandidateKernelIntent {
+    release: String,
+}
+
+impl CandidateKernelIntent {
+    fn from_facts(facts: &TargetFacts) -> Result<Self, LifecycleError> {
+        let intent = Self {
+            release: facts.candidate_kernel_release.clone(),
+        };
+        intent.prove_facts(facts)?;
+        Ok(intent)
+    }
+
+    fn release(&self) -> &str {
+        &self.release
+    }
+
+    fn prove_facts(&self, facts: &TargetFacts) -> Result<(), LifecycleError> {
+        self.prove_selected_candidate(
+            &facts.candidate_kernel_release,
+            facts.candidate_kernel_match_count,
+            &facts.boot_selected_kernel_release,
+            facts.boot_selected_kernel_match_count,
+            facts.boot_kernel_override_conflicting,
+        )
+    }
+
+    fn prove_selected_candidate(
+        &self,
+        candidate_release: &str,
+        candidate_match_count: u8,
+        boot_selected_release: &str,
+        boot_selected_match_count: u8,
+        boot_override_conflicting: bool,
+    ) -> Result<(), LifecycleError> {
+        if boot_override_conflicting
+            || candidate_match_count != 1
+            || boot_selected_match_count != 1
+            || candidate_release != self.release
+            || boot_selected_release != self.release
+        {
+            return Err(LifecycleError::Backend);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DriverReconnectPurpose {
+    CandidatePromotion,
+    TargetJournalRecovery,
+}
+
 struct SystemLifecycleBackend<R = SystemCommandRunner, C = SystemClock> {
     transport: OpenSshTransport<R, C>,
     target: RefCell<SshTarget>,
@@ -852,6 +907,7 @@ struct SystemLifecycleBackend<R = SystemCommandRunner, C = SystemClock> {
     protocol_tool: RefCell<Option<DriverTool<SystemCommandRunner>>>,
     retained_driver_transition: Cell<bool>,
     inactive_driver_transition: Cell<bool>,
+    candidate_kernel_intent: RefCell<Option<CandidateKernelIntent>>,
     #[cfg(test)]
     driver_protocol_actions: RefCell<Option<DriverProtocolActions>>,
 }
@@ -1051,7 +1107,15 @@ impl<R: TransportCommandRunner, C: Clock> SystemLifecycleBackend<R, C> {
         &self,
         identity: &ArtifactIdentity,
         facts: TargetFacts,
+        candidate_intent: Option<&CandidateKernelIntent>,
     ) -> Result<(), LifecycleError> {
+        if let Some(intent) = candidate_intent {
+            intent.prove_facts(&facts)?;
+        }
+        let candidate_kernel_release = candidate_intent
+            .map(CandidateKernelIntent::release)
+            .unwrap_or(&facts.candidate_kernel_release)
+            .to_owned();
         let lock = DriverLock {
             repository: planeradarctl::config::DRIVER_REPOSITORY.into(),
             version: Version::parse(&identity.version).map_err(|_| LifecycleError::Backend)?,
@@ -1060,7 +1124,7 @@ impl<R: TransportCommandRunner, C: Clock> SystemLifecycleBackend<R, C> {
             required_capability: planeradarctl::config::REQUIRED_DRIVER_CAPABILITY.into(),
         };
         let probe = DriverTargetProbe::new(
-            facts.candidate_kernel_release.clone(),
+            candidate_kernel_release.clone(),
             facts.candidate_kernel_vermagic.clone(),
         )
         .map_err(|_| LifecycleError::Backend)?;
@@ -1078,12 +1142,12 @@ impl<R: TransportCommandRunner, C: Clock> SystemLifecycleBackend<R, C> {
                 DriverContext {
                     target: self.target().ssh_destination(),
                     running_kernel_release: facts.kernel_release.clone(),
-                    candidate_kernel_release: facts.candidate_kernel_release.clone(),
+                    candidate_kernel_release: candidate_kernel_release.clone(),
                     target_identity_sha256: self.expected_identity.driver_binding_sha256(),
                     kernel_export: self
                         .cache_root
                         .join("kernel-export")
-                        .join(&facts.candidate_kernel_release),
+                        .join(&candidate_kernel_release),
                     artifacts: self.cache_root.join("driver-artifacts"),
                     replace_overlay: facts.replace_overlay.clone(),
                 },
@@ -1103,7 +1167,20 @@ impl<R: TransportCommandRunner, C: Clock> SystemLifecycleBackend<R, C> {
             return Ok(());
         }
         let facts = self.fresh_target_facts()?;
-        self.install_driver_tool(identity, facts)
+        self.install_driver_tool(identity, facts, None)
+    }
+
+    fn install_candidate_driver_tool(
+        &self,
+        identity: &ArtifactIdentity,
+        facts: TargetFacts,
+    ) -> Result<(), LifecycleError> {
+        let intent = self
+            .candidate_kernel_intent
+            .borrow()
+            .clone()
+            .ok_or(LifecycleError::Backend)?;
+        self.install_driver_tool(identity, facts, Some(&intent))
     }
 
     fn ensure_protocol_tool(&self) -> Result<(), LifecycleError> {
@@ -1192,6 +1269,7 @@ impl<R: TransportCommandRunner, C: Clock> SystemLifecycleBackend<R, C> {
         &self,
         tryboot: bool,
         driver: &ArtifactIdentity,
+        purpose: DriverReconnectPurpose,
     ) -> Result<(), LifecycleError> {
         let original = self.target();
         self.transport
@@ -1231,7 +1309,14 @@ impl<R: TransportCommandRunner, C: Clock> SystemLifecycleBackend<R, C> {
         *self.driver_tool.borrow_mut() = None;
         *self.protocol_tool.borrow_mut() = None;
         let facts = self.fresh_target_facts()?;
-        self.install_driver_tool(driver, facts)
+        match purpose {
+            DriverReconnectPurpose::CandidatePromotion => {
+                self.install_candidate_driver_tool(driver, facts)
+            }
+            DriverReconnectPurpose::TargetJournalRecovery => {
+                self.install_driver_tool(driver, facts, None)
+            }
+        }
     }
 
     fn quiesce_control_service(&self) -> Result<String, LifecycleError> {
@@ -1757,10 +1842,13 @@ impl<R: TransportCommandRunner, C: Clock> LifecycleBackend for SystemLifecycleBa
             .any(|accepted| accepted.pair.driver == pair.driver);
         self.retained_driver_transition.set(retained);
         self.inactive_driver_transition.set(false);
+        let facts = self.fresh_target_facts()?;
+        let intent = CandidateKernelIntent::from_facts(&facts)?;
+        *self.candidate_kernel_intent.borrow_mut() = Some(intent.clone());
         if retained {
             return self.run_driver_protocol(DriverAction::StageRetained, Some(&pair.driver));
         }
-        self.ensure_driver_tool(&pair.driver)?;
+        self.install_driver_tool(&pair.driver, facts, Some(&intent))?;
         self.inactive_driver_transition.set(
             self.driver_tool
                 .borrow()
@@ -1793,7 +1881,11 @@ impl<R: TransportCommandRunner, C: Clock> LifecycleBackend for SystemLifecycleBa
     }
 
     fn tryboot_driver(&self, _pair: &ReleasePair) -> Result<(), LifecycleError> {
-        self.reboot_and_reconnect(true, &_pair.driver)
+        self.reboot_and_reconnect(
+            true,
+            &_pair.driver,
+            DriverReconnectPurpose::CandidatePromotion,
+        )
     }
 
     fn verify_tryboot_driver(&self, pair: &ReleasePair) -> Result<(), LifecycleError> {
@@ -1827,13 +1919,17 @@ impl<R: TransportCommandRunner, C: Clock> LifecycleBackend for SystemLifecycleBa
     }
 
     fn reboot_normal(&self, _pair: &ReleasePair) -> Result<(), LifecycleError> {
-        self.reboot_and_reconnect(false, &_pair.driver)
+        self.reboot_and_reconnect(
+            false,
+            &_pair.driver,
+            DriverReconnectPurpose::CandidatePromotion,
+        )
     }
 
     fn verify_explicit_normal_driver(&self, pair: &ReleasePair) -> Result<(), LifecycleError> {
         *self.driver_tool.borrow_mut() = None;
         let facts = self.fresh_target_facts()?;
-        self.install_driver_tool(&pair.driver, facts)?;
+        self.install_candidate_driver_tool(&pair.driver, facts)?;
         self.driver_tool
             .borrow()
             .as_ref()
@@ -1865,10 +1961,16 @@ impl<R: TransportCommandRunner, C: Clock> LifecycleBackend for SystemLifecycleBa
     fn verify_normalized_driver(&self, pair: &ReleasePair) -> Result<(), LifecycleError> {
         *self.driver_tool.borrow_mut() = None;
         let facts = self.fresh_target_facts()?;
+        let intent = self
+            .candidate_kernel_intent
+            .borrow()
+            .clone()
+            .ok_or(LifecycleError::Backend)?;
+        intent.prove_facts(&facts)?;
         if self.inactive_driver_transition.get() && !facts.conventional_candidate_is_running() {
             return Err(LifecycleError::Backend);
         }
-        self.install_driver_tool(&pair.driver, facts)?;
+        self.install_driver_tool(&pair.driver, facts, Some(&intent))?;
         self.driver_tool
             .borrow()
             .as_ref()
@@ -1920,7 +2022,9 @@ impl<R: TransportCommandRunner, C: Clock> LifecycleBackend for SystemLifecycleBa
     }
 
     fn finalize_driver_acceptance(&self, _pair: &ReleasePair) -> Result<(), LifecycleError> {
-        self.run_driver_protocol(DriverAction::FinalizeAccepted, None)
+        self.run_driver_protocol(DriverAction::FinalizeAccepted, None)?;
+        *self.candidate_kernel_intent.borrow_mut() = None;
+        Ok(())
     }
 
     fn restore_application(&self, prior: &AcceptedPair) -> Result<Vec<OwnedFile>, LifecycleError> {
@@ -1941,8 +2045,14 @@ impl<R: TransportCommandRunner, C: Clock> LifecycleBackend for SystemLifecycleBa
         let restarts = self.quiesce_control_service()?;
         let reboot_required = self.recover_driver_protocol()?;
         self.verify_control_service_quiesced(&restarts)?;
+        *self.candidate_kernel_intent.borrow_mut() = None;
+        *self.driver_tool.borrow_mut() = None;
         if reboot_required {
-            self.reboot_and_reconnect(false, &prior.pair.driver)?;
+            self.reboot_and_reconnect(
+                false,
+                &prior.pair.driver,
+                DriverReconnectPurpose::TargetJournalRecovery,
+            )?;
         }
         self.ensure_driver_tool(&prior.pair.driver)?;
         self.driver_tool
@@ -2019,7 +2129,8 @@ impl<R: TransportCommandRunner, C: Clock> LifecycleBackend for SystemLifecycleBa
             return Err(LifecycleError::InvalidState);
         };
         self.run_driver_protocol(DriverAction::UninstallAccepted, Some(driver))?;
-        self.reboot_and_reconnect(false, driver)?;
+        *self.candidate_kernel_intent.borrow_mut() = None;
+        self.reboot_and_reconnect(false, driver, DriverReconnectPurpose::TargetJournalRecovery)?;
         let overlay = format!(
             "/boot/firmware/overlays/hyperpixel2r-kms-{}.dtbo",
             &driver.source_commit[..12]
@@ -2658,13 +2769,13 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     use super::{
-        DriverAction, DriverProtocolActions, InstallCandidateState, InstallPhase, InstallState,
-        MANIFEST_NAME, SCREENSHOT_OPERATION_TIMEOUT, SystemLifecycleBackend, TargetIdentity,
-        TransportError, deploy_helper_command, final_reboot_command,
-        finalize_lifecycle_uninstall_command, preserve_lifecycle_helper_command,
-        private_state_read_command, requested_version, resume_state_matches,
-        retire_lifecycle_helper_command, select_candidate_index, tryboot_reboot_command,
-        worker_exit_code,
+        CandidateKernelIntent, DriverAction, DriverProtocolActions, InstallCandidateState,
+        InstallPhase, InstallState, LifecycleError, MANIFEST_NAME, SCREENSHOT_OPERATION_TIMEOUT,
+        SystemLifecycleBackend, TargetIdentity, TransportError, deploy_helper_command,
+        final_reboot_command, finalize_lifecycle_uninstall_command,
+        preserve_lifecycle_helper_command, private_state_read_command, requested_version,
+        resume_state_matches, retire_lifecycle_helper_command, select_candidate_index,
+        tryboot_reboot_command, worker_exit_code,
     };
 
     #[test]
@@ -2841,6 +2952,7 @@ mod tests {
             protocol_tool: RefCell::new(None),
             retained_driver_transition: std::cell::Cell::new(false),
             inactive_driver_transition: std::cell::Cell::new(false),
+            candidate_kernel_intent: RefCell::new(None),
             driver_protocol_actions: RefCell::new(driver_protocol_actions),
         }
     }
@@ -2858,6 +2970,80 @@ mod tests {
                 sha256: driver_seed.to_string().repeat(64),
             },
         }
+    }
+
+    #[test]
+    fn candidate_kernel_intent_retains_the_pre_tryboot_release_across_reconnects() {
+        let intent = CandidateKernelIntent {
+            release: "6.18.35+rpt-rpi-v8".into(),
+        };
+
+        for _reconnect in 0..2 {
+            intent
+                .prove_selected_candidate("6.18.35+rpt-rpi-v8", 1, "6.18.35+rpt-rpi-v8", 1, false)
+                .expect("fresh facts retain exact candidate intent");
+            assert_eq!(intent.release(), "6.18.35+rpt-rpi-v8");
+        }
+    }
+
+    #[test]
+    fn candidate_kernel_intent_fails_closed_on_candidate_or_selector_drift() {
+        let intent = CandidateKernelIntent {
+            release: "6.18.35+rpt-rpi-v8".into(),
+        };
+
+        for result in [
+            intent.prove_selected_candidate(
+                "6.18.36+rpt-rpi-v8",
+                1,
+                "6.18.36+rpt-rpi-v8",
+                1,
+                false,
+            ),
+            intent.prove_selected_candidate(
+                "6.18.35+rpt-rpi-v8",
+                1,
+                "6.18.34+rpt-rpi-v8",
+                1,
+                false,
+            ),
+            intent.prove_selected_candidate(
+                "6.18.35+rpt-rpi-v8",
+                2,
+                "6.18.35+rpt-rpi-v8",
+                1,
+                false,
+            ),
+            intent.prove_selected_candidate("6.18.35+rpt-rpi-v8", 1, "6.18.35+rpt-rpi-v8", 1, true),
+        ] {
+            assert_eq!(result, Err(LifecycleError::Backend));
+        }
+    }
+
+    #[test]
+    fn fresh_process_recovers_from_the_target_journal_without_guessing_candidate_intent() {
+        let runner = ScriptedLifecycleRunner::new([]);
+        let temporary = tempfile::tempdir().expect("temporary backend");
+        let actions = Rc::new(RefCell::new(Vec::new()));
+        let backend = scripted_backend(
+            &runner,
+            temporary.path(),
+            BTreeMap::new(),
+            None,
+            Some(actions.clone()),
+        );
+
+        assert!(backend.candidate_kernel_intent.borrow().is_none());
+        assert!(
+            !backend
+                .recover_driver_protocol()
+                .expect("target journal recovery")
+        );
+        assert!(backend.candidate_kernel_intent.borrow().is_none());
+        assert_eq!(
+            actions.borrow().as_slice(),
+            [(DriverAction::RecoverAccepted, None)]
+        );
     }
 
     #[test]
@@ -2902,6 +3088,7 @@ mod tests {
             protocol_tool: RefCell::new(None),
             retained_driver_transition: std::cell::Cell::new(false),
             inactive_driver_transition: std::cell::Cell::new(false),
+            candidate_kernel_intent: RefCell::new(None),
             driver_protocol_actions: RefCell::new(None),
         };
 
@@ -2948,6 +3135,7 @@ mod tests {
             protocol_tool: RefCell::new(None),
             retained_driver_transition: std::cell::Cell::new(false),
             inactive_driver_transition: std::cell::Cell::new(false),
+            candidate_kernel_intent: RefCell::new(None),
             driver_protocol_actions: RefCell::new(Some(actions.clone())),
         };
 

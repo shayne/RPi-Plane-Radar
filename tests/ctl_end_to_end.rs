@@ -2211,6 +2211,7 @@ struct PromotionBackend {
     events: RefCell<Vec<PromotionEvent>>,
     fail_tryboot: Cell<bool>,
     running_driver: RefCell<ArtifactIdentity>,
+    candidate_kernel_intent: RefCell<Option<String>>,
 }
 
 impl PromotionBackend {
@@ -2222,6 +2223,7 @@ impl PromotionBackend {
             events: RefCell::new(Vec::new()),
             fail_tryboot: Cell::new(false),
             running_driver: RefCell::new(running_driver),
+            candidate_kernel_intent: RefCell::new(None),
         }
     }
 
@@ -2274,6 +2276,7 @@ impl LifecycleBackend for PromotionBackend {
 
     fn stage_driver(&self, _pair: &ReleasePair) -> Result<(), LifecycleError> {
         self.event(PromotionEvent::StageDriver);
+        *self.candidate_kernel_intent.borrow_mut() = Some("6.18.35+rpt-rpi-v8".to_owned());
         Ok(())
     }
 
@@ -2508,7 +2511,17 @@ fn failed_tryboot_returns_to_prior_without_a_candidate_normal_boot() {
         ]
     );
     assert_eq!(*backend.running_driver.borrow(), prior.pair.driver);
+    assert_eq!(
+        backend.candidate_kernel_intent.borrow().as_deref(),
+        Some("6.18.35+rpt-rpi-v8")
+    );
     assert!(!events.contains(&PromotionEvent::RebootNormal));
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        PromotionEvent::VerifyTryboot
+            | PromotionEvent::VerifyExplicitNormal
+            | PromotionEvent::VerifyNormalized
+    )));
     assert_eq!(
         events
             .iter()
@@ -2530,6 +2543,8 @@ fn recovery_after_partial_normalization_quiesces_and_reboots_the_prior_pair_once
     let candidate = promotion_pair("2.0.0", '2', 'b');
     let state = promotion_state(&prior, &candidate, "driver_normalized");
     let backend = PromotionBackend::new(state, prior.pair.clone());
+
+    assert!(backend.candidate_kernel_intent.borrow().is_none());
 
     assert_eq!(
         LifecycleManager::new(&backend).upgrade(None),
@@ -2554,6 +2569,7 @@ fn recovery_after_partial_normalization_quiesces_and_reboots_the_prior_pair_once
         ]
     );
     assert_eq!(*backend.running_driver.borrow(), prior.pair.driver);
+    assert!(backend.candidate_kernel_intent.borrow().is_none());
 }
 
 #[test]
