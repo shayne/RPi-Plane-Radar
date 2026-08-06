@@ -842,12 +842,28 @@ struct CandidateKernelIntent {
 }
 
 impl CandidateKernelIntent {
-    fn from_facts(facts: &TargetFacts) -> Result<Self, LifecycleError> {
+    fn for_transition(
+        requires_inactive_promotion: bool,
+        candidate_release: &str,
+        candidate_match_count: u8,
+        boot_selected_release: &str,
+        boot_selected_match_count: u8,
+        boot_override_conflicting: bool,
+    ) -> Result<Option<Self>, LifecycleError> {
+        if !requires_inactive_promotion {
+            return Ok(None);
+        }
         let intent = Self {
-            release: facts.candidate_kernel_release.clone(),
+            release: candidate_release.to_owned(),
         };
-        intent.prove_facts(facts)?;
-        Ok(intent)
+        intent.prove_selected_candidate(
+            candidate_release,
+            candidate_match_count,
+            boot_selected_release,
+            boot_selected_match_count,
+            boot_override_conflicting,
+        )?;
+        Ok(Some(intent))
     }
 
     fn release(&self) -> &str {
@@ -887,6 +903,7 @@ impl CandidateKernelIntent {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DriverReconnectPurpose {
     CandidatePromotion,
+    LegacyTransition,
     TargetJournalRecovery,
 }
 
@@ -1183,6 +1200,44 @@ impl<R: TransportCommandRunner, C: Clock> SystemLifecycleBackend<R, C> {
         self.install_driver_tool(identity, facts, Some(&intent))
     }
 
+    fn forward_driver_reconnect_purpose(&self) -> DriverReconnectPurpose {
+        if self.inactive_driver_transition.get() {
+            DriverReconnectPurpose::CandidatePromotion
+        } else {
+            DriverReconnectPurpose::LegacyTransition
+        }
+    }
+
+    fn begin_driver_transition(&self, retained: bool) -> bool {
+        self.retained_driver_transition.set(retained);
+        self.inactive_driver_transition.set(false);
+        *self.candidate_kernel_intent.borrow_mut() = None;
+        !retained
+    }
+
+    fn record_driver_kernel_transition(
+        &self,
+        requires_inactive_promotion: bool,
+        candidate_release: &str,
+        candidate_match_count: u8,
+        boot_selected_release: &str,
+        boot_selected_match_count: u8,
+        boot_override_conflicting: bool,
+    ) -> Result<(), LifecycleError> {
+        let intent = CandidateKernelIntent::for_transition(
+            requires_inactive_promotion,
+            candidate_release,
+            candidate_match_count,
+            boot_selected_release,
+            boot_selected_match_count,
+            boot_override_conflicting,
+        )?;
+        self.inactive_driver_transition
+            .set(requires_inactive_promotion);
+        *self.candidate_kernel_intent.borrow_mut() = intent;
+        Ok(())
+    }
+
     fn ensure_protocol_tool(&self) -> Result<(), LifecycleError> {
         if self.protocol_tool.borrow().is_some() {
             return Ok(());
@@ -1313,7 +1368,8 @@ impl<R: TransportCommandRunner, C: Clock> SystemLifecycleBackend<R, C> {
             DriverReconnectPurpose::CandidatePromotion => {
                 self.install_candidate_driver_tool(driver, facts)
             }
-            DriverReconnectPurpose::TargetJournalRecovery => {
+            DriverReconnectPurpose::LegacyTransition
+            | DriverReconnectPurpose::TargetJournalRecovery => {
                 self.install_driver_tool(driver, facts, None)
             }
         }
@@ -1840,23 +1896,26 @@ impl<R: TransportCommandRunner, C: Clock> LifecycleBackend for SystemLifecycleBa
             .iter()
             .skip(1)
             .any(|accepted| accepted.pair.driver == pair.driver);
-        self.retained_driver_transition.set(retained);
-        self.inactive_driver_transition.set(false);
-        let facts = self.fresh_target_facts()?;
-        let intent = CandidateKernelIntent::from_facts(&facts)?;
-        *self.candidate_kernel_intent.borrow_mut() = Some(intent.clone());
-        if retained {
+        if !self.begin_driver_transition(retained) {
             return self.run_driver_protocol(DriverAction::StageRetained, Some(&pair.driver));
         }
-        self.install_driver_tool(&pair.driver, facts, Some(&intent))?;
-        self.inactive_driver_transition.set(
-            self.driver_tool
-                .borrow()
-                .as_ref()
-                .ok_or(LifecycleError::Backend)?
-                .1
-                .requires_inactive_kernel_promotion(),
-        );
+        let facts = self.fresh_target_facts()?;
+        self.install_driver_tool(&pair.driver, facts.clone(), None)?;
+        let requires_inactive_promotion = self
+            .driver_tool
+            .borrow()
+            .as_ref()
+            .ok_or(LifecycleError::Backend)?
+            .1
+            .requires_inactive_kernel_promotion();
+        self.record_driver_kernel_transition(
+            requires_inactive_promotion,
+            &facts.candidate_kernel_release,
+            facts.candidate_kernel_match_count,
+            &facts.boot_selected_kernel_release,
+            facts.boot_selected_kernel_match_count,
+            facts.boot_kernel_override_conflicting,
+        )?;
         let postconditions = {
             let driver = self.driver_tool.borrow();
             let tool = &driver.as_ref().ok_or(LifecycleError::Backend)?.1;
@@ -1881,11 +1940,7 @@ impl<R: TransportCommandRunner, C: Clock> LifecycleBackend for SystemLifecycleBa
     }
 
     fn tryboot_driver(&self, _pair: &ReleasePair) -> Result<(), LifecycleError> {
-        self.reboot_and_reconnect(
-            true,
-            &_pair.driver,
-            DriverReconnectPurpose::CandidatePromotion,
-        )
+        self.reboot_and_reconnect(true, &_pair.driver, self.forward_driver_reconnect_purpose())
     }
 
     fn verify_tryboot_driver(&self, pair: &ReleasePair) -> Result<(), LifecycleError> {
@@ -1922,14 +1977,18 @@ impl<R: TransportCommandRunner, C: Clock> LifecycleBackend for SystemLifecycleBa
         self.reboot_and_reconnect(
             false,
             &_pair.driver,
-            DriverReconnectPurpose::CandidatePromotion,
+            self.forward_driver_reconnect_purpose(),
         )
     }
 
     fn verify_explicit_normal_driver(&self, pair: &ReleasePair) -> Result<(), LifecycleError> {
         *self.driver_tool.borrow_mut() = None;
         let facts = self.fresh_target_facts()?;
-        self.install_candidate_driver_tool(&pair.driver, facts)?;
+        if self.inactive_driver_transition.get() {
+            self.install_candidate_driver_tool(&pair.driver, facts)?;
+        } else {
+            self.install_driver_tool(&pair.driver, facts, None)?;
+        }
         self.driver_tool
             .borrow()
             .as_ref()
@@ -1961,16 +2020,20 @@ impl<R: TransportCommandRunner, C: Clock> LifecycleBackend for SystemLifecycleBa
     fn verify_normalized_driver(&self, pair: &ReleasePair) -> Result<(), LifecycleError> {
         *self.driver_tool.borrow_mut() = None;
         let facts = self.fresh_target_facts()?;
-        let intent = self
-            .candidate_kernel_intent
-            .borrow()
-            .clone()
-            .ok_or(LifecycleError::Backend)?;
-        intent.prove_facts(&facts)?;
-        if self.inactive_driver_transition.get() && !facts.conventional_candidate_is_running() {
-            return Err(LifecycleError::Backend);
+        if self.inactive_driver_transition.get() {
+            let intent = self
+                .candidate_kernel_intent
+                .borrow()
+                .clone()
+                .ok_or(LifecycleError::Backend)?;
+            intent.prove_facts(&facts)?;
+            if !facts.conventional_candidate_is_running() {
+                return Err(LifecycleError::Backend);
+            }
+            self.install_driver_tool(&pair.driver, facts, Some(&intent))?;
+        } else {
+            self.install_driver_tool(&pair.driver, facts, None)?;
         }
-        self.install_driver_tool(&pair.driver, facts, Some(&intent))?;
         self.driver_tool
             .borrow()
             .as_ref()
@@ -2769,10 +2832,10 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     use super::{
-        CandidateKernelIntent, DriverAction, DriverProtocolActions, InstallCandidateState,
-        InstallPhase, InstallState, LifecycleError, MANIFEST_NAME, SCREENSHOT_OPERATION_TIMEOUT,
-        SystemLifecycleBackend, TargetIdentity, TransportError, deploy_helper_command,
-        final_reboot_command, finalize_lifecycle_uninstall_command,
+        CandidateKernelIntent, DriverAction, DriverProtocolActions, DriverReconnectPurpose,
+        InstallCandidateState, InstallPhase, InstallState, LifecycleError, MANIFEST_NAME,
+        SCREENSHOT_OPERATION_TIMEOUT, SystemLifecycleBackend, TargetIdentity, TransportError,
+        deploy_helper_command, final_reboot_command, finalize_lifecycle_uninstall_command,
         preserve_lifecycle_helper_command, private_state_read_command, requested_version,
         resume_state_matches, retire_lifecycle_helper_command, select_candidate_index,
         tryboot_reboot_command, worker_exit_code,
@@ -3018,6 +3081,104 @@ mod tests {
         ] {
             assert_eq!(result, Err(LifecycleError::Backend));
         }
+    }
+
+    #[test]
+    fn same_kernel_zero_match_transition_continues_without_candidate_intent() {
+        let runner = ScriptedLifecycleRunner::new([]);
+        let temporary = tempfile::tempdir().expect("temporary backend");
+        let backend = scripted_backend(&runner, temporary.path(), BTreeMap::new(), None, None);
+
+        backend
+            .record_driver_kernel_transition(false, "6.18.34+rpt-rpi-v8", 0, "", 0, false)
+            .expect("same-kernel fallback");
+
+        assert!(!backend.inactive_driver_transition.get());
+        assert!(backend.candidate_kernel_intent.borrow().is_none());
+        assert_eq!(
+            backend.forward_driver_reconnect_purpose(),
+            DriverReconnectPurpose::LegacyTransition
+        );
+    }
+
+    #[test]
+    fn retained_transition_continues_without_candidate_intent() {
+        let runner = ScriptedLifecycleRunner::new([]);
+        let temporary = tempfile::tempdir().expect("temporary backend");
+        let backend = scripted_backend(&runner, temporary.path(), BTreeMap::new(), None, None);
+        *backend.candidate_kernel_intent.borrow_mut() = Some(CandidateKernelIntent {
+            release: "6.18.35+rpt-rpi-v8".into(),
+        });
+
+        assert!(!backend.begin_driver_transition(true));
+        assert!(backend.retained_driver_transition.get());
+        assert!(!backend.inactive_driver_transition.get());
+        assert!(backend.candidate_kernel_intent.borrow().is_none());
+    }
+
+    #[test]
+    fn non_retained_same_kernel_transition_keeps_legacy_intent_free_flow() {
+        let runner = ScriptedLifecycleRunner::new([]);
+        let temporary = tempfile::tempdir().expect("temporary backend");
+        let backend = scripted_backend(&runner, temporary.path(), BTreeMap::new(), None, None);
+
+        backend
+            .record_driver_kernel_transition(
+                false,
+                "6.18.34+rpt-rpi-v8",
+                1,
+                "6.18.34+rpt-rpi-v8",
+                1,
+                false,
+            )
+            .expect("same-kernel transition");
+
+        assert!(!backend.inactive_driver_transition.get());
+        assert!(backend.candidate_kernel_intent.borrow().is_none());
+        assert_eq!(
+            backend.forward_driver_reconnect_purpose(),
+            DriverReconnectPurpose::LegacyTransition
+        );
+    }
+
+    #[test]
+    fn different_kernel_transition_initializes_and_enforces_exact_candidate_intent() {
+        let runner = ScriptedLifecycleRunner::new([]);
+        let temporary = tempfile::tempdir().expect("temporary backend");
+        let backend = scripted_backend(&runner, temporary.path(), BTreeMap::new(), None, None);
+
+        backend
+            .record_driver_kernel_transition(
+                true,
+                "6.18.35+rpt-rpi-v8",
+                1,
+                "6.18.35+rpt-rpi-v8",
+                1,
+                false,
+            )
+            .expect("proven inactive candidate");
+        let intent = backend
+            .candidate_kernel_intent
+            .borrow()
+            .clone()
+            .expect("inactive candidate intent");
+
+        assert!(backend.inactive_driver_transition.get());
+        assert_eq!(intent.release(), "6.18.35+rpt-rpi-v8");
+        assert_eq!(
+            backend.forward_driver_reconnect_purpose(),
+            DriverReconnectPurpose::CandidatePromotion
+        );
+        assert_eq!(
+            intent.prove_selected_candidate(
+                "6.18.35+rpt-rpi-v8",
+                1,
+                "6.18.34+rpt-rpi-v8",
+                1,
+                false,
+            ),
+            Err(LifecycleError::Backend)
+        );
     }
 
     #[test]
