@@ -149,8 +149,7 @@ fn target_facts_bind_the_exact_candidate_kernel_or_running_fallback() {
             "\"candidate_kernel_vermagic\":\"6.18.34+rpt-rpi-v8 SMP preempt mod_unload modversions aarch64\"",
             "\"candidate_kernel_vermagic\":\"6.18.35+rpt-rpi-v8 SMP preempt mod_unload modversions aarch64\"",
             1,
-        )
-        .replacen("\"candidate_kernel_match_count\":1", "\"candidate_kernel_match_count\":1", 1);
+        );
     let selected = TargetFacts::parse(selected.as_bytes()).expect("one selected candidate");
     assert_eq!(selected.candidate_kernel_release, "6.18.35+rpt-rpi-v8");
 

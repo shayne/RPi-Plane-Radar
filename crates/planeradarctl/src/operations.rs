@@ -923,15 +923,13 @@ fn validate_facts(facts: &DiagnosticFacts) -> Result<(), OperationError> {
         Some(base_dtb_sha),
         Some(vc4_overlay_sha),
     ] = provenance
-    {
-        if kernel_file != "kernel8.img"
+        && (kernel_file != "kernel8.img"
             || initramfs_file != "initramfs8"
             || ![kernel_sha, initramfs_sha, base_dtb_sha, vc4_overlay_sha]
                 .into_iter()
-                .all(|digest| is_lower_hex(digest, 64))
-        {
-            return Err(OperationError::MalformedFacts);
-        }
+                .all(|digest| is_lower_hex(digest, 64)))
+    {
+        return Err(OperationError::MalformedFacts);
     }
     for artifact in [
         &facts.installed_application,
