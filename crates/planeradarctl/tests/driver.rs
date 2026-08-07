@@ -29,6 +29,7 @@ const DRIVER_TREE: &str = "1111111111111111111111111111111111111111";
 const TAG_OBJECT: &str = "e205b33925c9f0cfe7be5b47d30c5a013a3577ac";
 const EXPECTED_VERMAGIC: &str = "6.18.34+rpt-rpi-v8 SMP preempt mod_unload modversions aarch64";
 const REQUIRED_CAPABILITY: &str = "pwm-backlight-v1";
+const LIFECYCLE_CAPABILITY: &str = "exact-backlight-metadata-v1";
 const BACKLIGHT_RULE_FILE: &str = "70-planeradar-backlight.rules";
 const BACKLIGHT_RULE: &[u8] = b"SUBSYSTEM==\"backlight\", KERNEL==\"planeradar-backlight\", RUN+=\"/usr/bin/chgrp video /sys%p/brightness\", RUN+=\"/usr/bin/chmod 0660 /sys%p/brightness\"\n";
 const TASK_TWO_DRIVER_COMMIT: &str = "bb76bf8a3e9e02ce1b1acd4df97200083ca57277";
@@ -1478,6 +1479,7 @@ fn driver_postconditions_come_from_exact_verified_local_artifact_bytes() {
     assert_eq!(expected.overlay_sha256, digest(overlay));
     assert_eq!(expected.applied_dtb_sha256, digest(applied));
     assert_eq!(expected.capability, REQUIRED_CAPABILITY);
+    assert_eq!(expected.lifecycle_capability, None);
     assert_eq!(expected.backlight_rule_file, BACKLIGHT_RULE_FILE);
     assert_eq!(expected.backlight_rule_sha256, digest(BACKLIGHT_RULE));
 
@@ -1529,6 +1531,46 @@ fn driver_postconditions_come_from_exact_verified_local_artifact_bytes() {
         "schema-one GPIO-only manifest was accepted"
     );
     fs::write(artifact.join("manifest.txt"), &manifest).expect("restore manifest");
+
+    let schema_three_manifest = manifest
+        .replacen("schema_version\t2", "schema_version\t3", 1)
+        .replace(
+            &format!("capability\t{REQUIRED_CAPABILITY}\n"),
+            &format!(
+                "capability\t{REQUIRED_CAPABILITY}\nlifecycle_capability\t{LIFECYCLE_CAPABILITY}\n"
+            ),
+        );
+    fs::write(artifact.join("manifest.txt"), &schema_three_manifest)
+        .expect("schema-three manifest");
+    assert_eq!(
+        tool.postconditions()
+            .expect("schema-three postconditions")
+            .lifecycle_capability
+            .as_deref(),
+        Some(LIFECYCLE_CAPABILITY)
+    );
+    fs::write(
+        artifact.join("manifest.txt"),
+        schema_three_manifest.replace(LIFECYCLE_CAPABILITY, "ambient-lifecycle-v1"),
+    )
+    .expect("unknown lifecycle capability manifest");
+    assert!(
+        tool.postconditions().is_err(),
+        "schema-three manifest with an unknown lifecycle capability was accepted"
+    );
+    fs::write(
+        artifact.join("manifest.txt"),
+        schema_three_manifest.replace(
+            &format!("lifecycle_capability\t{LIFECYCLE_CAPABILITY}\n"),
+            "",
+        ),
+    )
+    .expect("missing lifecycle capability manifest");
+    assert!(
+        tool.postconditions().is_err(),
+        "schema-three manifest without its lifecycle capability was accepted"
+    );
+    fs::write(artifact.join("manifest.txt"), &manifest).expect("restore schema-two manifest");
 
     fs::write(artifact.join("hyperpixel2r_kms.ko"), b"tampered").expect("tamper");
     assert!(tool.postconditions().is_err());
@@ -2275,6 +2317,7 @@ fn inactive_accepted_driver_protocol_carries_only_candidate_authority() {
         source_tree: "1".repeat(40),
         kernel_release: "6.18.35+rpt-rpi-v8".into(),
         capability: REQUIRED_CAPABILITY.into(),
+        lifecycle_capability: Some(LIFECYCLE_CAPABILITY.into()),
         module_vermagic: "6.18.35+rpt-rpi-v8 SMP preempt mod_unload aarch64".into(),
         manifest_sha256: "2".repeat(64),
         module_file: "hyperpixel2r_kms.ko".into(),
@@ -2313,6 +2356,12 @@ fn inactive_accepted_driver_protocol_carries_only_candidate_authority() {
                 .any(|pair| pair == ["--kernel-target", "/cache/kernel"])
         );
     }
+    assert!(
+        invocations[0]
+            .arguments()
+            .windows(2)
+            .any(|pair| pair == ["--lifecycle-capability", LIFECYCLE_CAPABILITY])
+    );
 }
 
 #[test]
@@ -2364,6 +2413,7 @@ fn accepted_driver_protocol_actions_are_typed_exact_and_bounded() {
         source_tree: "1".repeat(40),
         kernel_release: "6.18.34+rpt-rpi-v8".into(),
         capability: REQUIRED_CAPABILITY.into(),
+        lifecycle_capability: None,
         module_vermagic: "6.18.34+rpt-rpi-v8 SMP preempt mod_unload aarch64".into(),
         manifest_sha256: "2".repeat(64),
         module_file: "hyperpixel2r_kms.ko".into(),
@@ -2406,6 +2456,13 @@ fn accepted_driver_protocol_actions_are_typed_exact_and_bounded() {
             .arguments()
             .windows(2)
             .any(|pair| pair == ["--action", "prepare-new"])
+    );
+    assert!(
+        !invocations[13]
+            .arguments()
+            .iter()
+            .any(|argument| argument == "--lifecycle-capability"),
+        "schema-two accepted preparation falsely advertised lifecycle capability"
     );
     assert!(
         invocations[13]

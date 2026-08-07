@@ -3970,6 +3970,7 @@ mod tests {
             source_tree: "1111111111111111111111111111111111111111".into(),
             kernel_release: "6.12.47+rpt-rpi-v8".into(),
             capability: "pwm-backlight-v1".into(),
+            lifecycle_capability: None,
             module_vermagic: "6.12.47+rpt-rpi-v8 SMP preempt mod_unload aarch64".into(),
             manifest_sha256: "2222222222222222222222222222222222222222222222222222222222222222"
                 .into(),
@@ -3992,7 +3993,7 @@ mod tests {
         assert!(command.is_interactive_sudo());
         let staged_check = &command.arguments()[3];
         assert!(staged_check.contains("test \"$(value schema_version)\" = 4"));
-        assert!(staged_check.contains("23:0"));
+        assert!(staged_check.contains("state_rows=23"));
         assert!(staged_check.contains("module_existed"));
         assert!(staged_check.contains("overlay_existed"));
         assert!(staged_check.contains("prior_dkms_inventory_sha256"));
@@ -4021,6 +4022,7 @@ mod tests {
                 "pwm-backlight-v1",
                 "70-planeradar-backlight.rules",
                 "6666666666666666666666666666666666666666666666666666666666666666",
+                "",
             ]
         );
 
@@ -4059,8 +4061,45 @@ mod tests {
                 "pwm-backlight-v1",
                 "70-planeradar-backlight.rules",
                 "6666666666666666666666666666666666666666666666666666666666666666",
+                "",
             ]
         );
+
+        let mut enhanced = expected.clone();
+        enhanced.lifecycle_capability = Some("exact-backlight-metadata-v1".into());
+        let enhanced_staged = staged_driver_transaction_command(&enhanced)
+            .expect("enhanced staged transaction command");
+        assert_eq!(
+            enhanced_staged.arguments().last().map(String::as_str),
+            Some("exact-backlight-metadata-v1")
+        );
+        let enhanced_staged_check = &enhanced_staged.arguments()[3];
+        assert!(enhanced_staged_check.contains("state_rows=25"));
+        assert!(enhanced_staged_check.contains("prior-backlight-metadata"));
+        assert!(enhanced_staged_check.contains("prior_backlight_metadata_sha256"));
+
+        let enhanced_committed =
+            committed_driver_command(&enhanced).expect("enhanced committed command");
+        assert_eq!(
+            enhanced_committed.arguments().last().map(String::as_str),
+            Some("exact-backlight-metadata-v1")
+        );
+        assert!(enhanced_committed.arguments()[3].contains("prior-backlight-metadata"));
+
+        for command in [&command, &committed, &enhanced_staged, &enhanced_committed] {
+            assert!(
+                std::process::Command::new("sh")
+                    .args(["-n", "-c", &command.arguments()[3]])
+                    .status()
+                    .expect("check driver postcondition shell syntax")
+                    .success()
+            );
+        }
+
+        let mut unknown = expected;
+        unknown.lifecycle_capability = Some("unknown-lifecycle-v1".into());
+        assert!(staged_driver_transaction_command(&unknown).is_err());
+        assert!(committed_driver_command(&unknown).is_err());
     }
 
     #[test]

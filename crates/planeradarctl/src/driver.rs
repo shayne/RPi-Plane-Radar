@@ -26,6 +26,7 @@ const DRIVER_MANIFEST_NAME: &str = "driver-manifest.json";
 const DRIVER_SOURCE_NAME: &str = "hyperpixel2r-kms-source.tar.zst";
 const DRIVER_SBOM_NAME: &str = "SBOM.spdx.json";
 const BACKLIGHT_RULE_NAME: &str = "70-planeradar-backlight.rules";
+pub(crate) const LIFECYCLE_CAPABILITY: &str = "exact-backlight-metadata-v1";
 const BACKLIGHT_RULE_BYTES: &[u8] = b"SUBSYSTEM==\"backlight\", KERNEL==\"planeradar-backlight\", RUN+=\"/usr/bin/chgrp video /sys%p/brightness\", RUN+=\"/usr/bin/chmod 0660 /sys%p/brightness\"\n";
 const MAX_DRIVER_MANIFEST_BYTES: usize = 64 * 1024;
 const MAX_DRIVER_ARTIFACT_BYTES: u64 = 1024 * 1024 * 1024;
@@ -1290,7 +1291,7 @@ impl ExactArtifactManifest {
                 return Err(DriverError::InvalidPrebuiltIdentity);
             }
         }
-        const KEYS: [&str; 17] = [
+        const KEYS_V2: [&str; 17] = [
             "schema_version",
             "driver_version",
             "source_revision",
@@ -1309,9 +1310,22 @@ impl ExactArtifactManifest {
             "backlight_rule_file",
             "backlight_rule_sha256",
         ];
-        if fields.len() != KEYS.len()
-            || KEYS.iter().any(|key| !fields.contains_key(*key))
-            || fields.get("schema_version").map(String::as_str) != Some("2")
+        let schema = fields.get("schema_version").map(String::as_str);
+        let exact_schema = match schema {
+            Some("2") => {
+                fields.len() == KEYS_V2.len()
+                    && KEYS_V2.iter().all(|key| fields.contains_key(*key))
+                    && !fields.contains_key("lifecycle_capability")
+            }
+            Some("3") => {
+                fields.len() == KEYS_V2.len() + 1
+                    && KEYS_V2.iter().all(|key| fields.contains_key(*key))
+                    && fields.get("lifecycle_capability").map(String::as_str)
+                        == Some(LIFECYCLE_CAPABILITY)
+            }
+            _ => false,
+        };
+        if !exact_schema
             || fields.get("capability").map(String::as_str) != Some(required_capability)
             || fields.get("architecture").map(String::as_str) != Some("aarch64")
             || fields.get("module_file").map(String::as_str) != Some("hyperpixel2r_kms.ko")
@@ -1573,6 +1587,7 @@ pub struct DriverPostconditions {
     pub source_tree: String,
     pub kernel_release: String,
     pub capability: String,
+    pub lifecycle_capability: Option<String>,
     pub module_vermagic: String,
     pub manifest_sha256: String,
     pub module_file: String,
@@ -1701,6 +1716,7 @@ impl<R> DriverTool<R> {
             source_tree: get("source_tree")?,
             kernel_release: get("kernel_release")?,
             capability: get("capability")?,
+            lifecycle_capability: parsed.fields.get("lifecycle_capability").cloned(),
             module_vermagic: get("module_vermagic")?,
             manifest_sha256: sha256_bytes(&manifest),
             module_file: get("module_file")?,
@@ -1872,6 +1888,10 @@ impl<R: CommandRunner> DriverTool<R> {
             || !is_lower_hex(&candidate.module_sha256, 64)
             || !is_lower_hex(&candidate.overlay_sha256, 64)
             || candidate.capability != self.required_capability
+            || candidate
+                .lifecycle_capability
+                .as_deref()
+                .is_some_and(|capability| capability != LIFECYCLE_CAPABILITY)
             || candidate.backlight_rule_file != BACKLIGHT_RULE_NAME
             || !is_lower_hex(&candidate.backlight_rule_sha256, 64)
             || candidate.overlay_file
@@ -1879,7 +1899,7 @@ impl<R: CommandRunner> DriverTool<R> {
         {
             return Err(DriverError::InvalidContext);
         }
-        let arguments = vec![
+        let mut arguments = vec![
             self.source
                 .join("scripts/accepted-lifecycle.sh")
                 .to_string_lossy()
@@ -1909,7 +1929,9 @@ impl<R: CommandRunner> DriverTool<R> {
             "--backlight-rule-sha256".into(),
             candidate.backlight_rule_sha256.clone(),
         ];
-        let mut arguments = arguments;
+        if let Some(capability) = &candidate.lifecycle_capability {
+            arguments.extend(["--lifecycle-capability".into(), capability.clone()]);
+        }
         if candidate.kernel_release != self.context.running_kernel_release {
             arguments.extend([
                 "--kernel-target".into(),
