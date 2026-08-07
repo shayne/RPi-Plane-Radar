@@ -60,6 +60,11 @@ fn fixture_value() -> Value {
     serde_json::from_slice(include_bytes!("fixtures/open_meteo/solar.json")).expect("solar fixture")
 }
 
+fn unixtime_fixture_value() -> Value {
+    serde_json::from_slice(include_bytes!("fixtures/open_meteo/solar-unixtime.json"))
+        .expect("live-shaped solar fixture")
+}
+
 fn response(value: &Value) -> Result<HttpResponse, HttpError> {
     Ok(HttpResponse {
         status: 200,
@@ -133,6 +138,28 @@ fn fixture_maps_seventeen_days_and_preserves_the_exact_requested_location_identi
     assert_eq!(schedule.days[8].date, "2026-08-10");
     assert_eq!(schedule.days[8].sunrise_unix, None);
     assert_eq!(schedule.days[16].date, "2026-08-18");
+}
+
+#[test]
+fn live_unixtime_fixture_maps_provider_day_timestamps_to_canonical_local_dates() {
+    let schedule =
+        fetch_value(&unixtime_fixture_value()).expect("live-shaped provider response must parse");
+
+    assert_eq!(schedule.days.len(), 17);
+    assert_eq!(
+        schedule.days[0],
+        SolarDay {
+            date: "2026-08-06".to_owned(),
+            sunrise_unix: Some(1_786_010_232),
+        }
+    );
+    assert_eq!(
+        schedule.days[16],
+        SolarDay {
+            date: "2026-08-22".to_owned(),
+            sunrise_unix: Some(1_787_393_574),
+        }
+    );
 }
 
 #[test]
@@ -266,11 +293,11 @@ fn response_requires_exactly_seventeen_unique_canonical_matching_days() {
     assert_category(fetch_value(&unequal), SolarErrorCategory::Schema);
 
     let mut duplicate = fixture_value();
-    duplicate["daily"]["time"][1] = json!("2026-08-02");
+    duplicate["daily"]["time"][1] = duplicate["daily"]["time"][0].clone();
     assert_category(fetch_value(&duplicate), SolarErrorCategory::Schema);
 
     let mut noncanonical = fixture_value();
-    noncanonical["daily"]["time"][1] = json!("2026-8-3");
+    noncanonical["daily"]["time"][1] = json!(1_785_729_601_i64);
     assert_category(fetch_value(&noncanonical), SolarErrorCategory::Schema);
 
     let mut mismatched_sunrise_date = fixture_value();
@@ -292,6 +319,26 @@ fn sunrise_values_are_only_checked_i64_integers_or_null() {
     let mut outside_jiff_range = fixture_value();
     outside_jiff_range["daily"]["sunrise"][1] = json!(i64::MAX);
     assert_category(fetch_value(&outside_jiff_range), SolarErrorCategory::Schema);
+}
+
+#[test]
+fn daily_time_values_require_integer_offset_adjusted_midnights_in_range() {
+    for value in [json!(1785643200.0), json!("1785643200"), json!({})] {
+        let mut fixture = fixture_value();
+        fixture["daily"]["time"][0] = value;
+        assert_category(fetch_value(&fixture), SolarErrorCategory::Schema);
+    }
+
+    let mut nonmidnight_offset = fixture_value();
+    nonmidnight_offset["utc_offset_seconds"] = json!(-14_399);
+    assert_category(fetch_value(&nonmidnight_offset), SolarErrorCategory::Schema);
+
+    for (timestamp, offset) in [(i64::MIN, -86_400), (i64::MAX, 86_400)] {
+        let mut outside_range = fixture_value();
+        outside_range["daily"]["time"][0] = json!(timestamp);
+        outside_range["utc_offset_seconds"] = json!(offset);
+        assert_category(fetch_value(&outside_range), SolarErrorCategory::Schema);
+    }
 }
 
 #[test]
@@ -332,7 +379,7 @@ fn strict_wire_schema_rejects_unknown_fields_and_wrong_units() {
     daily["daily"]["sunset"] = json!([]);
     assert_category(fetch_value(&daily), SolarErrorCategory::Schema);
 
-    for (field, value) in [("time", "unixtime"), ("sunrise", "iso8601")] {
+    for (field, value) in [("time", "iso8601"), ("sunrise", "iso8601")] {
         let mut units = fixture_value();
         units["daily_units"][field] = json!(value);
         assert_category(fetch_value(&units), SolarErrorCategory::Schema);

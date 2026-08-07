@@ -202,7 +202,7 @@ struct WireDailyUnits {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WireDaily {
-    time: Vec<String>,
+    time: Vec<i64>,
     sunrise: Vec<Option<i64>>,
 }
 
@@ -222,12 +222,17 @@ impl WireResponse {
         {
             return Err(SolarError::Schema("provider metadata"));
         }
-        if self.daily_units.time != "iso8601" || self.daily_units.sunrise != "unixtime" {
+        if self.daily_units.time != "unixtime" || self.daily_units.sunrise != "unixtime" {
             return Err(SolarError::Schema("daily units"));
         }
 
         let zone = load_time_zone(&self.timezone)?;
-        let days = validated_days(self.daily.time, self.daily.sunrise, &zone)?;
+        let days = validated_days(
+            self.daily.time,
+            self.daily.sunrise,
+            self.utc_offset_seconds,
+            &zone,
+        )?;
         let schedule = SolarSchedule {
             schema_version: CACHE_SCHEMA_VERSION,
             latitude: location.latitude,
@@ -242,8 +247,9 @@ impl WireResponse {
 }
 
 fn validated_days(
-    dates: Vec<String>,
+    dates: Vec<i64>,
     sunrises: Vec<Option<i64>>,
+    utc_offset_seconds: i32,
     zone: &TimeZone,
 ) -> Result<Vec<SolarDay>, SolarError> {
     if dates.len() != EXPECTED_DAYS || dates.len() != sunrises.len() {
@@ -252,8 +258,9 @@ fn validated_days(
 
     let mut seen = HashSet::with_capacity(dates.len());
     let mut days = Vec::with_capacity(dates.len());
-    for (date, sunrise_unix) in dates.into_iter().zip(sunrises) {
-        let parsed = canonical_date(&date)?;
+    for (date_unix, sunrise_unix) in dates.into_iter().zip(sunrises) {
+        let parsed = provider_date_from_unix(date_unix, utc_offset_seconds)?;
+        let date = parsed.to_string();
         if !seen.insert(date.clone()) {
             return Err(SolarError::Schema("duplicate daily date"));
         }
@@ -261,6 +268,18 @@ fn validated_days(
         days.push(SolarDay { date, sunrise_unix });
     }
     Ok(days)
+}
+
+fn provider_date_from_unix(value: i64, utc_offset_seconds: i32) -> Result<Date, SolarError> {
+    let shifted = value
+        .checked_add(i64::from(utc_offset_seconds))
+        .ok_or(SolarError::Schema("daily date"))?;
+    if shifted.rem_euclid(86_400) != 0 {
+        return Err(SolarError::Schema("daily date"));
+    }
+    let timestamp =
+        Timestamp::from_second(shifted).map_err(|_| SolarError::Schema("daily date"))?;
+    Ok(timestamp.to_zoned(TimeZone::UTC).date())
 }
 
 fn canonical_date(value: &str) -> Result<Date, SolarError> {
