@@ -1,6 +1,6 @@
 [package]
 name = "planeradar"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.97.1"
 build = "build.rs"
@@ -47,6 +47,6 @@ sdl2 = "0.38"
 [dev-dependencies]
 base64 = "0.22"
 jsonschema = { version = "0.37", default-features = false }
-planeradarctl = { version = "0.1.1", path = "crates/planeradarctl" }
+planeradarctl = { version = "0.2.0", path = "crates/planeradarctl" }
 tar = "0.4"
 zstd = "0.13"

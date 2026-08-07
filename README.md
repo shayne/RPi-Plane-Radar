@@ -8,7 +8,7 @@ on the physical display.
 
 The supported configuration is intentionally narrow. Other Raspberry Pi
 models, displays, and operating-system releases are not currently supported.
-[Version 0.1.1](https://github.com/shayne/RPi-Plane-Radar/releases/tag/v0.1.1)
+[Version 0.2.0](https://github.com/shayne/RPi-Plane-Radar/releases/tag/v0.2.0)
 is the current immutable stable release.
 
 ![Plane Radar running on a Raspberry Pi Zero 2 W](docs/images/planeradar-radar.gif)
