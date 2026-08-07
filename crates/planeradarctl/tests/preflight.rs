@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Command;
 use std::sync::Mutex;
@@ -1040,6 +1041,112 @@ fn target_candidate_kernel_probe_uses_only_exact_owned_package_selectors() {
         );
     let fallback = TargetFacts::parse(inconsistent.as_bytes()).expect("package candidate absent");
     assert_eq!(fallback.candidate_kernel_release, fallback.kernel_release);
+}
+
+#[test]
+fn target_candidate_kernel_probe_emits_canonical_zero_selector_running_fallback() {
+    let temporary = tempfile::tempdir().expect("private command shim");
+    let readlink = temporary.path().join("readlink");
+    std::fs::write(&readlink, b"#!/bin/sh\nexit 1\n").expect("write readlink shim");
+    std::fs::set_permissions(&readlink, std::fs::Permissions::from_mode(0o700))
+        .expect("readlink shim mode");
+
+    let start = TARGET_FACTS_SCRIPT
+        .find("candidate_kernel_match_count=0;")
+        .expect("candidate probe start");
+    let end = TARGET_FACTS_SCRIPT
+        .find("boot_kernel_override_conflicting=")
+        .expect("candidate probe end");
+    let fragment = &TARGET_FACTS_SCRIPT[start..end];
+    let program = [
+        "set -eu; ",
+        "kernel_release=6.18.34+rpt-rpi-v8; ",
+        "kernel_vermagic='6.18.34+rpt-rpi-v8 SMP preempt mod_unload modversions aarch64'; ",
+        fragment,
+        r#"printf '%s\n' \
+          "candidate_kernel_match_count=$candidate_kernel_match_count" \
+          "candidate_kernel_release=$candidate_kernel_release" \
+          "candidate_kernel_vermagic=$candidate_kernel_vermagic" \
+          "installed_kernel_header_pair_count=$installed_kernel_header_pair_count" \
+          "installed_kernel_release=$installed_kernel_release" \
+          "installed_headers_release=$installed_headers_release" \
+          "boot_selected_kernel_match_count=$boot_selected_kernel_match_count" \
+          "boot_selected_kernel_release=$boot_selected_kernel_release";"#,
+    ]
+    .concat();
+    let output = Command::new("/bin/sh")
+        .args(["-c", &program])
+        .env_clear()
+        .env("PATH", temporary.path())
+        .output()
+        .expect("run isolated candidate probe");
+    assert!(
+        output.status.success(),
+        "candidate probe failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("candidate probe utf8");
+    let emitted = stdout
+        .lines()
+        .map(|line| line.split_once('=').expect("candidate probe field"))
+        .collect::<std::collections::BTreeMap<_, _>>();
+
+    assert_eq!(emitted["candidate_kernel_match_count"], "0");
+    assert_eq!(emitted["candidate_kernel_release"], "6.18.34+rpt-rpi-v8");
+    assert_eq!(
+        emitted["candidate_kernel_vermagic"],
+        "6.18.34+rpt-rpi-v8 SMP preempt mod_unload modversions aarch64"
+    );
+    assert_eq!(emitted["installed_kernel_header_pair_count"], "0");
+    assert_eq!(emitted["installed_kernel_release"], "");
+    assert_eq!(emitted["installed_headers_release"], "");
+    assert_eq!(emitted["boot_selected_kernel_match_count"], "0");
+    assert_eq!(emitted["boot_selected_kernel_release"], "");
+
+    let mut fixture: serde_json::Value =
+        serde_json::from_slice(&valid_target_json()).expect("target fixture");
+    for field in [
+        "candidate_kernel_release",
+        "candidate_kernel_vermagic",
+        "installed_kernel_release",
+        "installed_headers_release",
+        "boot_selected_kernel_release",
+    ] {
+        fixture[field] = serde_json::Value::String(emitted[field].to_owned());
+    }
+    for field in [
+        "candidate_kernel_match_count",
+        "installed_kernel_header_pair_count",
+        "boot_selected_kernel_match_count",
+    ] {
+        fixture[field] = serde_json::Value::from(
+            emitted[field]
+                .parse::<u64>()
+                .expect("candidate probe count"),
+        );
+    }
+    let encoded = serde_json::to_vec(&fixture).expect("encoded target facts");
+    let parsed = TargetFacts::parse(&encoded).expect("canonical running-header fallback");
+    let expected = identity();
+    let report = evaluate_target(
+        &expected,
+        Some(&expected),
+        true,
+        Ok(&parsed),
+        parsed.system_time_unix,
+    );
+    assert_eq!(
+        target_status(&report, CheckId::TargetRunningHeaders),
+        CheckStatus::Passed
+    );
+    assert_eq!(
+        target_status(&report, CheckId::TargetInstalledKernelHeaders),
+        CheckStatus::Passed
+    );
+    assert_eq!(
+        report.require_success().expect("running-header fallback"),
+        PreflightDisposition::Ready
+    );
 }
 
 #[test]
