@@ -41,6 +41,19 @@ jobs:
           PLANERADAR_SOURCE_REF="$GITHUB_SHA" mise run build-pi
           file dist/planeradar | grep 'ELF 64-bit LSB.*ARM aarch64'
 
+      - name: Upload commit-bound Linux ARM64 input
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: linux-aarch64-${{ github.sha }}
+          path: |
+            dist/planeradar
+            dist/planeradar.readelf.txt
+            dist/planeradar.revision
+            dist/planeradar.tree
+            dist/planeradar.sha256
+          if-no-files-found: error
+          retention-days: 30
+
   control:
     name: Native control build and tests (${{ matrix.arch }})
     strategy:
@@ -65,3 +78,11 @@ jobs:
           PLANERADAR_REVISION="$GITHUB_SHA" mise exec -- cargo build --locked --release -p planeradarctl
           file target/release/planeradarctl | grep 'Mach-O 64-bit'
           test "$(lipo -archs target/release/planeradarctl)" = '${{ matrix.arch }}'
+
+      - name: Upload commit-bound native control input
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: control-${{ matrix.arch }}-${{ github.sha }}
+          path: target/release/planeradarctl
+          if-no-files-found: error
+          retention-days: 30

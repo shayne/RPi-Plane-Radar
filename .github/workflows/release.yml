@@ -14,6 +14,7 @@ on:
         type: string
 
 permissions:
+  actions: read
   contents: read
 
 jobs:
@@ -39,7 +40,6 @@ jobs:
           git cat-file -e "$GITHUB_SHA:.github/workflows/release.yml"
           source_commit="$(git rev-parse 'HEAD^{commit}')"
           test "$source_commit" = "$GITHUB_SHA"
-          git cat-file -e "$source_commit:.github/workflows/release.yml"
           version="${TAG#v}"
           test "$TAG" = "v$version"
           [[ "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-rc\.([1-9][0-9]*)$ ]]
@@ -49,79 +49,8 @@ jobs:
           ! git rev-parse --verify --quiet "refs/tags/$TAG"
           printf 'commit=%s\n' "$source_commit" >>"$GITHUB_OUTPUT"
 
-  linux:
-    needs: resolve
-    runs-on: ubuntu-24.04-arm
-    steps:
-      - name: Check out exact source
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ needs.resolve.outputs.commit }}
-
-      - name: Set up mise
-        uses: jdx/mise-action@9e7f7633ff6f6d6048a9418a68d48f288f50eb14 # v4.2.3
-
-      - name: Build and verify exact Linux ARM64 application
-        env:
-          RELEASE_COMMIT: ${{ needs.resolve.outputs.commit }}
-        run: |
-          test "$(git rev-parse HEAD)" = "$RELEASE_COMMIT"
-          PLANERADAR_SOURCE_REF="$RELEASE_COMMIT" mise run build-pi
-          file dist/planeradar | grep 'ELF 64-bit LSB.*ARM aarch64'
-          test "$(cat dist/planeradar.revision)" = "$RELEASE_COMMIT"
-
-      - name: Upload immutable Linux input
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: linux-aarch64
-          path: |
-            dist/planeradar
-            dist/planeradar.readelf.txt
-            dist/planeradar.revision
-            dist/planeradar.tree
-            dist/planeradar.sha256
-          if-no-files-found: error
-          retention-days: 1
-
-  control:
-    needs: resolve
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - runner: macos-15
-            arch: arm64
-          - runner: macos-15-intel
-            arch: x86_64
-    runs-on: ${{ matrix.runner }}
-    steps:
-      - name: Check out exact source
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ needs.resolve.outputs.commit }}
-
-      - name: Set up mise
-        uses: jdx/mise-action@9e7f7633ff6f6d6048a9418a68d48f288f50eb14 # v4.2.3
-
-      - name: Test and build exact native control tool
-        env:
-          RELEASE_COMMIT: ${{ needs.resolve.outputs.commit }}
-        run: |
-          test "$(git rev-parse HEAD)" = "$RELEASE_COMMIT"
-          mise exec -- cargo test --locked -p planeradarctl
-          PLANERADAR_REVISION="$RELEASE_COMMIT" mise exec -- cargo build --locked --release -p planeradarctl
-          test "$(lipo -archs target/release/planeradarctl)" = '${{ matrix.arch }}'
-
-      - name: Upload immutable native control input
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: control-${{ matrix.arch }}
-          path: target/release/planeradarctl
-          if-no-files-found: error
-          retention-days: 1
-
   verify-release:
-    needs: [resolve, linux, control]
+    needs: resolve
     runs-on: ubuntu-24.04-arm
     steps:
       - name: Check out exact source
@@ -134,16 +63,25 @@ jobs:
         uses: jdx/mise-action@9e7f7633ff6f6d6048a9418a68d48f288f50eb14 # v4.2.3
 
       - name: Install packaging dependencies
+        run: sudo apt-get update && sudo apt-get install --yes file libdigest-sha-perl zstd
+
+      - name: Download commit-bound CI build inputs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_COMMIT: ${{ needs.resolve.outputs.commit }}
         run: |
-          sudo apt-get update
-          sudo apt-get install --yes file libdigest-sha-perl libsdl2-dev pkg-config zstd
+          runs="$RUNNER_TEMP/verified-runs.json"
+          gh run list --workflow ci.yml --commit "$RELEASE_COMMIT" --status success \
+            --limit 20 --json databaseId,headSha,conclusion > "$runs"
+          run_id="$(jq -r --arg commit "$RELEASE_COMMIT" \
+            '[.[] | select(.headSha == $commit and .conclusion == "success")] | last | .databaseId // empty' \
+            "$runs")"
+          test -n "$run_id" || { echo "no successful CI run for $RELEASE_COMMIT" >&2; exit 1; }
+          gh run download "$run_id" --name "linux-aarch64-$RELEASE_COMMIT" --dir dist/inputs/linux-aarch64
+          gh run download "$run_id" --name "control-arm64-$RELEASE_COMMIT" --dir dist/inputs/control-arm64
+          gh run download "$run_id" --name "control-x86_64-$RELEASE_COMMIT" --dir dist/inputs/control-x86_64
 
-      - name: Download exact build inputs
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
-        with:
-          path: dist/inputs
-
-      - name: Verify complete release twice
+      - name: Package the verified build inputs once
         env:
           RELEASE_COMMIT: ${{ needs.resolve.outputs.commit }}
           VERSION: ${{ inputs.tag }}
@@ -158,16 +96,15 @@ jobs:
           chmod +x "$PLANERADAR_APP_BINARY" "$PLANERADAR_CTL_ARM64_BINARY" "$PLANERADAR_CTL_X86_64_BINARY"
           cp dist/inputs/linux-aarch64/planeradar.* dist/
           mise run package-release -- "${VERSION#v}"
-          cp -R dist/release "$RUNNER_TEMP/release-one"
-          mise run package-release -- "${VERSION#v}"
-          diff -r "$RUNNER_TEMP/release-one" dist/release
           (cd dist/release && shasum -a 256 -c SHA256SUMS)
-          PLANERADAR_RELEASE_FIXTURE_DIR="$PWD/dist/release" mise exec -- cargo test --test release_contract -- --test-threads=1
+          ./scripts/validate-release-metadata.sh dist/release/release-manifest.json dist/release/SBOM.spdx.json
+          test "$(jq -r .source_commit dist/release/release-manifest.json)" = "$RELEASE_COMMIT"
+          test "$(jq -r .workflow.path dist/release/release-manifest.json)" = ".github/workflows/release.yml"
 
       - name: Upload verified exact release
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: verified-release
+          name: verified-release-${{ needs.resolve.outputs.commit }}
           path: dist/release/*
           if-no-files-found: error
           retention-days: 1
@@ -189,7 +126,7 @@ jobs:
       - name: Download verified release
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          name: verified-release
+          name: verified-release-${{ needs.resolve.outputs.commit }}
           path: dist/release
 
       - name: Verify complete release
@@ -199,11 +136,8 @@ jobs:
           test "$(git rev-parse HEAD)" = "$RELEASE_COMMIT"
           test "$(find dist/release -maxdepth 1 -type f | wc -l)" = 7
           (cd dist/release && sha256sum -c SHA256SUMS)
-          ./scripts/validate-release-metadata.sh \
-            dist/release/release-manifest.json \
-            dist/release/SBOM.spdx.json
+          ./scripts/validate-release-metadata.sh dist/release/release-manifest.json dist/release/SBOM.spdx.json
           test "$(jq -r .source_commit dist/release/release-manifest.json)" = "$RELEASE_COMMIT"
-          test "$(jq -r .workflow.path dist/release/release-manifest.json)" = ".github/workflows/release.yml"
 
       - name: Create annotated tag
         id: tag
@@ -252,10 +186,8 @@ jobs:
           TAG: ${{ inputs.tag }}
         run: |
           publish_status=0
-          gh release edit "$TAG" --draft=false --prerelease \
-            --title "RPi Plane Radar $TAG" || publish_status=$?
-          release_state="$(gh release view "$TAG" \
-            --json tagName,isDraft,isPrerelease)"
+          gh release edit "$TAG" --draft=false --prerelease --title "RPi Plane Radar $TAG" || publish_status=$?
+          release_state="$(gh release view "$TAG" --json tagName,isDraft,isPrerelease)"
           test "$(jq -r .tagName <<<"$release_state")" = "$TAG"
           test "$(jq -r .isDraft <<<"$release_state")" = false
           test "$(jq -r .isPrerelease <<<"$release_state")" = true

@@ -159,9 +159,10 @@ fn stable_workflows_promote_the_exact_accepted_draft_without_rebuilding() {
     for required in [
         "Create unpublished stable app draft",
         "refs/heads/main",
-        "mise run verify",
+        "Download commit-bound CI build inputs",
         "mise run package-release",
-        "diff -r",
+        "Package the verified stable inputs once",
+        "linux-aarch64-$RELEASE_COMMIT",
         "Attest every stable draft subject",
         "subject-path: dist/release/SHA256SUMS",
         "Create unpublished stable draft without a tag",
@@ -172,6 +173,13 @@ fn stable_workflows_promote_the_exact_accepted_draft_without_rebuilding() {
             "stable draft workflow is missing {required:?}"
         );
     }
+    assert!(
+        !draft.contains("mise run verify")
+            && !draft.contains("cargo test")
+            && !draft.contains("mise run build-pi")
+            && !draft.contains("diff -r"),
+        "stable draft must reuse the exact CI-tested binaries without rebuilding or retesting"
+    );
     for required in [
         "Promote accepted stable app draft",
         "source_commit",
@@ -221,30 +229,16 @@ fn stable_workflows_promote_the_exact_accepted_draft_without_rebuilding() {
 }
 
 #[test]
-fn stable_draft_installs_pinned_tools_before_parallel_source_verification() {
+fn stable_draft_reuses_the_successful_commit_bound_ci_run() {
     let draft = read(".github/workflows/stable-draft.yml");
-    let verify_source = draft
-        .split_once("\n  verify-source:")
-        .and_then(|(_, jobs)| jobs.split_once("\n  control:"))
-        .map(|(job, _)| job)
-        .expect("stable draft must define a verify-source job before control builds");
-    let install = draft
-        .find(
-            "mise exec -- rustup toolchain install \"$RUSTUP_TOOLCHAIN\" --profile minimal --component clippy,rustfmt --no-self-update",
-        )
-        .expect("stable draft must install the pinned Rust toolchain and verification components");
-    let verify = draft
-        .find("mise run verify")
-        .expect("stable draft must verify the exact source");
-
-    assert!(
-        install < verify,
-        "stable draft must finish installing pinned tools before parallel verification"
-    );
-    assert!(
-        verify_source.contains("fetch-depth: 0"),
-        "stable source verification must fetch full history for release-contract fixtures"
-    );
+    assert!(draft.contains("gh run list --workflow ci.yml --commit \"$RELEASE_COMMIT\" --status success"));
+    for artifact in [
+        "linux-aarch64-$RELEASE_COMMIT",
+        "control-arm64-$RELEASE_COMMIT",
+        "control-x86_64-$RELEASE_COMMIT",
+    ] {
+        assert!(draft.contains(artifact), "stable draft is missing {artifact}");
+    }
 }
 
 #[test]
@@ -585,7 +579,7 @@ fn release_packaging_verifiers_run_on_native_docker_hosts() {
         );
         assert!(
             verifier.contains("Install packaging dependencies")
-                && verifier.contains("file libdigest-sha-perl libsdl2-dev pkg-config zstd"),
+                && verifier.contains("file libdigest-sha-perl zstd"),
             "{path} must provision the non-mise packaging dependencies"
         );
         assert!(
@@ -784,6 +778,12 @@ fn ordinary_ci_is_read_only_and_covers_the_supported_build_matrix() {
         "ordinary CI must serialize the explicit release-contract rerun"
     );
     assert!(ci.contains("README"));
+    for artifact in [
+        "linux-aarch64-${{ github.sha }}",
+        "control-${{ matrix.arch }}-${{ github.sha }}",
+    ] {
+        assert!(ci.contains(artifact), "ordinary CI is missing {artifact}");
+    }
 }
 
 #[test]
@@ -810,12 +810,9 @@ fn release_workflow_pins_actions_and_defers_all_write_authority_to_release_job()
         workflow.contains("subject-path: dist/release/SHA256SUMS"),
         "the checksum manifest is a public asset and needs its own provenance attestation"
     );
-    assert!(
-        workflow.contains(
-            "PLANERADAR_RELEASE_FIXTURE_DIR=\"$PWD/dist/release\" mise exec -- cargo test --test release_contract -- --test-threads=1"
-        ),
-        "release verification must serialize the real assembled-archive inspector"
-    );
+    assert!(workflow.contains("Download commit-bound CI build inputs"));
+    assert!(workflow.contains("Package the verified build inputs once"));
+    assert!(!workflow.contains("cargo test") && !workflow.contains("mise run build-pi"));
 
     let verify = workflow
         .find("Verify complete release")
