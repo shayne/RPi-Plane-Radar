@@ -773,11 +773,11 @@ fn ordinary_ci_is_read_only_and_covers_the_supported_build_matrix() {
     assert!(ci.contains("macos-15\n"));
     assert!(ci.contains("macos-15-intel"));
     assert!(ci.contains("mise run verify"));
-    assert!(
-        ci.contains("mise exec -- cargo test --test release_contract -- --test-threads=1"),
-        "ordinary CI must serialize the explicit release-contract rerun"
+    assert_eq!(
+        ci.matches("mise run verify").count(),
+        1,
+        "ordinary CI must run the complete gate exactly once"
     );
-    assert!(ci.contains("README"));
     for artifact in [
         "linux-aarch64-${{ github.sha }}",
         "control-${{ matrix.arch }}-${{ github.sha }}",
