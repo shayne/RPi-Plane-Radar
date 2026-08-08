@@ -404,7 +404,7 @@ impl SysfsFixture {
         fs::create_dir_all(&device_root).expect("device root");
         fs::write(device_root.join("max_brightness"), maximum).expect("max brightness");
         fs::write(device_root.join("brightness"), current).expect("brightness");
-        let class_device = class_root.join("planeradar-backlight");
+        let class_device = class_root.join("hyperpixel2r-backlight");
         symlink(&device_root, &class_device).expect("class device link");
         Self {
             root,

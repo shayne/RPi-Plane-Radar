@@ -3983,7 +3983,7 @@ mod tests {
             applied_dtb_file: "hyperpixel2r-kms-applied.dtb".into(),
             applied_dtb_sha256: "5555555555555555555555555555555555555555555555555555555555555555"
                 .into(),
-            backlight_rule_file: "70-planeradar-backlight.rules".into(),
+            backlight_rule_file: "70-hyperpixel2r-backlight.rules".into(),
             backlight_rule_sha256:
                 "6666666666666666666666666666666666666666666666666666666666666666".into(),
             replaced_overlay: "vc4-kms-dpi-hyperpixel2r".into(),
@@ -4020,7 +4020,7 @@ mod tests {
                 "5555555555555555555555555555555555555555555555555555555555555555",
                 "vc4-kms-dpi-hyperpixel2r",
                 "pwm-backlight-v1",
-                "70-planeradar-backlight.rules",
+                "70-hyperpixel2r-backlight.rules",
                 "6666666666666666666666666666666666666666666666666666666666666666",
                 "",
             ]
@@ -4059,7 +4059,7 @@ mod tests {
                 "5555555555555555555555555555555555555555555555555555555555555555",
                 "vc4-kms-dpi-hyperpixel2r",
                 "pwm-backlight-v1",
-                "70-planeradar-backlight.rules",
+                "70-hyperpixel2r-backlight.rules",
                 "6666666666666666666666666666666666666666666666666666666666666666",
                 "",
             ]

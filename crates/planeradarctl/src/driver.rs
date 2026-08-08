@@ -25,9 +25,9 @@ use crate::{
 const DRIVER_MANIFEST_NAME: &str = "driver-manifest.json";
 const DRIVER_SOURCE_NAME: &str = "hyperpixel2r-kms-source.tar.zst";
 const DRIVER_SBOM_NAME: &str = "SBOM.spdx.json";
-const BACKLIGHT_RULE_NAME: &str = "70-planeradar-backlight.rules";
+const BACKLIGHT_RULE_NAME: &str = "70-hyperpixel2r-backlight.rules";
 pub(crate) const LIFECYCLE_CAPABILITY: &str = "exact-backlight-metadata-v1";
-const BACKLIGHT_RULE_BYTES: &[u8] = b"SUBSYSTEM==\"backlight\", KERNEL==\"planeradar-backlight\", RUN+=\"/usr/bin/chgrp video /sys%p/brightness\", RUN+=\"/usr/bin/chmod 0660 /sys%p/brightness\"\n";
+const BACKLIGHT_RULE_BYTES: &[u8] = b"SUBSYSTEM==\"backlight\", KERNEL==\"hyperpixel2r-backlight\", RUN+=\"/usr/bin/chgrp video /sys%p/brightness\", RUN+=\"/usr/bin/chmod 0660 /sys%p/brightness\"\n";
 const MAX_DRIVER_MANIFEST_BYTES: usize = 64 * 1024;
 const MAX_DRIVER_ARTIFACT_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_ARCHIVE_ENTRY_BYTES: u64 = 8 * 1024 * 1024;

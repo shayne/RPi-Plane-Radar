@@ -30,8 +30,8 @@ const TAG_OBJECT: &str = "e205b33925c9f0cfe7be5b47d30c5a013a3577ac";
 const EXPECTED_VERMAGIC: &str = "6.18.34+rpt-rpi-v8 SMP preempt mod_unload modversions aarch64";
 const REQUIRED_CAPABILITY: &str = "pwm-backlight-v1";
 const LIFECYCLE_CAPABILITY: &str = "exact-backlight-metadata-v1";
-const BACKLIGHT_RULE_FILE: &str = "70-planeradar-backlight.rules";
-const BACKLIGHT_RULE: &[u8] = b"SUBSYSTEM==\"backlight\", KERNEL==\"planeradar-backlight\", RUN+=\"/usr/bin/chgrp video /sys%p/brightness\", RUN+=\"/usr/bin/chmod 0660 /sys%p/brightness\"\n";
+const BACKLIGHT_RULE_FILE: &str = "70-hyperpixel2r-backlight.rules";
+const BACKLIGHT_RULE: &[u8] = b"SUBSYSTEM==\"backlight\", KERNEL==\"hyperpixel2r-backlight\", RUN+=\"/usr/bin/chgrp video /sys%p/brightness\", RUN+=\"/usr/bin/chmod 0660 /sys%p/brightness\"\n";
 const TASK_TWO_DRIVER_COMMIT: &str = "bb76bf8a3e9e02ce1b1acd4df97200083ca57277";
 const TASK_TWO_DRIVER_TREE: &str = "0693468744845cc03e91b6dfdd10b8cd676dbce6";
 const TASK_TWO_DRIVER_DATE_EPOCH: u64 = 1_785_742_634;
@@ -310,7 +310,7 @@ fn prebuilt_archive(
             None,
         ),
         (
-            "hyperpixel2r-kms-0.1.0-6.18.34+rpt-rpi-v8-aarch64/70-planeradar-backlight.rules",
+            "hyperpixel2r-kms-0.1.0-6.18.34+rpt-rpi-v8-aarch64/70-hyperpixel2r-backlight.rules",
             EntryType::Regular,
             BACKLIGHT_RULE,
             None,
@@ -2326,7 +2326,7 @@ fn inactive_accepted_driver_protocol_carries_only_candidate_authority() {
         overlay_sha256: "4".repeat(64),
         applied_dtb_file: "hyperpixel2r-kms-applied.dtb".into(),
         applied_dtb_sha256: "5".repeat(64),
-        backlight_rule_file: "70-planeradar-backlight.rules".into(),
+        backlight_rule_file: "70-hyperpixel2r-backlight.rules".into(),
         backlight_rule_sha256: "6".repeat(64),
         replaced_overlay: "vc4-kms-dpi-hyperpixel2r".into(),
     })
@@ -2422,7 +2422,7 @@ fn accepted_driver_protocol_actions_are_typed_exact_and_bounded() {
         overlay_sha256: "4".repeat(64),
         applied_dtb_file: "hyperpixel2r-kms-applied.dtb".into(),
         applied_dtb_sha256: "5".repeat(64),
-        backlight_rule_file: "70-planeradar-backlight.rules".into(),
+        backlight_rule_file: "70-hyperpixel2r-backlight.rules".into(),
         backlight_rule_sha256: "6".repeat(64),
         replaced_overlay: "vc4-kms-dpi-hyperpixel2r".into(),
     })

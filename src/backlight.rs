@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use crate::model::{BacklightAvailability, DisplayPolicy, FrameColorMode};
 
-const DEVICE_NAME: &str = "planeradar-backlight";
+const DEVICE_NAME: &str = "hyperpixel2r-backlight";
 const MAX_BRIGHTNESS_ATTRIBUTE: &str = "max_brightness";
 const BRIGHTNESS_ATTRIBUTE: &str = "brightness";
 const RAMP_DURATION: Duration = Duration::from_secs(2);

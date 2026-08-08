@@ -50,8 +50,8 @@ mod release_fixture;
 const FIXTURE_ROOT: &str = "tests/fixtures/pi-os-trixie";
 const REQUIRED_DRIVER_CAPABILITY: &str = "pwm-backlight-v1";
 const LIFECYCLE_CAPABILITY: &str = "exact-backlight-metadata-v1";
-const BACKLIGHT_RULE_FILE: &str = "70-planeradar-backlight.rules";
-const BACKLIGHT_RULE: &[u8] = b"SUBSYSTEM==\"backlight\", KERNEL==\"planeradar-backlight\", RUN+=\"/usr/bin/chgrp video /sys%p/brightness\", RUN+=\"/usr/bin/chmod 0660 /sys%p/brightness\"\n";
+const BACKLIGHT_RULE_FILE: &str = "70-hyperpixel2r-backlight.rules";
+const BACKLIGHT_RULE: &[u8] = b"SUBSYSTEM==\"backlight\", KERNEL==\"hyperpixel2r-backlight\", RUN+=\"/usr/bin/chgrp video /sys%p/brightness\", RUN+=\"/usr/bin/chmod 0660 /sys%p/brightness\"\n";
 const TASK_TWO_DRIVER_COMMIT: &str = release_fixture::TASK_TWO_DRIVER_COMMIT;
 const TASK_TWO_DRIVER_TREE: &str = release_fixture::TASK_TWO_DRIVER_TREE;
 

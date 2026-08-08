@@ -31,7 +31,7 @@ use planeradar::render::setup::SetupRenderer;
 use planeradar::render::setup::{run_setup_demo, write_fixtures as write_setup_fixtures};
 use planeradar::runtime::{RuntimeConfig, RuntimeCoordinator};
 
-const BACKLIGHT_CLASS_DEVICE: &str = "/sys/class/backlight/planeradar-backlight";
+const BACKLIGHT_CLASS_DEVICE: &str = "/sys/class/backlight/hyperpixel2r-backlight";
 
 fn main() {
     if let Err(error) = logging::init() {
