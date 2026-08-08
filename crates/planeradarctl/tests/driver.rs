@@ -850,16 +850,19 @@ fn sync_verifies_the_locked_release_and_materializes_safe_source_and_prebuilt_ar
 }
 
 #[test]
-fn published_schema_one_manifest_matches_the_production_lock_and_fails_sync() {
+fn published_schema_one_manifest_is_legacy_and_fails_sync() {
     let lock = DriverLock::checked_in().expect("published driver lock");
     let manifest: serde_json::Value =
         serde_json::from_slice(PUBLISHED_SCHEMA_ONE_MANIFEST).expect("published driver manifest");
 
-    assert_eq!(lock.version, Version::parse("0.1.1").expect("version"));
-    assert_eq!(lock.commit, "261a29f45963ef3fcaf1a23e8e444b4e68d4c370");
-    assert_eq!(digest(PUBLISHED_SCHEMA_ONE_MANIFEST), lock.manifest_sha256);
+    assert_ne!(lock.version, Version::parse("0.1.1").expect("version"));
+    assert_ne!(lock.commit, "261a29f45963ef3fcaf1a23e8e444b4e68d4c370");
+    assert_ne!(digest(PUBLISHED_SCHEMA_ONE_MANIFEST), lock.manifest_sha256);
     assert_eq!(manifest["schema_version"], 1);
-    assert_eq!(manifest["source"]["commit"], lock.commit);
+    assert_eq!(
+        manifest["source"]["commit"],
+        "261a29f45963ef3fcaf1a23e8e444b4e68d4c370"
+    );
     assert!(manifest.get("capabilities").is_none());
 
     let manager = DriverManager::new(

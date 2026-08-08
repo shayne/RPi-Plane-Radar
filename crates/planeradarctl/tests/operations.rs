@@ -21,9 +21,9 @@ use sha2::{Digest, Sha256};
 
 const APP_REVISION: &str = "1111111111111111111111111111111111111111";
 const APP_SHA256: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-const DRIVER_VERSION: &str = "0.1.1";
-const DRIVER_REVISION: &str = "261a29f45963ef3fcaf1a23e8e444b4e68d4c370";
-const DRIVER_MANIFEST: &str = "b75adb56cb6298d648f7e78e640e003bf611a3d48628b6ff881c3c845b7934ba";
+const DRIVER_VERSION: &str = "0.2.0";
+const DRIVER_REVISION: &str = "b856694572316d0f485401af4d555a4ec7a8fe86";
+const DRIVER_MANIFEST: &str = "0aa224ac2e175ee187182d8f32d32fa66741d5530a1d43032756716b90cca8e8";
 const INSTALLED_DRIVER_MANIFEST: &str =
     "37b40967b952de49bf7663ffdae48e4208d1a6618ffc966d84c7f7a2176d969e";
 const MODULE_SHA256: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
