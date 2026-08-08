@@ -119,7 +119,7 @@ fn schema_two_pwm_driver_bundle_is_accepted_with_its_exact_named_rule() {
     assert_eq!(postconditions.source_tree, TASK_TWO_DRIVER_TREE);
     assert_eq!(
         postconditions.backlight_rule_sha256,
-        "579166d62b6444ea3b289b62d68a9c41ee3120262e2e2bca18967550e8423c11"
+        "9cc59fd2e4d5bf43541d7a59395c35afa98f675ab4a045eb67c4245213edd46c"
     );
 }
 
@@ -1791,7 +1791,7 @@ fn controller_install_resume_reaches_every_real_phase() {
             .any(|row| row == format!("source_tree\t{TASK_TWO_DRIVER_TREE}"))
     );
     assert!(exact_manifest.lines().any(|row| {
-        row == "backlight_rule_sha256\t579166d62b6444ea3b289b62d68a9c41ee3120262e2e2bca18967550e8423c11"
+        row == "backlight_rule_sha256\t9cc59fd2e4d5bf43541d7a59395c35afa98f675ab4a045eb67c4245213edd46c"
     }));
     let accepted = fs::read_to_string(root.join("var/lib/hyperpixel2r-kms/accepted-state"))
         .expect("accepted driver receipt");

@@ -1,5 +1,5 @@
 repository = "https://github.com/shayne/hyperpixel2r-kms"
-version = "0.2.0-rc.2"
+version = "0.2.0"
 commit = "b856694572316d0f485401af4d555a4ec7a8fe86"
 manifest_sha256 = "0aa224ac2e175ee187182d8f32d32fa66741d5530a1d43032756716b90cca8e8"
 required_capability = "pwm-backlight-v1"

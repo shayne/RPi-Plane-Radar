@@ -231,13 +231,20 @@ fn stable_workflows_promote_the_exact_accepted_draft_without_rebuilding() {
 #[test]
 fn stable_draft_reuses_the_successful_commit_bound_ci_run() {
     let draft = read(".github/workflows/stable-draft.yml");
-    assert!(draft.contains("gh run list --workflow ci.yml --commit \"$RELEASE_COMMIT\" --status success"));
+    assert!(
+        draft.contains(
+            "gh run list --workflow ci.yml --commit \"$RELEASE_COMMIT\" --status success"
+        )
+    );
     for artifact in [
         "linux-aarch64-$RELEASE_COMMIT",
         "control-arm64-$RELEASE_COMMIT",
         "control-x86_64-$RELEASE_COMMIT",
     ] {
-        assert!(draft.contains(artifact), "stable draft is missing {artifact}");
+        assert!(
+            draft.contains(artifact),
+            "stable draft is missing {artifact}"
+        );
     }
 }
 

@@ -1512,7 +1512,7 @@ fn production_backend_collects_strict_fixed_diagnostics_without_mutating_target(
 }
 
 #[test]
-fn production_doctor_accepts_only_exact_schema_three_or_schema_four_receipt_keys() {
+fn production_doctor_accepts_exact_legacy_and_metadata_receipt_shapes() {
     let transport = RecordingTransport::default();
     transport.outputs.borrow_mut().extend([
         Ok(Output::success(target_state_json(), Vec::new())),
@@ -1531,7 +1531,13 @@ fn production_doctor_accepts_only_exact_schema_three_or_schema_four_receipt_keys
     let commands = transport.commands.borrow();
     let program = &commands[1][6];
     assert!(program.contains("3:16:0"));
+    assert!(program.contains("3:18:0"));
     assert!(program.contains("4:22:0"));
+    assert!(program.contains("4:24:0"));
+    assert!(program.contains("17:0"));
+    assert!(program.contains("18:0"));
+    assert!(program.contains("exact-backlight-metadata-v1"));
+    assert!(program.contains("prior-backlight-metadata"));
     for binding in [
         "test \"$normal_kernel_file\" = kernel8.img",
         "test \"$normal_initramfs_file\" = initramfs8",
